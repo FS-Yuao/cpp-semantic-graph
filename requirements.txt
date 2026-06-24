@@ -1,0 +1,4 @@
+# cpp-semantic-graph 核心依赖
+clang>=18
+PyYAML>=6.0
+mcp>=1.0

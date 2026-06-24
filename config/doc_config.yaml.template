@@ -1,0 +1,29 @@
+# 文档解析配置模板
+# 复制为 doc_config.yaml 并按你的项目修改
+
+doc_dirs:
+  - "docs/"
+
+exclude_patterns:
+  - "*.html"
+  - "*/build/*"
+
+# 按目录自动打标签（路径相对于 docs/ 根目录）
+tag_rules: []
+  # - path_pattern: "architecture/**"
+  #   tags: ["架构设计"]
+  # - path_pattern: "api/**"
+  #   tags: ["接口规约"]
+
+section_split:
+  min_level: 2          # 按 ## 切片
+  min_word_count: 20    # 少于 20 字的切片合并到上一节
+
+# 手动精准关联（不侵入文档原文）
+# 每条指定文档路径 + 关联的代码实体名，confidence=1.0
+manual_links: []
+  # - doc: "architecture/OTA_FLOW.md"
+  #   heading: "升级流程"
+  #   code:
+  #     - "BasePeriUpdate"
+  #     - "SocUpdate"

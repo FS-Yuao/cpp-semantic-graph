@@ -1,0 +1,68 @@
+-- SQLite 图谱库建表语句
+-- 项目无关设计：表结构不绑定任何特定项目
+
+-- 节点表：类、函数、文件、文档切片
+CREATE TABLE IF NOT EXISTS node (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  type TEXT NOT NULL,           -- class / struct / function / file / doc_section
+  name TEXT NOT NULL,
+  namespace TEXT DEFAULT '',
+  file_path TEXT NOT NULL,
+  start_line INTEGER,
+  end_line INTEGER,
+  extra_info TEXT,              -- JSON: 模板参数、访问权限、签名等
+  unique_key TEXT NOT NULL UNIQUE,  -- type|namespace|name|file_path
+  created_at TEXT DEFAULT (datetime('now')),
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
+-- 边表：节点间的关系
+-- from_id = 关系起点, to_id = 关系终点
+-- 方向约定: inherits → from=子类 to=父类, calls → from=调用方 to=被调用方
+CREATE TABLE IF NOT EXISTS edge (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_id INTEGER NOT NULL,
+  to_id INTEGER NOT NULL,
+  relation_type TEXT NOT NULL,   -- 见 models.RelationType 枚举
+  extra_info TEXT,               -- JSON
+  created_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY(from_id) REFERENCES node(id) ON DELETE CASCADE,
+  FOREIGN KEY(to_id) REFERENCES node(id) ON DELETE CASCADE,
+  UNIQUE(from_id, to_id, relation_type)
+);
+
+-- include 依赖表：支持增量更新时的翻译单元影响范围分析
+CREATE TABLE IF NOT EXISTS include_dep (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_file TEXT NOT NULL,     -- 翻译单元（.cpp）
+  included_file TEXT NOT NULL,   -- 被 include 的文件（.h/.hpp）
+  is_system INTEGER DEFAULT 0,  -- 是否系统头文件
+  UNIQUE(source_file, included_file)
+);
+
+-- 解析状态表：记录每个翻译单元的解析状态，支持增量更新
+CREATE TABLE IF NOT EXISTS parse_status (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_file TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'pending',  -- pending / success / partial / failed
+  error_message TEXT,
+  node_count INTEGER DEFAULT 0,
+  edge_count INTEGER DEFAULT 0,
+  parsed_at TEXT DEFAULT (datetime('now')),
+  file_hash TEXT                -- 文件内容 hash，用于增量更新检测
+);
+
+-- 索引
+CREATE INDEX IF NOT EXISTS idx_node_name ON node(name);
+CREATE INDEX IF NOT EXISTS idx_node_type ON node(type);
+CREATE INDEX IF NOT EXISTS idx_node_file_path ON node(file_path);
+CREATE INDEX IF NOT EXISTS idx_node_unique_key ON node(unique_key);
+CREATE INDEX IF NOT EXISTS idx_node_namespace ON node(namespace);
+CREATE INDEX IF NOT EXISTS idx_edge_from_id ON edge(from_id);
+CREATE INDEX IF NOT EXISTS idx_edge_to_id ON edge(to_id);
+CREATE INDEX IF NOT EXISTS idx_edge_relation_type ON edge(relation_type);
+CREATE INDEX IF NOT EXISTS idx_edge_from_type ON edge(from_id, relation_type);
+CREATE INDEX IF NOT EXISTS idx_edge_to_type ON edge(to_id, relation_type);
+CREATE INDEX IF NOT EXISTS idx_include_source ON include_dep(source_file);
+CREATE INDEX IF NOT EXISTS idx_include_included ON include_dep(included_file);
+CREATE INDEX IF NOT EXISTS idx_parse_status_file ON parse_status(source_file);
