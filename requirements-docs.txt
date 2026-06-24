@@ -1,0 +1,2 @@
+# 文档融合依赖（可选，语义关联文档与代码）
+sentence-transformers>=2.0

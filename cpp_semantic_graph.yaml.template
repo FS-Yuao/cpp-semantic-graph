@@ -1,0 +1,45 @@
+# C++ 语义图谱工具 — 项目配置模板
+# 复制为 cpp_semantic_graph.yaml 并修改，无需改代码
+# 用法: cp cpp_semantic_graph.yaml.template cpp_semantic_graph.yaml
+
+project:
+  name: "YOUR_PROJECT_NAME"
+  # compile_commands.json 路径（相对于项目根目录或绝对路径）
+  compile_commands: "/path/to/your/project/compile_commands.json"
+
+# 源码范围定义 — 决定哪些代码算"项目代码"
+# 节点提取和调用关系过滤都基于此
+source_paths:
+  - "src"
+  - "include"
+
+# 生成代码路径 — 头文件入库接口声明，源文件不入库
+# 调用关系中，callee 在此范围内也保留
+generated_paths: []
+  # - "src-gen"
+
+# 完全忽略的路径 — 不解析不入库
+exclude_paths:
+  - "thirdparty"
+  - "build"
+  - "test/mock"
+
+# libclang 路径（按你的系统调整）
+# 常见路径:
+#   Ubuntu/Debian: /usr/lib/llvm-18/lib/libclang.so.1
+#   macOS (Homebrew): /opt/homebrew/opt/llvm/lib/libclang.dylib
+#   自编译: 指向你的 libclang.so / libclang.dylib
+libclang_path: "/usr/lib/llvm-18/lib/libclang.so.1"
+
+# 解析选项
+parse_options:
+  # 是否跳过函数体（加速解析，但无法提取调用关系）
+  skip_function_bodies: false
+  # 并行解析的最大进程数（1=串行，内存最低）
+  max_workers: 4
+
+# 文档配置（可选，不配则跳过文档融合）
+# docs_config: "config/doc_config.yaml"
+
+# 文档根目录（相对于此配置文件所在目录，或绝对路径）
+# docs_dir: "../../docs"
