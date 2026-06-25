@@ -131,7 +131,7 @@ class FullParsePipeline:
         report = ParseReport()
 
         # 1. 加载 compile_commands，筛选翻译单元
-        cdb = CompileDB(self.config.compile_commands)
+        cdb = CompileDB(self.config.compile_commands, config=self.config)
         entries = cdb.get_entries(
             filter_path=filter_path,
             include_generated=include_generated,

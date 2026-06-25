@@ -20,10 +20,14 @@ class CompileCommand:
     directory: str
     args: list[str]
     output: str = ""
+    _generated_paths: list[str] = field(default_factory=list)  # 从 ProjectConfig 注入
 
     @property
     def is_generated(self) -> bool:
-        """是否是 ARA COM 生成代码"""
+        """是否是生成代码（基于配置的 generated_paths 判断，默认检查 src-gen）"""
+        if self._generated_paths:
+            return any(p in self.file for p in self._generated_paths)
+        # fallback: 兼容无配置场景
         return "src-gen" in self.file
 
     @property
@@ -38,8 +42,18 @@ class CompileCommand:
 class CompileDB:
     """compile_commands.json 加载与清洗"""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, config=None):
+        """初始化
+
+        Args:
+            db_path: compile_commands.json 路径
+            config: ProjectConfig（可选，用于 generated_paths 判断）
+        """
         self.db_path = Path(db_path)
+        self._generated_paths = list(config.generated_paths) if config else []
+        # 交叉编译注入参数：-target + 工具链 C++ stdlib -isystem
+        # libclang 默认按宿主 triple 解析，不注入会导致 aarch64 sysroot 头 fatal。
+        self._extra_flags = list(config.extra_parse_flags) if config else []
         self._entries: list[CompileCommand] = []
         self._load()
 
@@ -54,10 +68,21 @@ class CompileDB:
         for entry in data:
             file_path = entry.get("file", "")
             directory = entry.get("directory", "")
+            # 支持 command（shell 字符串）和 arguments（参数列表）两种格式
             command = entry.get("command", "")
+            arguments = entry.get("arguments", [])
 
-            if not file_path or not command:
+            if not file_path:
                 continue
+            if not command and not arguments:
+                continue
+
+            # arguments 列表格式：合并为 shell 字符串再解析
+            if not command and arguments:
+                command = " ".join(
+                    shlex.quote(str(a)) if " " in str(a) else str(a)
+                    for a in arguments
+                )
 
             # Parse command string to args
             raw_args = shlex.split(command)
@@ -68,6 +93,13 @@ class CompileDB:
             clean_args = self._clean_args(raw_args)
             output = self._extract_output(raw_args)
 
+            # 注入交叉编译参数（-target + 工具链 stdlib -isystem）
+            # 前置以保证 sysroot 头按正确 target 解析；compile_commands 自带 -target 时不重复
+            if self._extra_flags and not any(
+                a == "-target" for a in clean_args
+            ):
+                clean_args = self._extra_flags + clean_args
+
             # Make file path absolute
             if not Path(file_path).is_absolute():
                 file_path = str(Path(directory) / file_path)
@@ -77,6 +109,7 @@ class CompileDB:
                 directory=directory,
                 args=clean_args,
                 output=output,
+                _generated_paths=self._generated_paths,
             ))
 
     @staticmethod
