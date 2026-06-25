@@ -75,7 +75,7 @@ class IncrementalUpdater:
         self.config_path = config_path
         self.db_path = db_path
         self.repo_root = repo_root
-        self.compile_db = CompileDB(self.config.compile_commands)
+        self.compile_db = CompileDB(self.config.compile_commands, config=self.config)
 
     def run(self, *,
             base_ref: str | None = "HEAD~1",
@@ -140,43 +140,67 @@ class IncrementalUpdater:
             report.elapsed_seconds = time.time() - t0
             return report
 
-        # --- 3. 删除旧数据 ---
+        # --- 3~6: 删旧+重解析+导入+清理，包进单事务确保原子性 ---
         db = GraphDB(self.db_path)
-        del_stats = self._delete_stale_data(changes, impact, db)
-        report.edges_deleted = del_stats["edges_deleted"]
-        report.includes_deleted = del_stats["includes_deleted"]
+        try:
+            # 禁用内部自动 commit，由本函数统一控制事务边界
+            db._autocommit = False
 
-        # --- 4. 重新解析 ---
-        results = self._reparse_tus(impact.affected_tus)
-        for r in results:
-            if r.status == "failed":
-                report.tus_failed += 1
-                report.failed_files.append(r.source_path)
-            else:
-                report.tus_reparsed += 1
+            # --- 3. 删除旧数据 ---
+            del_stats = self._delete_stale_data(changes, impact, db)
+            report.edges_deleted = del_stats["edges_deleted"]
+            report.includes_deleted = del_stats["includes_deleted"]
 
-        # --- 5. 导入结果（upsert）---
-        import_stats = self._import_results(results, db)
-        report.nodes_new = import_stats["nodes_new"]
-        report.nodes_updated = import_stats["nodes_updated"]
-        report.edges_new = import_stats["edges_new"]
-        report.edges_skipped = import_stats["edges_skipped"]
-        report.includes_new = import_stats["includes_new"]
+            # --- 4. 重新解析 ---
+            results = self._reparse_tus(impact.affected_tus)
+            for r in results:
+                if r.status == "failed":
+                    report.tus_failed += 1
+                    report.failed_files.append(r.source_path)
+                else:
+                    report.tus_reparsed += 1
 
-        # --- 6. 清理残留节点 ---
-        report.nodes_removed = self._cleanup_removed_nodes(
-            changes.reparse_files, results, db)
+            # --- 5. 导入结果（upsert）---
+            import_stats = self._import_results(results, db)
+            report.nodes_new = import_stats["nodes_new"]
+            report.nodes_updated = import_stats["nodes_updated"]
+            report.edges_new = import_stats["edges_new"]
+            report.edges_skipped = import_stats["edges_skipped"]
+            report.includes_new = import_stats["includes_new"]
 
-        # --- 7. 重建文档关联 ---
-        if rebuild_associations:
-            self._rebuild_associations(rebuild_embeddings)
-            report.associations_rebuilt = True
+            # --- 6. 清理残留节点 ---
+            report.nodes_removed = self._cleanup_removed_nodes(
+                changes.reparse_files, results, db)
 
-        # --- 8. 统计 ---
-        db_stats = db.get_stats()
-        report.db_node_count = db_stats["node_count"]
-        report.db_edge_count = db_stats["edge_count"]
-        db.close()
+            # 全部成功，统一提交
+            db.conn.commit()
+
+        except Exception:
+            # 异常回滚：删旧数据+新导入全部撤销，保持 DB 一致
+            logger.exception("增量更新异常，回滚事务")
+            try:
+                db.conn.rollback()
+            except Exception as rb_err:
+                logger.error("回滚失败: %s", rb_err)
+            raise
+
+        finally:
+            # 恢复 autocommit（虽然即将 close，但保持状态一致）
+            db._autocommit = True
+
+            # --- 7. 重建文档关联（事务外，独立操作）---
+            if rebuild_associations:
+                self._rebuild_associations(rebuild_embeddings)
+                report.associations_rebuilt = True
+
+            # --- 8. 统计 + 关闭 ---
+            try:
+                db_stats = db.get_stats()
+                report.db_node_count = db_stats["node_count"]
+                report.db_edge_count = db_stats["edge_count"]
+            except Exception:
+                pass
+            db.close()
 
         report.elapsed_seconds = time.time() - t0
         return report

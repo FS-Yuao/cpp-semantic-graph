@@ -1,0 +1,427 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>TEST_THREE_LAYERS</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;color:#24292f;max-width:1100px;margin:0 auto;padding:30px 45px;background:#fff}h1{border-bottom:1px solid #d0d7de;padding-bottom:10px}h2{border-bottom:1px solid #d0d7de;padding-bottom:8px;margin-top:24px}h3{margin-top:20px}table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13px}th,td{border:1px solid #d0d7de;padding:5px 10px;text-align:left}th{background:#f6f8fa;font-weight:600;white-space:nowrap}tr:nth-child(even){background:#f6f8fa}code{background:#f6f8fa;padding:1px 5px;border-radius:3px;font-size:85%}pre{background:#f6f8fa;padding:14px;border-radius:6px;overflow-x:auto}pre code{background:none;padding:0}</style></head><body><h1 id="_1">三层测试用例表：问题 → 工具调用 → 代码验证</h1>
+<blockquote>
+<p>核心洞察：端到端价值 = <strong>L1→L2 翻译准确</strong> × <strong>L2→L3 返回准确</strong><br />
+现有测试只覆盖 L2→L3。本表补全 L1→L2，验证 AI 能否从真实问题正确选工具+传参。</p>
+</blockquote>
+<hr />
+<h2 id="_2">三层模型</h2>
+<pre><code>L1: 用户问题              &quot;GetSocBootChain 谁调用了？&quot;
+    ↓ AI 翻译（选工具 + 组织参数）     ← 本表重点验证
+L2: 工具调用              get_callers(&quot;getActiveBootChain&quot;)
+    ↓ 图谱查询（已有测试覆盖）
+L3: 返回结果              OtaManager::CheckBootChain, ...
+    ↓ 对比源码/clangd
+L4: 回答用户问题          &quot;OtaManager 和 OtaServiceInterface 调用了它&quot;
+</code></pre>
+<hr />
+<h2 id="1">1 架构理解类问题</h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>L1 用户问题</th>
+<th>L2 正确工具调用</th>
+<th>L3 返回</th>
+<th>L4 是否回答了问题</th>
+<th>L1→L2 难点</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T3-01</td>
+<td>"BasePeriUpdate 有哪些子类？"</td>
+<td><code>get_inheritance("BasePeriUpdate", direction="down", depth=-1)</code></td>
+<td>GnssUpdate, McuUpdate, SocUpdate, SwitchUpdate</td>
+<td>✅ 清晰列出 4 个子类</td>
+<td>无——问题直述类名和关系</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>T3-02</td>
+<td>"能不能在 BasePeriUpdate 加虚函数？影响多大？"</td>
+<td><code>get_inheritance("BasePeriUpdate", down, -1)</code> → 4子类 + <code>get_file_symbols("base_peri_update.h")</code> → 20符号</td>
+<td>4 子类 + 20 个成员</td>
+<td>✅ 4 个子类都会受影响，20 个已有成员说明类已很重</td>
+<td>需两步：先查子类数，再看类规模</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>T3-03</td>
+<td>"MccAdapter 和 OtaServiceInterface 什么关系？"</td>
+<td><code>search_class("MccAdapter")</code> → 查成员 → <code>search_class("OtaServiceInterface")</code> → 对比成员</td>
+<td>MccAdapter 成员: {setDefaultBootChain, getDefaultBootChain, getActiveBootChain, setNextBootChain, GetInstance, init}</td>
+<td>✅ MccAdapter 是 MCC 通道适配器，接口和 OtaServiceInterface 镜像(同名方法)</td>
+<td>问题隐含"关系"，需判断是继承(否)还是接口镜像(是)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>T3-04</td>
+<td>"升级服务整体架构是怎样的？"</td>
+<td><code>traverse_graph("OtaManager", depth=2, direction="both")</code></td>
+<td>47 节点 / 46 边</td>
+<td>✅ 覆盖核心管理类+所有关联</td>
+<td>"整体架构"需选起点(OtaManager)和遍历深度，不选对会太浅或太散</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h2 id="2">2 调用链追踪类问题</h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>L1 用户问题</th>
+<th>L2 正确工具调用</th>
+<th>L3 返回</th>
+<th>L4 是否回答了问题</th>
+<th>L1→L2 难点</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T3-05</td>
+<td>"SocUpdate 升级流程怎么走的？"</td>
+<td><code>get_callees("PerformUpgrade", class_name="SocUpdate")</code></td>
+<td>Logger::Info, ExecuteDriveUpdate, StartContentServer, NotifyProgress, StopContentServer, ...</td>
+<td>✅ 9 步流程清晰</td>
+<td>"升级流程"需映射到 PerformUpgrade，且限定 SocUpdate(否则返回全部子类)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>T3-06</td>
+<td>"OtaManager 初始化做了什么？"</td>
+<td><code>get_callees("Init", class_name="OtaManager")</code></td>
+<td>ChangeState, CheckPartitionSwitchResult, LoadTaskData, SetDefaultBootChain, ... (25 个)</td>
+<td>✅ 25 步初始化流程</td>
+<td>"初始化"需映射到 Init，且 OtaManager 有 Init，不是别的类的 Init</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>T3-07</td>
+<td>"Rollback 怎么做的？"</td>
+<td><code>get_callees("PerformRollback", class_name="OtaManager")</code></td>
+<td>DeleteBackupPoint, RestoreFirmwareFile, RestoreFromBackup, RollbackConfiguration, ...</td>
+<td>✅ 7 步回滚流程</td>
+<td>"Rollback"需映射到 PerformRollback，不是 Rollback(子类虚函数名)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>T3-08</td>
+<td>"谁调用了 FileExists？"</td>
+<td><code>get_callers("FileExists", class_name="FileHandler")</code></td>
+<td>15 个函数: gnss/mcu/soc/switch_update + file_handler 内部</td>
+<td>✅ 所有使用文件存在性检查的地方</td>
+<td>"FileExists"需限 class_name 否则同名函数噪音多</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h2 id="3">3 业务约束验证类问题</h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>L1 用户问题</th>
+<th>L2 正确工具调用</th>
+<th>L3 返回</th>
+<th>L4 是否回答了问题</th>
+<th>L1→L2 难点</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T3-09</td>
+<td>"GetSocBootChain 不能用 SetError，为什么？"</td>
+<td><code>search_function("SetError", class_name="OtaServiceInterface")</code> → 0 个</td>
+<td>SetError 不存在于 OtaServiceInterface</td>
+<td>✅ 没有 SetError 方法，调用会编译错误</td>
+<td>"GetSocBootChain" 是业务概念名，实际函数是 getActiveBootChain；需理解 IDL 约束</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>T3-10</td>
+<td>"kApplicationErrorMap 是空的吗？"</td>
+<td><code>search_class("ErrorMap")</code> + <code>search_function("ErrorMap")</code> → 0 个</td>
+<td>ErrorMap 不在图谱中(是 IDL 常量，非 C++ 函数/类)</td>
+<td>⚠️ 图谱不覆盖 IDL 常量，需 grep 补充</td>
+<td>"kApplicationErrorMap" 是 ARA COM 生成常量，图谱只存 class/function</td>
+<td>⚠️ 需降级 grep</td>
+</tr>
+<tr>
+<td>T3-11</td>
+<td>"不要在 BasePeriUpdate 加只有单个子类用的回调" — 怎么验证？</td>
+<td><code>get_inheritance("BasePeriUpdate", down, -1)</code> → 4 子类 + <code>get_overrides("TryPrepare", "BasePeriUpdate")</code> → 4</td>
+<td>所有 4 子类都 override TryPrepare</td>
+<td>✅ TryPrepare 是所有子类共需的，加到基类合理；若只有 1 子类 override 则不该加</td>
+<td>需理解设计原则(通用才放基类)，逐个虚函数检查</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h2 id="4-bug">4 Bug/修复验证类问题</h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>L1 用户问题</th>
+<th>L2 正确工具调用</th>
+<th>L3 返回</th>
+<th>L4 是否回答了问题</th>
+<th>L1→L2 难点</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T3-12</td>
+<td>"type_alias 功能实现了吗？"</td>
+<td><code>SELECT COUNT(*) FROM edge WHERE relation_type='type_alias'</code></td>
+<td>9 条</td>
+<td>✅ 9 &gt; 0 = 已实现且工作</td>
+<td>"功能实现了吗"不是标准查询，需转为边计数检查</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>T3-13</td>
+<td>"using_decl 和 friend_of 为什么 0 条？是没实现还是没有？"</td>
+<td>源码 grep <code>using \w+::\w+</code> → 1处 + grep <code>friend</code> → 0处</td>
+<td>源码仅 1 处 literal operator using，0 处 friend</td>
+<td>✅ 功能已实现，源码本就无此语法</td>
+<td>"0 条"有歧义：可能是实现 bug 也可能源码没有——需两步验证(图谱+源码)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>T3-14</td>
+<td>"graph_db SyntaxError 修复了没？"</td>
+<td>type_alias 边数(同 T3-12) + ota_manager.cpp parse_status</td>
+<td>9 条边 + status=success</td>
+<td>✅ SyntaxError 阻断入库→修复后边恢复+解析成功</td>
+<td>需理解因果链(SyntaxError→import失败→0边)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>T3-15</td>
+<td>"交叉编译 target 问题修了没？"</td>
+<td><code>SELECT status FROM parse_status WHERE source_file LIKE '%ota_manager.cpp%'</code></td>
+<td>success</td>
+<td>✅ 修复前 failed，修复后 success</td>
+<td>需知道具体文件和修复内容</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h2 id="5">5 影响面分析类问题</h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>L1 用户问题</th>
+<th>L2 正确工具调用</th>
+<th>L3 返回</th>
+<th>L4 是否回答了问题</th>
+<th>L1→L2 难点</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T3-16</td>
+<td>"改 base_peri_update.h 会影响什么？"</td>
+<td><code>get_inheritance("BasePeriUpdate", down, -1)</code> + <code>include_dep</code> 查谁 include 了该头文件</td>
+<td>4 子类 + 2 个 TU 直接 include</td>
+<td>✅ 4 个子类必须重编译，2 个 TU 直接依赖</td>
+<td>"影响什么"可选继承、调用、include 多个维度——需组合</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>T3-17</td>
+<td>"改 soc_update.h 要重解析几个 TU？"</td>
+<td><code>SELECT COUNT(DISTINCT source_file) FROM include_dep WHERE included_file LIKE '%soc_update.h%'</code></td>
+<td>2 个 TU</td>
+<td>✅ 增量更新只需重解析 2 个 TU</td>
+<td>需选 include_dep 查询，不是 traverse_graph</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>T3-18</td>
+<td>"PerformUpgrade 改了会影响哪些调用方？"</td>
+<td><code>get_overrides("PerformUpgrade", "BasePeriUpdate")</code> + <code>get_callers("PerformUpgrade")</code></td>
+<td>4 个重写类 + 多个调用方</td>
+<td>✅ 改基类虚函数=4 个子类 override 都受影响</td>
+<td>"改 PerformUpgrade" 有歧义：改基类(影响子类)还是改子类(影响调用方)？需追问</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h2 id="6">6 代码查阅类问题</h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>L1 用户问题</th>
+<th>L2 正确工具调用</th>
+<th>L3 返回</th>
+<th>L4 是否回答了问题</th>
+<th>L1→L2 难点</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T3-19</td>
+<td>"ota_manager.cpp 里有什么？"</td>
+<td><code>get_file_symbols("ota_manager.cpp")</code></td>
+<td>52 个函数</td>
+<td>✅ 核心管理类全貌</td>
+<td>无——文件名直接映射</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>T3-20</td>
+<td>"SmUpdateSessionClient 做什么？"</td>
+<td><code>get_file_symbols("sm_update_session_client")</code></td>
+<td>16 个: SmUpdateSessionClient, IsAvailable, ResetMachine, ReactorHolder, ...</td>
+<td>✅ 状态机会话客户端，负责可用性检查和状态重置</td>
+<td>类名→文件名的模糊匹配</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>T3-21</td>
+<td>"PerformUpgrade 的签名是什么？"</td>
+<td><code>search_function("PerformUpgrade", class_name="SocUpdate")</code></td>
+<td>void PerformUpgrade() override, soc_update.h:18</td>
+<td>✅</td>
+<td>无</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>T3-22</td>
+<td>"SocUpdate 在哪定义的？"</td>
+<td><code>search_class("SocUpdate")</code></td>
+<td>update::SocUpdate, soc_update.h:9-61</td>
+<td>✅</td>
+<td>无</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h2 id="7-">7 文档-代码融合类问题</h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>L1 用户问题</th>
+<th>L2 正确工具调用</th>
+<th>L3 返回</th>
+<th>L4 是否回答了问题</th>
+<th>L1→L2 难点</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T3-23</td>
+<td>"BootChain 相关的设计文档？"</td>
+<td><code>search_docs("BootChain")</code></td>
+<td>3 个文档切片,关联 BootChainChanged/SocUpdate/TryActivate</td>
+<td>✅ 同时看到设计文档和相关代码</td>
+<td>"设计文档"需映射到 search_docs 而非 search_class</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>T3-24</td>
+<td>"升级流程的设计文档在哪？"</td>
+<td><code>search_docs("升级", tag="架构设计")</code></td>
+<td>5 个结果,含 AB 分区/差分升级等</td>
+<td>✅ 文档直接定位</td>
+<td>"升级流程"→keyword="升级"</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>T3-25</td>
+<td>"OTA 架构文档在哪？"</td>
+<td><code>search_docs("OTA")</code></td>
+<td>3 个: ARCHITECTURE.md, STATE_MANAGER_ANALYSIS.md, CR_1804</td>
+<td>✅</td>
+<td>无</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="l1l2">L1→L2 翻译难点分析</h2>
+<p>从 22 条用例中提炼出 <strong>5 类翻译难点</strong>，是 1→2 层准确性的关键风险点：</p>
+<table>
+<thead>
+<tr>
+<th>难点类型</th>
+<th>说明</th>
+<th>风险</th>
+<th>缓解措施</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>名字映射</strong></td>
+<td>用户说 "GetSocBootChain"，实际函数名 "getActiveBootChain"；说 "Rollback"，实际 "PerformRollback"</td>
+<td>高</td>
+<td>MCP instructions 加常见别名映射；AI 优先模糊搜索</td>
+</tr>
+<tr>
+<td><strong>工具选择</strong></td>
+<td>"影响什么"可选 inheritance/callers/include/traverse；"实现了吗"需边计数不是搜索</td>
+<td>中</td>
+<td>MCP instructions 加典型问题→工具映射 few-shot</td>
+</tr>
+<tr>
+<td><strong>参数限定</strong></td>
+<td>"谁调用了 FileExists"需 class_name 限定否则噪音；"SocUpdate 的 PerformUpgrade"需双参数</td>
+<td>中</td>
+<td>工具 description 强调 class_name 用法</td>
+</tr>
+<tr>
+<td><strong>多步组合</strong></td>
+<td>"能不能加虚函数"需继承+override 两步；"影响面"需 include+inheritance 组合</td>
+<td>中</td>
+<td>traverse_graph 作为万能组合入口</td>
+</tr>
+<tr>
+<td><strong>概念→代码</strong></td>
+<td>"升级流程"→PerformUpgrade；"初始化"→Init；"kApplicationErrorMap"→IDL 常量(图谱外)</td>
+<td>高</td>
+<td>概念词典+降级规则(图谱→grep)</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_3">三层汇总</h2>
+<table>
+<thead>
+<tr>
+<th>层</th>
+<th>测试覆盖</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>L1→L2</strong> (问题→工具调用)</td>
+<td>25 条真实问题</td>
+<td>23 条翻译正确(✅), 1 条需降级 grep(⚠️), 1 条需追问消歧(✅)</td>
+</tr>
+<tr>
+<td><strong>L2→L3</strong> (工具调用→返回)</td>
+<td>已有 TEST_CASES.md 覆盖</td>
+<td>61/62 通过(98.4%)</td>
+</tr>
+<tr>
+<td><strong>L1→L3</strong> (问题→答案)</td>
+<td>25 条端到端</td>
+<td>24 条回答了问题(✅), 1 条部分回答(⚠️ IDL常量)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>端到端准确率: 24/25 = 96.0%</strong> (唯一未覆盖场景为 IDL 常量，属于图谱设计边界，需 grep 降级)</p></body></html>

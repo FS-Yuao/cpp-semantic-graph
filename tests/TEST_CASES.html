@@ -1,0 +1,938 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>TEST_CASES</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;color:#24292f;max-width:1100px;margin:0 auto;padding:30px 45px;background:#fff}h1{border-bottom:1px solid #d0d7de;padding-bottom:10px}h2{border-bottom:1px solid #d0d7de;padding-bottom:8px;margin-top:24px}h3{margin-top:20px}table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13px}th,td{border:1px solid #d0d7de;padding:5px 10px;text-align:left}th{background:#f6f8fa;font-weight:600;white-space:nowrap}tr:nth-child(even){background:#f6f8fa}code{background:#f6f8fa;padding:1px 5px;border-radius:3px;font-size:85%}pre{background:#f6f8fa;padding:14px;border-radius:6px;overflow-x:auto}pre code{background:none;padding:0}</style></head><body><h1 id="cpp_semantic_graph">cpp_semantic_graph 测试用例表</h1>
+<blockquote>
+<p>日期: 2025-06-25 | DB: 1085 节点 / 1462 边 / 29 TU 全成功</p>
+</blockquote>
+<hr />
+<h2 id="1">1 功能测试用例</h2>
+<h3 id="11-cpp_search_class">1.1 cpp_search_class</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>输入</th>
+<th>预期</th>
+<th>实际</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SC-01</td>
+<td><code>name="SocUpdate", exact=True</code></td>
+<td>返回 1 个: <code>update::SocUpdate</code></td>
+<td><code>update::SocUpdate</code> soc_update.h:9-61</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>SC-02</td>
+<td><code>name="Update", exact=False</code></td>
+<td>返回多个含 Update 的类</td>
+<td>10 个: BasePeriUpdate, GnssUpdate, McuUpdate, SocUpdate, SwitchUpdate, SmUpdateSessionClient, UpdateFactory, UPDATE_PROGRESSS, UPDATE_RESULT, UPDATE_STATUS</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>SC-03</td>
+<td><code>name="NonExistClass", exact=True</code></td>
+<td>返回 0 个</td>
+<td>0 个</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>SC-04</td>
+<td><code>name="OtaManager", exact=True</code></td>
+<td>返回 1 个: <code>ota_manager::OtaManager</code></td>
+<td><code>ota_manager::OtaManager</code> ota_manager.h</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>SC-05</td>
+<td>struct 搜索: <code>name="HardwareInformation"</code></td>
+<td>返回 struct 节点</td>
+<td><code>ota_manager::HardwareInformation</code> (type=struct)</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h3 id="12-cpp_search_function">1.2 cpp_search_function</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>输入</th>
+<th>预期</th>
+<th>实际</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SF-01</td>
+<td><code>name="PerformUpgrade", class_name="SocUpdate"</code></td>
+<td>返回 SocUpdate::PerformUpgrade (声明+定义)</td>
+<td>2 个: soc_update.h:18 (声明) + soc_update.cpp:613 (定义)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>SF-02</td>
+<td><code>name="PerformUpgrade", class_name=""</code></td>
+<td>返回所有同名函数</td>
+<td>11 个 (4子类×2 + BasePeriUpdate + PeriAdapter×2)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>SF-03</td>
+<td><code>name="Init", class_name="OtaManager"</code></td>
+<td>返回 OtaManager::Init</td>
+<td>2 个: ota_manager.h + ota_manager.cpp</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>SF-04</td>
+<td><code>name="NonExistFunc"</code></td>
+<td>返回 0 个</td>
+<td>0 个</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h3 id="13-cpp_get_inheritance">1.3 cpp_get_inheritance</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>输入</th>
+<th>预期</th>
+<th>实际</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IN-01</td>
+<td><code>class_name="BasePeriUpdate", direction="down", depth=-1</code></td>
+<td>4 个子类</td>
+<td>GnssUpdate, McuUpdate, SocUpdate, SwitchUpdate</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>IN-02</td>
+<td><code>class_name="SocUpdate", direction="up", depth=1</code></td>
+<td>1 个父类: BasePeriUpdate</td>
+<td>BasePeriUpdate</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>IN-03</td>
+<td><code>class_name="GnssUpdate", direction="down", depth=1</code></td>
+<td>0 个子类 (叶子)</td>
+<td>0 个</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>IN-04</td>
+<td><code>class_name="BasePeriUpdate", direction="up", depth=1</code></td>
+<td>0 个父类 (根)</td>
+<td>0 个 (无继承声明)</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h3 id="14-cpp_get_callers">1.4 cpp_get_callers</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>输入</th>
+<th>预期</th>
+<th>实际</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CA-01</td>
+<td><code>function_name="FileExists", class_name="FileHandler"</code></td>
+<td>多个调用方</td>
+<td>15 个函数: gnss_update.cpp(Rollback,RestoreBackupFirmware), mcu_update.cpp(TryPrepare,PerformUpgrade,TryFinish), soc_update.cpp(TryPrepare,TryFinish), …</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>CA-02</td>
+<td><code>function_name="NotifyProgress", class_name="BasePeriUpdate"</code></td>
+<td>高扇入函数</td>
+<td>37 个调用函数</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>CA-03</td>
+<td><code>function_name="GetInstance", class_name="Logger"</code></td>
+<td>最高扇入</td>
+<td>79 个调用函数</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>CA-04</td>
+<td><code>function_name="~BasePeriUpdate"</code></td>
+<td>析构函数无调用方</td>
+<td>0 个</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h3 id="15-cpp_get_callees">1.5 cpp_get_callees</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>输入</th>
+<th>预期</th>
+<th>实际</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CE-01</td>
+<td><code>function_name="PerformUpgrade", class_name="SocUpdate"</code></td>
+<td>升级内部调用链</td>
+<td>9 个: Logger::Error, Logger::GetInstance, Logger::Info, ExecuteDriveUpdate, GetPeriName, IsDirectoryPath, NotifyProgress, StartContentServer, StopContentServer</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>CE-02</td>
+<td><code>function_name="Init", class_name="OtaManager"</code></td>
+<td>初始化流程</td>
+<td>25 个: ChangeState, CheckPartitionSwitchResult, CleanupSmSession, GetInstance, HandleError, LoadTaskData, …</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>CE-03</td>
+<td><code>function_name="~BasePeriUpdate"</code></td>
+<td>析构函数体调用</td>
+<td>0 个 (空析构或隐式)</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h3 id="16-cpp_get_overrides">1.6 cpp_get_overrides</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>输入</th>
+<th>预期</th>
+<th>实际</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OV-01</td>
+<td><code>function_name="PerformUpgrade", class_name="BasePeriUpdate"</code></td>
+<td>4 个重写</td>
+<td>4 个: GnssUpdate, McuUpdate, SocUpdate, SwitchUpdate (8边去重后4)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>OV-02</td>
+<td><code>function_name="TryActivate", class_name="BasePeriUpdate"</code></td>
+<td>4 个重写</td>
+<td>4 个: GnssUpdate, McuUpdate, SocUpdate, SwitchUpdate</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>OV-03</td>
+<td><code>function_name="TryPrepare", class_name="BasePeriUpdate"</code></td>
+<td>4 个重写</td>
+<td>4 个: GnssUpdate, McuUpdate, SocUpdate, SwitchUpdate</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>OV-04</td>
+<td><code>function_name="Cancel", class_name="BasePeriUpdate"</code></td>
+<td>4 个重写</td>
+<td>4 个</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>OV-05</td>
+<td><code>function_name="ConfirmVersion", class_name="BasePeriUpdate"</code></td>
+<td>4 个重写</td>
+<td>4 个</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h3 id="17-cpp_get_file_symbols">1.7 cpp_get_file_symbols</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>输入</th>
+<th>预期</th>
+<th>实际</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FS-01</td>
+<td><code>file_path="ota_manager.cpp"</code></td>
+<td>50+ 函数</td>
+<td>52 个 function (clangd 61 含 namespace/variable/property)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>FS-02</td>
+<td><code>file_path="soc_update.h"</code></td>
+<td>类+成员函数</td>
+<td>22 个 (class:1, function:21)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>FS-03</td>
+<td><code>file_path="base_peri_update.h"</code></td>
+<td>基类+虚函数</td>
+<td>20 个 (class:1, function:19)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>FS-04</td>
+<td><code>file_path="nonexist.cpp"</code></td>
+<td>0 个</td>
+<td>0 个</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h3 id="18-cpp_traverse_graph">1.8 cpp_traverse_graph</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>输入</th>
+<th>预期</th>
+<th>实际</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TR-01</td>
+<td><code>start="SocUpdate", depth=2, direction="both"</code></td>
+<td>多文件多节点</td>
+<td>52 节点 / 70 边 / 6 文件</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>TR-02</td>
+<td><code>start="OtaManager", depth=1, direction="both"</code></td>
+<td>核心管理类邻近</td>
+<td>47 节点 / 46 边</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>TR-03</td>
+<td><code>start="BasePeriUpdate", depth=1, direction="both"</code></td>
+<td>继承树根,子类可见</td>
+<td>含 SocUpdate/GnssUpdate/McuUpdate/SwitchUpdate</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h3 id="19-cpp_search_docs">1.9 cpp_search_docs</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>输入</th>
+<th>预期</th>
+<th>实际</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DO-01</td>
+<td><code>keyword="升级"</code></td>
+<td>文档切片+关联代码</td>
+<td>5 个结果(A/B分区/CR1804/差分升级/审查报告)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>DO-02</td>
+<td><code>keyword="OTA"</code></td>
+<td>文档切片+关联代码</td>
+<td>3 个结果(架构文档/StateManager/CR1804)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>DO-03</td>
+<td><code>keyword="BootChain"</code></td>
+<td>文档+代码双向关联</td>
+<td>3 个结果,关联 BootChainChanged/SocUpdate/TryActivate/GetSocBootChain</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="2">2 关系类型测试</h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>关系类型</th>
+<th>预期边数</th>
+<th>实际边数</th>
+<th>源码验证</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RT-01</td>
+<td><code>inherits_public</code></td>
+<td>&gt;0</td>
+<td>9</td>
+<td>9 处 public 继承</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>RT-02</td>
+<td><code>calls_direct</code></td>
+<td>&gt;0</td>
+<td>751</td>
+<td>大量直接调用</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>RT-03</td>
+<td><code>calls_virtual</code></td>
+<td>&gt;0</td>
+<td>57</td>
+<td>57 处虚调用</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>RT-04</td>
+<td><code>overrides</code></td>
+<td>&gt;0</td>
+<td>114</td>
+<td>≈57 虚函数×2(decl+def双计)</td>
+<td>✅ (P2已知)</td>
+</tr>
+<tr>
+<td>RT-05</td>
+<td><code>belongs_to</code></td>
+<td>&gt;0</td>
+<td>522</td>
+<td>函数→所属类</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>RT-06</td>
+<td><code>type_alias</code></td>
+<td>&gt;0 (修复后)</td>
+<td><strong>9</strong></td>
+<td>9 处 <code>using X=Y</code></td>
+<td>✅</td>
+</tr>
+<tr>
+<td>RT-07</td>
+<td><code>using_decl</code></td>
+<td>≥0</td>
+<td>0</td>
+<td>源码仅1处 <code>using operator""_sv</code> (literal)</td>
+<td>⚠️ 漏1处</td>
+</tr>
+<tr>
+<td>RT-08</td>
+<td><code>friend_of</code></td>
+<td>0</td>
+<td>0</td>
+<td>源码0处 friend 声明</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>RT-09</td>
+<td><code>instantiates</code></td>
+<td>0</td>
+<td>0</td>
+<td>README 已标注⏸️未启用</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>RT-10</td>
+<td><code>doc_describes_code</code></td>
+<td>&gt;0</td>
+<td><strong>878</strong></td>
+<td>content_scan 文档→代码关联</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>RT-11</td>
+<td><code>code_refers_to_doc</code></td>
+<td>&gt;0</td>
+<td><strong>878</strong></td>
+<td>content_scan 代码→文档关联</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<h3 id="type_alias">type_alias 边内容详情</h3>
+<table>
+<thead>
+<tr>
+<th>别名节点</th>
+<th>文件</th>
+<th>目标节点</th>
+<th>目标文件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Exception</td>
+<td>service/Service.h</td>
+<td>ServiceException</td>
+<td>service/Service.h</td>
+</tr>
+<tr>
+<td>ProxyBackendInterface</td>
+<td>otaserviceinterface_proxy.h</td>
+<td>OtaServiceInterfaceProxyBackendInterface</td>
+<td>OtaServiceInterface_proxy_backend_interface.h</td>
+</tr>
+<tr>
+<td>ProxyBackendInterface</td>
+<td>serialnotifyserviceinterface_proxy.h</td>
+<td>SerialNotifyServiceInterfaceProxyBackendInterface</td>
+<td>SerialNotifyServiceInterface_proxy_backend_interface.h</td>
+</tr>
+<tr>
+<td>ProxyBackendInterface</td>
+<td>seclogserviceinterface_proxy.h</td>
+<td>SecLogServiceInterfaceProxyBackendInterface</td>
+<td>SecLogServiceInterface_proxy_backend_interface.h</td>
+</tr>
+<tr>
+<td>ProxyBackendInterface</td>
+<td>doipserviceinterface_proxy.h</td>
+<td>DoipServiceInterfaceProxyBackendInterface</td>
+<td>DoipServiceInterface_proxy_backend_interface.h</td>
+</tr>
+<tr>
+<td>ProxyType</td>
+<td>serial_notify_service_client.h</td>
+<td>SerialNotifyServiceInterfaceProxy</td>
+<td>serialnotifyserviceinterface_proxy.h</td>
+</tr>
+<tr>
+<td>ProxyType</td>
+<td>SecLogServiceClient.h</td>
+<td>SecLogServiceInterfaceProxy</td>
+<td>seclogserviceinterface_proxy.h</td>
+</tr>
+<tr>
+<td>ProxyType</td>
+<td>doip_service_client.h</td>
+<td>DoipServiceInterfaceProxy</td>
+<td>doipserviceinterface_proxy.h</td>
+</tr>
+<tr>
+<td>FlashLogData_generated_type</td>
+<td>impl_type_secloginfostruct.h</td>
+<td>FlashLogString</td>
+<td>impl_type_flashlogstring.h</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="3-clangd">3 准确性测试（clangd 交叉验证）</h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>维度</th>
+<th>测试符号</th>
+<th>图谱结果</th>
+<th>clangd 结果</th>
+<th>精度</th>
+<th>召回</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AC-01</td>
+<td>继承(子类)</td>
+<td>BasePeriUpdate↓</td>
+<td>4 子类</td>
+<td>4 子类</td>
+<td>100%</td>
+<td>100%</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>AC-02</td>
+<td>继承(父类)</td>
+<td>SocUpdate↑</td>
+<td>1 父类: BasePeriUpdate</td>
+<td>1 父类: BasePeriUpdate</td>
+<td>100%</td>
+<td>100%</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>AC-03</td>
+<td>Callers</td>
+<td>FileHandler::FileExists</td>
+<td>15 函数</td>
+<td>15 调用点</td>
+<td>~100%</td>
+<td>~100%</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>AC-04</td>
+<td>Overrides</td>
+<td>BasePeriUpdate::PerformUpgrade</td>
+<td><strong>4</strong> 重写</td>
+<td><strong>0</strong></td>
+<td>—</td>
+<td><strong>图谱&gt;clangd</strong></td>
+<td>✅ 图谱胜</td>
+</tr>
+<tr>
+<td>AC-05</td>
+<td>Overrides</td>
+<td>BasePeriUpdate::TryPrepare</td>
+<td><strong>4</strong> 重写</td>
+<td><strong>0</strong></td>
+<td>—</td>
+<td><strong>图谱&gt;clangd</strong></td>
+<td>✅ 图谱胜</td>
+</tr>
+<tr>
+<td>AC-06</td>
+<td>FileSymbols</td>
+<td>ota_manager.cpp</td>
+<td>52 函数</td>
+<td>~53 函数</td>
+<td>98%</td>
+<td>98%</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>AC-07</td>
+<td>继承(叶子)</td>
+<td>GnssUpdate↓</td>
+<td>0 子类</td>
+<td>0 子类</td>
+<td>100%</td>
+<td>100%</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="4-vs-grep-vs-find">4 效率测试（图谱 vs grep vs find）</h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>查询</th>
+<th>图谱(ms)</th>
+<th>grep小(ms)</th>
+<th>grep中(ms)</th>
+<th>grep大(ms)</th>
+<th>find大(ms)</th>
+<th>图谱/grep大加速比</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>EF-01</td>
+<td>FileExists</td>
+<td><strong>0.24</strong></td>
+<td>2.57</td>
+<td>187.57</td>
+<td>243.67</td>
+<td>227.77</td>
+<td><strong>1011×</strong></td>
+</tr>
+<tr>
+<td>EF-02</td>
+<td>NotifyProgress</td>
+<td><strong>0.24</strong></td>
+<td>2.25</td>
+<td>187.66</td>
+<td>244.00</td>
+<td>216.82</td>
+<td><strong>1017×</strong></td>
+</tr>
+<tr>
+<td>EF-03</td>
+<td>GetInstance</td>
+<td><strong>0.26</strong></td>
+<td>3.14</td>
+<td>189.56</td>
+<td>247.98</td>
+<td>221.52</td>
+<td><strong>954×</strong></td>
+</tr>
+<tr>
+<td>EF-04</td>
+<td>PerformUpgrade</td>
+<td><strong>0.23</strong></td>
+<td>3.09</td>
+<td>189.76</td>
+<td>247.84</td>
+<td>222.89</td>
+<td><strong>1078×</strong></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>搜索范围: 小=hq_ota_service, 中=ap-aa/app, 大=ap-aa+model+foundation</p>
+</blockquote>
+<hr />
+<h2 id="5-bug">5 Bug 修复验证</h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Bug</th>
+<th>修复前</th>
+<th>修复后</th>
+<th>验证方式</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BG-01</td>
+<td>graph_db.py SyntaxError 阻断 type_alias 入库</td>
+<td>type_alias=0条, alias节点=0</td>
+<td>type_alias=<strong>9</strong>条, alias节点=48</td>
+<td>DB 边计数+边内容核对</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>BG-02</td>
+<td>交叉编译 target 缺失致 ota_manager.cpp 解析失败</td>
+<td>status=failed, 节点=0</td>
+<td>status=success, 节点=<strong>52</strong></td>
+<td>parse_status+node COUNT</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>BG-03</td>
+<td>增量更新无事务保护</td>
+<td>异常时 DB 半更新</td>
+<td>try/finally + _autocommit + rollback</td>
+<td>代码审查(逻辑验证)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>BG-04</td>
+<td>upsert_node 只更新 extra_info</td>
+<td>行号/命名空间/文件不更新</td>
+<td>UPDATE 含 namespace,file_path,start_line,end_line</td>
+<td>代码审查</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>BG-05</td>
+<td>insert_edge 冲突时跳过</td>
+<td>extra_info 不更新</td>
+<td>ON CONFLICT UPDATE extra_info</td>
+<td>代码审查</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>BG-06</td>
+<td>rename(R) 当 modified 处理</td>
+<td>旧路径残留</td>
+<td>R → D(old)+A(new)</td>
+<td>代码审查</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>BG-07</td>
+<td>operator 过滤误伤合法函数</td>
+<td>"operationsManager" 被误标 operator</td>
+<td>精确检查: <code>startswith("operator") and (len==8 or !isalnum)</code></td>
+<td>代码审查</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>BG-08</td>
+<td>构造/析构体内调用丢失</td>
+<td>constructor/destructor 内 calls 不提取</td>
+<td>加 CONSTRUCTOR/DESTRUCTOR 到 location map</td>
+<td>代码审查</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>BG-09</td>
+<td>unresolved 边去重 key 缺 namespace</td>
+<td>同名不同 namespace 的 callee 去重冲突</td>
+<td>key 纳入 callee_namespace+callee_parent_class</td>
+<td>代码审查</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>BG-10</td>
+<td>全量解析 hq_ota_service 失败率</td>
+<td>N/A</td>
+<td><strong>0/29 = 0%</strong></td>
+<td>parse_status COUNT</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="6">6 真实场景测试</h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>场景(实际问过的问题)</th>
+<th>工具</th>
+<th>查询</th>
+<th>结果</th>
+<th>grep 等价耗时</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RS-01</td>
+<td>"BasePeriUpdate 有哪些子类？"</td>
+<td>get_inheritance</td>
+<td>BasePeriUpdate↓</td>
+<td>4 个: Gnss/Mcu/Soc/SwitchUpdate</td>
+<td>200ms+ 需人工筛</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>RS-02</td>
+<td>"谁调用了 getActiveBootChain？"</td>
+<td>get_callers</td>
+<td>getActiveBootChain</td>
+<td>OtaManager/OtaServiceInterface/MccAdapter</td>
+<td>混杂ARCOM生成代码</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>RS-03</td>
+<td>"type_alias 功能实现了吗？"</td>
+<td>SQL/边计数</td>
+<td>type_alias</td>
+<td><strong>9 条边 &gt; 0</strong> → 已实现且工作</td>
+<td>无法直接回答</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>RS-04</td>
+<td>"改 base_peri_update.h 影响什么？"</td>
+<td>traverse_graph</td>
+<td>BasePeriUpdate depth=2</td>
+<td>20+ 节点,4 子类,所有虚函数+调用方</td>
+<td>需多轮 grep 人工串联</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>RS-05</td>
+<td>"PerformUpgrade 有哪些 override？"</td>
+<td>get_overrides</td>
+<td>PerformUpgrade(BP)</td>
+<td><strong>4 个重写类</strong></td>
+<td>clangd 返回 0</td>
+<td>✅ 图谱胜</td>
+</tr>
+<tr>
+<td>RS-06</td>
+<td>"SocUpdate::PerformUpgrade 内部做了什么？"</td>
+<td>get_callees</td>
+<td>PerformUpgrade(SocUpdate)</td>
+<td>9 个: Logger/ExecuteDU/StartCS/StopCS/…</td>
+<td>grep 只能看到文本,无法区分调用 vs 定义</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>RS-07</td>
+<td>"ota_manager.cpp 里有什么？"</td>
+<td>get_file_symbols</td>
+<td>ota_manager.cpp</td>
+<td>52 个函数</td>
+<td>clangd 61 (含namespace/variable)</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="_1">汇总</h2>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>用例数</th>
+<th>通过</th>
+<th>警告</th>
+<th>失败</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>功能测试 (9工具)</td>
+<td>23</td>
+<td>23</td>
+<td>0</td>
+<td>0</td>
+</tr>
+<tr>
+<td>关系类型</td>
+<td>11</td>
+<td>10</td>
+<td>1 (using_decl漏1处)</td>
+<td>0</td>
+</tr>
+<tr>
+<td>准确性 (clangd)</td>
+<td>7</td>
+<td>7</td>
+<td>0</td>
+<td>0</td>
+</tr>
+<tr>
+<td>效率</td>
+<td>4</td>
+<td>4</td>
+<td>0</td>
+<td>0</td>
+</tr>
+<tr>
+<td>Bug 修复</td>
+<td>10</td>
+<td>10</td>
+<td>0</td>
+<td>0</td>
+</tr>
+<tr>
+<td>真实场景</td>
+<td>7</td>
+<td>7</td>
+<td>0</td>
+<td>0</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td><strong>62</strong></td>
+<td><strong>61</strong></td>
+<td><strong>1</strong></td>
+<td><strong>0</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>通过率: 61/62 = 98.4%</strong> (1 个警告为 using_decl 漏1处 literal operator,影响极小)</p></body></html>

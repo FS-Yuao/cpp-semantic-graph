@@ -166,9 +166,16 @@ class ChangeDetector:
             if len(parts) < 2:
                 continue
             status_letter = parts[0][0]  # R100 → R, M → M
-            # 重命名格式: R100\told\tnew，取新路径
-            git_path = parts[-1]
-            entries.append((status_letter, git_path))
+            if status_letter == "R" and len(parts) >= 3:
+                # 重命名格式: R100\told_path\tnew_path
+                # 拆成"删除旧路径 + 新增新路径"，避免旧路径节点/边残留
+                old_path = parts[1]
+                new_path = parts[2]
+                entries.append(("D", old_path))   # 删除旧路径
+                entries.append(("A", new_path))   # 新增新路径
+            else:
+                git_path = parts[-1]
+                entries.append((status_letter, git_path))
         return entries
 
     def _convert_git_path(self, git_path: str, status: str,

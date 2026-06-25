@@ -47,12 +47,17 @@ logger = logging.getLogger(__name__)
 
 # ── FastMCP 实例 ──
 
-# 项目名称：从环境变量或配置推断，避免硬编码
+# 项目名称：模块级占位，最终值在 main() 中确定
+# （环境变量 > 从 DB 路径推断）。导入期为空，避免在 main 推断前固化 instructions。
 _PROJECT_NAME = os.environ.get("CPP_GRAPH_PROJECT", "")
 
 
 def _build_instructions() -> str:
-    """构建 MCP instructions，动态包含项目名（如已知）"""
+    """构建 MCP instructions，动态包含项目名（如已知）
+
+    注意：必须在 _PROJECT_NAME 确定后调用（见 main()），
+    否则 instructions 中不会含项目名。
+    """
     base = ("C++ 语义图谱查询工具。用于搜索 C++ 类/函数定义、查继承/调用/override 关系、"
             "多跳遍历影响面分析、搜索项目文档。")
     if _PROJECT_NAME:
@@ -60,10 +65,22 @@ def _build_instructions() -> str:
     return base
 
 
+# FastMCP 实例在导入期创建（@mcp.tool() 装饰器需要实例存在）。
+# instructions 先用通用占位，main() 推断完项目名后通过 _mcp_server 覆写。
 mcp = FastMCP(
     "cpp-semantic-graph",
     instructions=_build_instructions(),
 )
+
+
+def _update_instructions():
+    """推断完项目名后更新 MCP instructions（通过内部属性覆写）。
+
+    FastMCP.instructions 是只读 property（返回 _mcp_server.instructions），
+    因此直接赋值 mcp.instructions 会报错。但 _mcp_server.instructions
+    是普通实例属性，可以赋值。main() 调用此方法即可让推断的项目名生效。
+    """
+    mcp._mcp_server.instructions = _build_instructions()
 
 # ── DB 连接（Lazy init） ──
 
@@ -200,7 +217,7 @@ def cpp_search_class(name: str, exact: bool = False) -> str:
     """按类名搜索 C++ 类定义。用于：找类在哪定义、查类的基本信息（命名空间、文件位置、是否抽象）。不适合：查继承关系（用 cpp_get_inheritance）、查函数（用 cpp_search_function）。
 
     Args:
-        name: 类名（支持模糊匹配，如 "SocUpdate" 或 "Update"）
+        name: 类名（支持模糊匹配，如 "MyClass" 或 "Update"）
         exact: 是否精确匹配（默认模糊匹配）
     """
     try:
@@ -223,8 +240,8 @@ def cpp_search_function(name: str, class_name: str = "") -> str:
     """按函数名搜索 C++ 函数定义。用于：找函数定义位置、查看函数签名和所属类。不适合：查调用关系（用 cpp_get_callers/cpp_get_callees）。
 
     Args:
-        name: 函数名（如 "PerformUpgrade"）
-        class_name: 限定所属类名（可选，如 "SocUpdate"）
+        name: 函数名（如 "doWork"）
+        class_name: 限定所属类名（可选，如 "MyClass"）
     """
     try:
         gq, _, _, _, _ = _get_queries()
@@ -247,7 +264,7 @@ def cpp_get_inheritance(class_name: str, direction: str = "down",
     """查询类的继承关系（支持多级）。用于：查父类/子类、理解类层次结构。direction="down" 查子类，"up" 查父类。
 
     Args:
-        class_name: 类名（如 "BasePeriUpdate"）
+        class_name: 类名（如 "MyBaseClass"）
         direction: 查询方向，"down" 查子类，"up" 查父类
         depth: 递归深度（1=直接，-1=全部）
     """
@@ -273,7 +290,7 @@ def cpp_get_callers(function_name: str, class_name: str = "") -> str:
     """查询谁调用了指定函数（影响面分析）。用于：修改函数前评估影响范围、理解函数被谁依赖。不适合：查函数调用了谁（用 cpp_get_callees）。
 
     Args:
-        function_name: 被调用方函数名（如 "GetSocBootChain"）
+        function_name: 被调用方函数名（如 "getValue"）
         class_name: 限定所属类名（可选）
     """
     try:
@@ -296,7 +313,7 @@ def cpp_get_callees(function_name: str, class_name: str = "") -> str:
     """查询指定函数调用了谁（调用链分析）。用于：理解函数内部逻辑、追踪依赖路径。不适合：查谁调用了此函数（用 cpp_get_callers）。
 
     Args:
-        function_name: 调用方函数名（如 "PerformUpgrade"）
+        function_name: 调用方函数名（如 "doWork"）
         class_name: 限定所属类名（可选）
     """
     try:
@@ -319,8 +336,8 @@ def cpp_get_overrides(function_name: str, class_name: str) -> str:
     """查询虚函数的所有重写实现。用于：查接口的所有实现、理解多态调度。适合分析 override 和纯虚函数的具体实现。
 
     Args:
-        function_name: 虚函数名（如 "PerformUpgrade"）
-        class_name: 声明该虚函数的基类名（必填，如 "BasePeriUpdate"）
+        function_name: 虚函数名（如 "doWork"）
+        class_name: 声明该虚函数的基类名（必填，如 "MyBaseClass"）
     """
     try:
         _, _, pq, _, _ = _get_queries()
@@ -342,7 +359,7 @@ def cpp_get_file_symbols(file_path: str) -> str:
     """查询文件内的所有类和函数符号。用于：快速了解文件内容、确认文件包含哪些定义。
 
     Args:
-        file_path: 文件路径（部分匹配即可，如 "soc_update.h"）
+        file_path: 文件路径（部分匹配即可，如 "my_module.h"）
     """
     try:
         gq, _, _, _, _ = _get_queries()
@@ -388,7 +405,7 @@ def cpp_traverse_graph(start: str, relation_types: list[str] | None = None,
     calls_direct, calls_virtual, calls_callback, doc_describes_code, code_refers_to_doc
 
     Args:
-        start: 起始节点名称（如 "SocUpdate"）
+        start: 起始节点名称（如 "MyClass"）
         relation_types: 遍历的关系类型列表（None=所有类型）
         direction: 遍历方向，"outgoing" 或 "incoming"
         depth: 最大遍历深度（默认 3）
@@ -504,6 +521,11 @@ def main():
     # 推断项目名（环境变量优先，否则从 DB 路径推断）
     if not _PROJECT_NAME:
         _PROJECT_NAME = _infer_project_name(_db_path)
+
+    # 项目名确定后，重新构建 instructions 并覆写到 FastMCP 实例。
+    # 导入期的占位 instructions 不含项目名，必须在此刷新，否则
+    # "从 DB 路径推断项目名"永远不会出现在发给 AI 的 instructions 里。
+    _update_instructions()
 
     logger.info("C++ 语义图谱 MCP Server 启动, DB=%s, project=%s",
                 _db_path, _PROJECT_NAME or "(未知)")

@@ -23,6 +23,13 @@ from .models import (
     NodeInfo, EdgeInfo, IncludeDep, ParseResult,
     NodeType, RelationType,
 )
+from .alias_extractor import AliasExtractor
+from .friend_extractor import FriendExtractor
+# TemplateExtractor 当前不参与提取：libclang 对模板特化（如 ThreadDrivenProxy<X>）
+# 不产生独立的 CLASS_DECL 节点（特化名只出现在 CONSTRUCTOR/TYPE_REF 的 spelling 中），
+# walk_preorder 找不到含 '<' 的类声明，提取产不出数据。保留导入以便后续改用
+# LibTooling 或基于 TYPE_REF 重建特化节点时复用。
+# from .template_extractor import TemplateExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +50,10 @@ class SemanticExtractor:
         self.index = clang.cindex.Index.create()
         self._config = config
         self._func_location_map: dict[str, list[tuple[int, int, str]]] = {}
+        # 复杂场景提取器（阶段 2-3）：类型别名/using 声明、友元关系。
+        # 复用 self._config 与 self._make_file_path，保证 file_path 与本类提取一致。
+        self._alias_extractor = AliasExtractor()
+        self._friend_extractor = FriendExtractor()
 
     def parse(self, entry: CompileCommand) -> ParseResult:
         """解析单个翻译单元
@@ -77,6 +88,10 @@ class SemanticExtractor:
             self._extract_inheritance(tu, result)
             self._extract_calls(tu, result)
             self._extract_includes(tu, result)
+
+            # 复杂场景（阶段 2-3）：类型别名/using 声明、友元关系。
+            # 传入 config 与 _make_file_path，保证 file_path 与上面提取一致。
+            self._extract_complex_scenarios(tu.cursor, result)
 
             # Deduplicate within this translation unit
             self._deduplicate(result)
@@ -132,7 +147,8 @@ class SemanticExtractor:
         key = file_path, value = [(start_line, end_line, func_key), ...]
         """
         for cursor in tu.cursor.walk_preorder():
-            if cursor.kind in (CursorKind.CXX_METHOD, CursorKind.FUNCTION_DECL):
+            if cursor.kind in (CursorKind.CXX_METHOD, CursorKind.FUNCTION_DECL,
+                               CursorKind.CONSTRUCTOR, CursorKind.DESTRUCTOR):
                 if not cursor.location.file:
                     continue
                 file_name = str(cursor.location.file.name)
@@ -154,7 +170,8 @@ class SemanticExtractor:
         # Strategy 1: walk semantic_parent chain (fast, works for most cases)
         parent = cursor.semantic_parent
         while parent:
-            if parent.kind in (CursorKind.CXX_METHOD, CursorKind.FUNCTION_DECL):
+            if parent.kind in (CursorKind.CXX_METHOD, CursorKind.FUNCTION_DECL,
+                               CursorKind.CONSTRUCTOR, CursorKind.DESTRUCTOR):
                 return self._make_function_key(parent)
             parent = parent.semantic_parent
 
@@ -462,7 +479,14 @@ class SemanticExtractor:
 
     def _should_filter_call(self, callee_name: str) -> bool:
         """过滤不需要的调用关系（标准库、编译器内部等）"""
-        if not callee_name or callee_name.startswith("operator"):
+        if not callee_name:
+            return True
+        # 过滤 C++ 运算符重载（operator+, operator= 等），
+        # 但不过滤以 "operator" 开头的合法函数名（如 operationsManager）。
+        # 运算符重载特征："operator" 后跟运算符符号（非字母数字）或刚好 8 字符。
+        if callee_name.startswith("operator") and (
+            len(callee_name) == 8 or not callee_name[8].isalnum()
+        ):
             return True
         if callee_name.startswith(("_M_", "_r_", "__")):
             return True
@@ -653,6 +677,29 @@ class SemanticExtractor:
             return False
 
     # ------------------------------------------------------------------
+    # Complex scenarios (阶段 2-3): 模板/别名/友元
+    # ------------------------------------------------------------------
+
+    def _extract_complex_scenarios(self, tu_cursor, result: ParseResult):
+        """提取类型别名/using 声明/友元关系，并入 result
+
+        模板实例化（TemplateExtractor）当前不调用：libclang 不为模板特化产生
+        独立 CLASS_DECL 节点，walk_preorder 找不到含 '<' 的类，提取无产出。
+        类型别名与友元由 AliasExtractor/FriendExtractor 提取，二者复用
+        self._config 与 self._make_file_path，保证 file_path 与本类提取一致。
+        """
+        alias_nodes, alias_edges = self._alias_extractor.extract_type_aliases(
+            tu_cursor, self._config, self._make_file_path,
+        )
+        friend_nodes, friend_edges = self._friend_extractor.extract_friends(
+            tu_cursor, self._config, self._make_file_path,
+        )
+        result.nodes.extend(alias_nodes)
+        result.nodes.extend(friend_nodes)
+        result.edges.extend(alias_edges)
+        result.edges.extend(friend_edges)
+
+    # ------------------------------------------------------------------
     # Deduplication
     # ------------------------------------------------------------------
 
@@ -673,8 +720,13 @@ class SemanticExtractor:
             if edge.to_unique_key:
                 key = (edge.from_unique_key, edge.to_unique_key, rt)
             else:
+                # 未解析边：去重 key 需含 callee 的命名空间和父类，
+                # 否则 A::init() 和 B::init() 会被误判为重复
                 callee = edge.extra_info.get("callee_name", "")
-                key = (edge.from_unique_key, f"__unresolved__{callee}", rt)
+                callee_ns = edge.extra_info.get("callee_namespace", "")
+                callee_parent = edge.extra_info.get("callee_parent_class", "")
+                key = (edge.from_unique_key,
+                       f"__unresolved__{callee_ns}::{callee_parent}::{callee}", rt)
             if key not in seen_edges:
                 seen_edges.add(key)
                 unique_edges.append(edge)

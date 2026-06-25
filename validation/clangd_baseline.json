@@ -1,0 +1,140 @@
+{
+  "_meta": {
+    "description": "clangd MCP ground truth — task 1-4 准确性验证基准",
+    "collected_by": "clangd MCP 工具（会话内人工采集）",
+    "collected_at": "2026-06-23",
+    "scope": "hq_ota_service 核心模块（peri_update 子模块 + base_peri_update）",
+    "note": "clangd 工具能力边界：find_symbol/get_type_hierarchy/get_type_info/find_references 可用；find_implementations 对虚函数 override 返回空（不可用）；get_callees method not found（不可用）。调用关系维度改用 find_references 的引用文件集合作 ground truth。"
+  },
+
+  "classes": [
+    {
+      "name": "BasePeriUpdate",
+      "namespace": "update",
+      "file": "hq_ota_service/include/base_peri_update.h",
+      "start_line": 13,
+      "is_abstract": true,
+      "supertypes": [],
+      "subtypes": [
+        {"name": "SocUpdate", "namespace": "update", "file": "hq_ota_service/include/soc_update.h", "line": 9},
+        {"name": "GnssUpdate", "namespace": "update", "file": "hq_ota_service/include/gnss_update.h", "line": 13},
+        {"name": "SwitchUpdate", "namespace": "update", "file": "hq_ota_service/include/switch_update.h", "line": 14},
+        {"name": "McuUpdate", "namespace": "update", "file": "hq_ota_service/include/mcu_update.h", "line": 13}
+      ]
+    },
+    {
+      "name": "SocUpdate",
+      "namespace": "update",
+      "file": "hq_ota_service/include/soc_update.h",
+      "start_line": 9,
+      "is_abstract": false,
+      "supertypes": [
+        {"name": "BasePeriUpdate", "namespace": "update", "file": "hq_ota_service/include/base_peri_update.h", "line": 13}
+      ],
+      "subtypes": []
+    }
+  ],
+
+  "functions": [
+    {
+      "name": "PerformUpgrade",
+      "owner_class": "BasePeriUpdate",
+      "namespace": "update",
+      "signature_normalized": "bool PerformUpgrade()",
+      "return_type": "bool",
+      "is_virtual": true,
+      "is_pure_virtual": true,
+      "is_override": false,
+      "declaration": "hq_ota_service/include/base_peri_update.h:25",
+      "definition": null,
+      "note": "纯虚函数，仅声明无定义"
+    },
+    {
+      "name": "PerformUpgrade",
+      "owner_class": "SocUpdate",
+      "namespace": "update",
+      "signature_normalized": "bool PerformUpgrade()",
+      "return_type": "bool",
+      "is_virtual": true,
+      "is_pure_virtual": false,
+      "is_override": true,
+      "declaration": "hq_ota_service/include/soc_update.h:18",
+      "definition": "hq_ota_service/src/peri_update/soc/soc_update.cpp:612"
+    },
+    {
+      "name": "PerformUpgrade",
+      "owner_class": "GnssUpdate",
+      "namespace": "update",
+      "signature_normalized": "bool PerformUpgrade()",
+      "return_type": "bool",
+      "is_virtual": true,
+      "is_pure_virtual": false,
+      "is_override": true,
+      "declaration": "hq_ota_service/include/gnss_update.h:22",
+      "definition": "hq_ota_service/src/peri_update/gnss/gnss_update.cpp:129"
+    },
+    {
+      "name": "PerformUpgrade",
+      "owner_class": "SwitchUpdate",
+      "namespace": "update",
+      "signature_normalized": "bool PerformUpgrade()",
+      "return_type": "bool",
+      "is_virtual": true,
+      "is_pure_virtual": false,
+      "is_override": true,
+      "declaration": "hq_ota_service/include/switch_update.h:23",
+      "definition": "hq_ota_service/src/peri_update/switch/switch_update.cpp:100"
+    },
+    {
+      "name": "PerformUpgrade",
+      "owner_class": "McuUpdate",
+      "namespace": "update",
+      "signature_normalized": "bool PerformUpgrade()",
+      "return_type": "bool",
+      "is_virtual": true,
+      "is_pure_virtual": false,
+      "is_override": true,
+      "declaration": "hq_ota_service/include/mcu_update.h:22",
+      "definition": "hq_ota_service/src/peri_update/mcu/mcu_update.cpp:147"
+    },
+    {
+      "name": "GetPeriName",
+      "owner_class": "SocUpdate",
+      "namespace": "update",
+      "signature_normalized": "std::string GetPeriName()",
+      "return_type": "std::string",
+      "is_virtual": true,
+      "is_pure_virtual": false,
+      "is_override": true,
+      "declaration": "hq_ota_service/include/soc_update.h:16",
+      "definition": "hq_ota_service/src/peri_update/soc/soc_update.cpp:170"
+    }
+  ],
+
+  "call_references": [
+    {
+      "symbol": "PerformUpgrade",
+      "owner_class": "BasePeriUpdate",
+      "references": [
+        {"file": "hq_ota_service/src/peri_manger/peri_adapter.cpp", "line": 61, "kind": "call"},
+        {"file": "hq_ota_service/src/ota_manager/ota_manager.cpp", "line": 879, "kind": "call"}
+      ],
+      "note": "图谱按静态类型建边（BasePeriUpdate* 指针的虚调用，calls_virtual）。两处调用方：peri_adapter.cpp:61 (agent->impl->PerformUpgrade) 和 ota_manager.cpp:879 (updater->PerformUpgrade)。注：clangd find_references('PerformUpgrade') 返回 4 处、find_references('BasePeriUpdate::PerformUpgrade') 返回 10 处，均未包含 ota_manager.cpp:879——图谱反而比 clangd references 更全（该调用真实存在于源码）。多态动态解析见 task 2-1"
+    },
+    {
+      "symbol": "ExecuteDriveUpdate",
+      "owner_class": "SocUpdate",
+      "references": [
+        {"file": "hq_ota_service/src/peri_update/soc/soc_update.cpp", "line": 631, "kind": "call"}
+      ],
+      "note": "clangd find_references 的 call 引用。第 631 行是 PerformUpgrade 内对 ExecuteDriveUpdate 的调用（this->ExecuteDriveUpdate()，静态类型即 SocUpdate），图谱建边到 SocUpdate::ExecuteDriveUpdate"
+    }
+  ],
+
+  "thresholds": {
+    "class_definition": {"precision_min": 0.98, "recall_min": 0.95},
+    "inheritance": {"precision_min": 0.95, "recall_min": 0.90},
+    "function_signature": {"precision_min": 0.95, "recall_min": 0.90},
+    "call_relation": {"precision_min": 0.85, "recall_min": 0.80, "note": "允许间接调用/回调缺失"}
+  }
+}

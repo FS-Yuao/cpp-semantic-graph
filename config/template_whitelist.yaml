@@ -1,0 +1,30 @@
+# 模板白名单配置
+# 指定哪些模板特化必须导出为独立节点
+
+template_whitelist:
+  # ---- ARA COM Proxy ----
+  # hq_ota_service 核心 Proxy
+  - template: "amsr::socal::ThreadDrivenProxy"
+    specializations:
+      - "OtaServiceInterfaceProxy"        # OTA 服务 Proxy（BootChainChanged/GetSocBootChain/EnterUpgrade）
+      - "DoipServiceInterfaceProxy"        # DoIP 服务 Proxy（DoipTrans/FF/LargeTrans）
+    action: "instantiate_as_node"
+
+  # hq_vehicle_service 核心 Proxy
+  - template: "amsr::socal::ThreadDrivenProxy"
+    specializations:
+      - "PowerStatusServiceInterfaceProxy"  # 电源状态 Proxy
+    action: "instantiate_as_node"
+
+  # ---- ARA COM Service Interface (非模板，但由代码生成器产出) ----
+  - template: null  # 非模板类
+    classes:
+      - "OtaServiceInterface"              # OTA 服务接口
+      - "DoipServiceInterface"             # DoIP 服务接口
+      - "PowerStatusServiceInterface"       # 电源状态接口
+    action: "include_as_node"
+
+  # ---- 其他模板（如需补充） ----
+
+# 默认策略：只导出模板定义，不展开实例化
+default_action: "definition_only"

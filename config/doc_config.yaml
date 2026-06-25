@@ -1,0 +1,70 @@
+# 文档解析配置
+
+doc_dirs:
+  - "docs/"
+
+exclude_patterns:
+  - "*.html"
+  - "*/build/*"
+  - "*/__pycache__/*"
+  - "*/cpp_semantic_graph_env/*"
+  - "*/.claude/*"
+
+# 按目录自动打标签（路径相对于 docs/ 根目录）
+tag_rules:
+  - path_pattern: "OTA_flow/**"
+    tags: ["架构设计", "OTA"]
+  - path_pattern: "AB_Switch/**"
+    tags: ["架构设计", "A/B分区"]
+  - path_pattern: "Doip_Uds/**"
+    tags: ["接口规约", "UDS"]
+  - path_pattern: "ADC4.0_System_architecture/**"
+    tags: ["系统架构"]
+  - path_pattern: "du_mcc/**"
+    tags: ["DUCC", "MCC"]
+  - path_pattern: "Claude_Code_Graph/**"
+    tags: ["工具", "MCP"]
+  - path_pattern: "Claude_harness/**"
+    tags: ["工具", "Claude"]
+  - path_pattern: "task/**"
+    tags: ["开发任务"]
+  - path_pattern: "review_reports/**"
+    tags: ["审查报告"]
+  - path_pattern: "Completion status/**"
+    tags: ["完成报告"]
+
+section_split:
+  min_level: 2         # 按 ## 切片
+  min_word_count: 20   # 少于 20 字的切片合并到上一节
+
+# 手动精准关联（不侵入文档原文）
+# 每条指定文档路径 + 关联的代码实体名，confidence=1.0
+manual_links:
+  - doc: "OTA_flow/OTA_COMPLETE_FLOW.md"
+    heading: "刷写与激活"
+    code:
+      - "BasePeriUpdate"
+      - "SocUpdate"
+      - "PerformUpgrade"
+      - "ExecuteDriveUpdate"
+
+  - doc: "OTA_flow/OTA_COMPLETE_FLOW.md"
+    heading: "完整性校验"
+    code:
+      - "VerifyVersionCompatibility"
+
+  - doc: "OTA_flow/OTA_COMPLETE_FLOW.md"
+    heading: "备份与持久化"
+    code:
+      - "SafeCopy"
+      - "Rollback"
+
+  - doc: "AB_Switch/AB_PARTITION_SWITCH_DESIGN.md"
+    code:
+      - "GetSocBootChain"
+
+  - doc: "ADC4.0_System_architecture/ARCHITECTURE.md"
+    code:
+      - "OtaManager"
+      - "BasePeriUpdate"
+      - "OtaServiceInterfaceProxy"

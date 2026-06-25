@@ -1,21 +1,27 @@
 """
 C++ 语义图谱 CLI 工具
 
-提供 4 个核心查询命令:
+提供 9 个查询命令（与 MCP 工具一一对应）:
   search-class   按类名搜索
   inheritance    查询继承关系
   search-func    按函数名搜索
   file-symbols   查文件内符号
+  callers        查谁调用了某函数
+  callees        查某函数调用了谁
+  overrides      查虚函数的所有重写
+  traverse       多跳遍历图谱
+  search-docs    搜索项目文档
 
 另有:
   import         批量导入 JSON 到 SQLite
   stats          查看数据库统计
 
 用法:
-  python -m cpp_semantic_graph search-class "SocUpdate"
-  python -m cpp_semantic_graph inheritance "BasePeriUpdate" --direction down
-  python -m cpp_semantic_graph search-func "PerformUpgrade"
-  python -m cpp_semantic_graph file-symbols "soc_update.cpp"
+  python -m cpp_semantic_graph search-class "MyClass"
+  python -m cpp_semantic_graph inheritance "MyBaseClass" --direction down
+  python -m cpp_semantic_graph callers "doWork"
+  python -m cpp_semantic_graph overrides "doWork" --class-name MyBaseClass
+  python -m cpp_semantic_graph traverse "MyClass" --depth 2
 """
 
 import argparse
@@ -30,6 +36,10 @@ if str(_HERE.parent) not in sys.path:
     sys.path.insert(0, str(_HERE.parent))
 
 from cpp_semantic_graph.query import GraphQuery, ClassInfo, InheritanceInfo, FunctionInfo, SymbolInfo
+from cpp_semantic_graph.query.call_query import CallQuery, CallInfo
+from cpp_semantic_graph.query.polymorphism_query import PolymorphismQuery, OverrideInfo
+from cpp_semantic_graph.query.traverse import TraverseQuery, TraverseResult
+from cpp_semantic_graph.query.doc_query import DocQuery, DocWithCode
 
 
 def _fmt_class(ci: ClassInfo) -> str:
@@ -68,6 +78,52 @@ def _fmt_function(fi: FunctionInfo) -> str:
 def _fmt_symbol(si: SymbolInfo) -> str:
     ns = f"{si.namespace}::" if si.namespace else ""
     return f"  [{si.node_type}] {ns}{si.name}  ({si.file_path}:{si.start_line}-{si.end_line})"
+
+
+def _fmt_call_info(ci: CallInfo, is_caller: bool) -> str:
+    """格式化调用关系信息
+
+    Args:
+        is_caller: True=展示调用方（callers 场景，给 caller_file:line）
+                   False=展示被调用方（callees 场景，给 callee_file）
+    """
+    virt = " [virtual]" if ci.is_virtual_dispatch else ""
+    if is_caller:
+        cls = f"{ci.caller_class}::" if ci.caller_class else ""
+        ns = f"{ci.caller_namespace}::" if ci.caller_namespace else ""
+        return (f"  {ns}{cls}{ci.caller_name}  →  {ci.callee_name}{virt}\n"
+                f"    [{ci.call_type}]  {ci.caller_file}:{ci.caller_line}")
+    # callees
+    cls = f"{ci.callee_class}::" if ci.callee_class else ""
+    ns = f"{ci.callee_namespace}::" if ci.callee_namespace else ""
+    return (f"  {ci.caller_name}  →  {ns}{cls}{ci.callee_name}{virt}\n"
+            f"    [{ci.call_type}]  {ci.callee_file}")
+
+
+def _fmt_override(oi: OverrideInfo) -> str:
+    ns = f"{oi.namespace}::" if oi.namespace else ""
+    cls = f"{oi.class_name}::" if oi.class_name else ""
+    return (f"  {ns}{cls}{oi.function_name}  ({oi.file_path}:{oi.line_number})\n"
+            f"    signature: {oi.signature}\n"
+            f"    overrides: {oi.base_class}::{oi.function_name}")
+
+
+def _fmt_doc(dc: DocWithCode) -> str:
+    d = dc.doc
+    tags = f"  [{', '.join(d.tags)}]" if d.tags else ""
+    lines = [
+        f"  - {d.title}  ({d.file_path}:{d.start_line}-{d.end_line}){tags}",
+    ]
+    preview = d.content_preview.replace("\n", " ").strip()
+    if preview:
+        lines.append(f"    预览: {preview[:120]}{'…' if len(preview) > 120 else ''}")
+    if dc.related_code:
+        codes = ", ".join(
+            f"{c.get('name', '?')}({c.get('confidence', 0):.2f})"
+            for c in dc.related_code[:5]
+        )
+        lines.append(f"    关联代码: {codes}")
+    return "\n".join(lines)
 
 
 # ======================================================================
@@ -149,6 +205,107 @@ def cmd_file_symbols(args):
         print(f"\n  其他 ({len(others)}):")
         for s in others:
             print(_fmt_symbol(s))
+
+
+def cmd_callers(args):
+    """查询谁调用了指定函数"""
+    with CallQuery(args.db) as cq:
+        start = time.perf_counter()
+        results = cq.get_callers(args.name, class_name=args.class_name or None)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+    if not results:
+        print(f"未找到调用 {args.name} 的代码")
+        return
+
+    print(f"调用 {args.name} 的代码（{len(results)} 个, {elapsed_ms:.1f}ms）:")
+    for ci in results:
+        print(_fmt_call_info(ci, is_caller=True))
+
+
+def cmd_callees(args):
+    """查询指定函数调用了谁"""
+    with CallQuery(args.db) as cq:
+        start = time.perf_counter()
+        results = cq.get_callees(args.name, class_name=args.class_name or None)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+    if not results:
+        print(f"未找到 {args.name} 调用的代码")
+        return
+
+    print(f"{args.name} 调用的代码（{len(results)} 个, {elapsed_ms:.1f}ms）:")
+    for ci in results:
+        print(_fmt_call_info(ci, is_caller=False))
+
+
+def cmd_overrides(args):
+    """查询虚函数的所有重写实现"""
+    if not args.class_name:
+        print("错误: overrides 需要 --class-name 指定声明该虚函数的基类名", file=sys.stderr)
+        sys.exit(2)
+    with PolymorphismQuery(args.db) as pq:
+        start = time.perf_counter()
+        results = pq.get_all_overrides(args.name, class_name=args.class_name)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+    if not results:
+        print(f"未找到 {args.name}（基类 {args.class_name}）的重写实现")
+        return
+
+    print(f"{args.name} 的重写实现（{len(results)} 个, {elapsed_ms:.1f}ms）:")
+    for oi in results:
+        print(_fmt_override(oi))
+
+
+def cmd_traverse(args):
+    """多跳遍历图谱"""
+    rel_types = None
+    if args.relation_types:
+        rel_types = [r.strip() for r in args.relation_types.split(",") if r.strip()]
+
+    with TraverseQuery(args.db) as tq:
+        start = time.perf_counter()
+        result = tq.traverse_graph(
+            args.start, relation_types=rel_types, direction=args.direction,
+            depth=args.depth, mode=args.mode, max_results=args.max_results,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+    if not result.nodes:
+        print(f"从 {args.start} 出发未找到关联节点")
+        return
+
+    print(f"从 {args.start} 出发（{len(result.nodes)} 个节点, "
+          f"{result.stats.total_edges_traversed} 条边, {elapsed_ms:.1f}ms）:")
+    if result.stats.truncated:
+        print(f"  (结果已截断，上限 {args.max_results})")
+    for i, node in enumerate(result.nodes, 1):
+        ns = node.get("namespace", "")
+        ns = f"{ns}::" if ns else ""
+        name = node.get("name", "?")
+        ntype = node.get("type", "?")
+        fp = node.get("file_path", "")
+        print(f"  {i}. [{ntype}] {ns}{name}  ({fp})")
+
+
+def cmd_search_docs(args):
+    """搜索项目文档"""
+    with DocQuery(args.db) as dq:
+        start = time.perf_counter()
+        results = dq.search_documentation(
+            args.keyword, tag=args.tag or None,
+            max_results=args.max_results, min_confidence=args.min_confidence,
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+    if not results:
+        print(f"未找到匹配 {args.keyword!r} 的文档")
+        return
+
+    print(f"文档搜索 {args.keyword!r}（{len(results)} 个结果, {elapsed_ms:.1f}ms）:")
+    for dc in results:
+        print(_fmt_doc(dc))
 
 
 def cmd_import(args):
@@ -328,8 +485,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--db", "-d",
-        default="semantic_graph.db",
-        help="SQLite 数据库路径 (默认: semantic_graph.db)",
+        default="semantic_graph_full.db",
+        help="SQLite 数据库路径 (默认: semantic_graph_full.db)",
     )
 
     sub = parser.add_subparsers(dest="command", help="子命令")
@@ -359,6 +516,49 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("file-symbols", help="查询文件内符号")
     p.add_argument("file_path", help="文件路径（支持部分匹配）")
     p.set_defaults(func=cmd_file_symbols)
+
+    # callers
+    p = sub.add_parser("callers", help="查询谁调用了指定函数（影响面分析）")
+    p.add_argument("name", help="被调用方函数名")
+    p.add_argument("--class-name", "-c", help="限定所属类名")
+    p.set_defaults(func=cmd_callers)
+
+    # callees
+    p = sub.add_parser("callees", help="查询指定函数调用了谁（调用链分析）")
+    p.add_argument("name", help="调用方函数名")
+    p.add_argument("--class-name", "-c", help="限定所属类名")
+    p.set_defaults(func=cmd_callees)
+
+    # overrides
+    p = sub.add_parser("overrides", help="查询虚函数的所有重写实现")
+    p.add_argument("name", help="虚函数名")
+    p.add_argument("--class-name", "-c", required=True,
+                   help="声明该虚函数的基类名（必填）")
+    p.set_defaults(func=cmd_overrides)
+
+    # traverse
+    p = sub.add_parser("traverse", help="多跳遍历图谱（影响面分析）")
+    p.add_argument("start", help="起始节点名称")
+    p.add_argument("--relation-types", "-r", default=None,
+                   help="逗号分隔的关系类型列表（如 inherits_public,calls_direct），默认全部")
+    p.add_argument("--direction", "-D", default="outgoing",
+                   choices=["outgoing", "incoming"],
+                   help="遍历方向（默认 outgoing）")
+    p.add_argument("--depth", type=int, default=3, help="最大遍历深度（默认 3）")
+    p.add_argument("--mode", default="bfs", choices=["bfs", "dfs"],
+                   help="遍历模式（默认 bfs）")
+    p.add_argument("--max-results", type=int, default=50,
+                   help="最大返回节点数（默认 50）")
+    p.set_defaults(func=cmd_traverse)
+
+    # search-docs
+    p = sub.add_parser("search-docs", help="搜索项目文档")
+    p.add_argument("keyword", help="搜索关键词")
+    p.add_argument("--tag", "-t", help="按标签过滤（可选）")
+    p.add_argument("--max-results", type=int, default=10, help="最大返回数（默认 10）")
+    p.add_argument("--min-confidence", type=float, default=0.0,
+                   help="关联代码最低置信度（0=不过滤，默认 0）")
+    p.set_defaults(func=cmd_search_docs)
 
     # import
     p = sub.add_parser("import", help="导入 JSON 到数据库")

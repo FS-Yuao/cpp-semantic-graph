@@ -22,6 +22,11 @@ class ProjectConfig:
     skip_function_bodies: bool = False
     max_workers: int = 1
     template_whitelist: str = ""
+    # 交叉编译支持：libclang 默认按宿主 triple 解析，交叉编译项目（aarch64 等）
+    # 的 sysroot 头文件会用到 target 专属内建类型（NEON/SVE），不指定 -target 会 fatal。
+    # toolchain_includes：工具链 C++ 标准库头所在目录（compile_commands 通常不带）。
+    target_triple: str = ""
+    toolchain_includes: list[str] = field(default_factory=list)
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "ProjectConfig":
@@ -46,7 +51,25 @@ class ProjectConfig:
             skip_function_bodies=parse_opts.get("skip_function_bodies", False),
             max_workers=parse_opts.get("max_workers", 1),
             template_whitelist=data.get("template_whitelist", ""),
+            target_triple=data.get("target_triple", ""),
+            toolchain_includes=data.get("toolchain_includes", []),
         )
+
+    @property
+    def extra_parse_flags(self) -> list[str]:
+        """需要注入到每个翻译单元的额外编译参数。
+
+        - 交叉编译 target：-target <triple>
+        - 工具链 C++ stdlib 头：-isystem <dir>（每个 toolchain_includes 一条）
+
+        仅在配置了相应字段时产生，未配置返回空列表（兼容本机编译项目）。
+        """
+        flags: list[str] = []
+        if self.target_triple:
+            flags += ["-target", self.target_triple]
+        for inc in self.toolchain_includes:
+            flags.append(f"-isystem{inc}")
+        return flags
 
     # ------------------------------------------------------------------
     # 核心路径判断接口 — 所有过滤逻辑统一走这里

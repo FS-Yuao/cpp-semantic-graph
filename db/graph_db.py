@@ -34,6 +34,7 @@ class GraphDB:
         self.conn.execute("PRAGMA journal_mode=WAL")      # 并发读写
         self.conn.execute("PRAGMA foreign_keys=ON")        # 外键约束
         self.conn.row_factory = sqlite3.Row
+        self._autocommit = True  # False 时 _commit() 变 no-op，由外部事务控制
         self._init_schema()
 
     def _init_schema(self):
@@ -45,7 +46,7 @@ class GraphDB:
         else:
             # Fallback: inline schema
             self._create_tables_inline()
-        self.conn.commit()
+        self._commit()
 
     def _create_tables_inline(self):
         """内联建表（schema.sql 不可用时的 fallback）"""
@@ -108,6 +109,11 @@ class GraphDB:
         """关闭数据库连接"""
         self.conn.close()
 
+    def _commit(self):
+        """提交事务（当 _autocommit=True 时生效，否则由外部事务控制）"""
+        if self._autocommit:
+            self.conn.commit()
+
     # ------------------------------------------------------------------
     # Node operations
     # ------------------------------------------------------------------
@@ -116,7 +122,7 @@ class GraphDB:
         """插入或更新节点，返回 node id
 
         - unique_key 不存在 → INSERT
-        - unique_key 已存在 → UPDATE extra_info, updated_at
+        - unique_key 已存在 → UPDATE 可变字段（行号、命名空间、extra_info 等）
         """
         type_val = node.type.value if isinstance(node.type, NodeType) else node.type
         extra_json = json.dumps(node.extra_info, ensure_ascii=False) if node.extra_info else None
@@ -131,11 +137,13 @@ class GraphDB:
             )
             return cursor.lastrowid
         except sqlite3.IntegrityError:
-            # unique_key conflict → update
+            # unique_key conflict → update 可变字段
             self.conn.execute(
-                """UPDATE node SET extra_info=?, updated_at=datetime('now')
+                """UPDATE node SET namespace=?, file_path=?, start_line=?, end_line=?,
+                          extra_info=?, updated_at=datetime('now')
                    WHERE unique_key=?""",
-                (extra_json, node.unique_key)
+                (node.namespace, node.file_path, node.start_line, node.end_line,
+                 extra_json, node.unique_key)
             )
             row = self.conn.execute(
                 "SELECT id FROM node WHERE unique_key=?", (node.unique_key,)
@@ -185,10 +193,10 @@ class GraphDB:
 
     def insert_edge(self, from_id: int, to_id: int, relation_type: str,
                     extra_info: dict = None) -> int | None:
-        """插入边，已存在则跳过
+        """插入边，已存在则更新 extra_info
 
         Returns:
-            edge id，或 None（已存在）
+            edge id，或 None（不应发生）
         """
         extra_json = json.dumps(extra_info, ensure_ascii=False) if extra_info else None
         try:
@@ -199,8 +207,18 @@ class GraphDB:
             )
             return cursor.lastrowid
         except sqlite3.IntegrityError:
-            # (from_id, to_id, relation_type) conflict → skip
-            return None
+            # (from_id, to_id, relation_type) conflict → update extra_info
+            self.conn.execute(
+                """UPDATE edge SET extra_info=?
+                   WHERE from_id=? AND to_id=? AND relation_type=?""",
+                (extra_json, from_id, to_id, relation_type)
+            )
+            row = self.conn.execute(
+                """SELECT id FROM edge
+                   WHERE from_id=? AND to_id=? AND relation_type=?""",
+                (from_id, to_id, relation_type)
+            ).fetchone()
+            return row["id"] if row else None
 
     def get_edges_from(self, node_id: int, relation_type: str = None) -> list[dict]:
         """查询从指定节点出发的边"""
@@ -478,6 +496,40 @@ class GraphDB:
                             ).fetchone()
                             if to_row:
                                 to_id = to_row["id"]
+
+                elif resolve_hint == "type_alias":
+                    # ── 类型别名边解析 ──
+                    # from=别名节点 → to=目标类型节点
+                    # target 的 namespace/file_path 未知（多来自外部库），
+                    # 按 target_simple_name 在 DB 中查同名 class 节点。
+                    target_simple = edge.extra_info.get("target_simple_name", "")
+                    if target_simple:
+                        to_row = self.conn.execute(
+                            """SELECT id FROM node
+                               WHERE name=? AND type IN ('class', 'struct')
+                               LIMIT 1""",
+                            (target_simple,)
+                        ).fetchone()
+                        if to_row:
+                            to_id = to_row["id"]
+
+                elif resolve_hint == "using_decl":
+                    # ── using 声明边解析 ──
+                    # from=子类::func → to=基类::func
+                    # 按 base_class + func_name 查基类中的同名函数。
+                    func_name = edge.extra_info.get("function_name", "")
+                    base_class = edge.extra_info.get("base_class", "")
+                    if func_name and base_class:
+                        to_row = self.conn.execute(
+                            """SELECT id FROM node
+                               WHERE name=? AND type='function'
+                               AND namespace LIKE ?
+                               LIMIT 1""",
+                            (func_name, f"%{base_class}%")
+                        ).fetchone()
+                        if to_row:
+                            to_id = to_row["id"]
+
                 else:
                     # ── 调用边解析（原逻辑） ──
                     callee_name = edge.extra_info.get("callee_name", "")
@@ -537,7 +589,7 @@ class GraphDB:
             edge_count=result.edge_count,
         )
 
-        self.conn.commit()
+        self._commit()
         return stats
 
     def import_results(self, results: list[ParseResult]) -> dict:
@@ -612,7 +664,7 @@ class GraphDB:
             "DELETE FROM parse_status WHERE source_file LIKE ?", (f"%{file_path}%",)
         )
 
-        self.conn.commit()
+        self._commit()
         return len(node_ids)
 
     # ------------------------------------------------------------------
@@ -636,7 +688,7 @@ class GraphDB:
                WHERE from_id IN (SELECT id FROM node WHERE file_path = ?)""",
             (file_path,)
         )
-        self.conn.commit()
+        self._commit()
         return cursor.rowcount
 
     def delete_tu_data(self, source_file_rel: str,
@@ -664,7 +716,7 @@ class GraphDB:
                 "DELETE FROM parse_status WHERE source_file LIKE ?",
                 (f"%{source_file_rel}%",)
             )
-        self.conn.commit()
+        self._commit()
         return {
             "includes_deleted": inc_cur.rowcount,
             "parse_status_deleted": ps_cur.rowcount,
@@ -700,7 +752,7 @@ class GraphDB:
             f"DELETE FROM node WHERE id IN ({placeholders})",
             to_delete
         )
-        self.conn.commit()
+        self._commit()
         return len(to_delete)
 
     def delete_file_completely(self, file_path: str) -> dict:
@@ -741,7 +793,7 @@ class GraphDB:
             "DELETE FROM parse_status WHERE source_file LIKE ?",
             (f"%{file_path}%",)
         )
-        self.conn.commit()
+        self._commit()
         return {
             "nodes_deleted": node_count,
             "edges_cascaded": edge_count,

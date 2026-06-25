@@ -1,0 +1,52 @@
+# C++ 语义图谱工具 — 项目配置文件
+# 换项目只改这个文件，不改代码
+
+project:
+  name: "hq_ota_service"
+  # compile_commands.json 路径（相对于项目根目录或绝对路径）
+  compile_commands: "/mnt/code1/adc4.0/drive-vendor/ap/ap-aa/compile_commands.json"
+
+# 源码范围定义 — 决定哪些代码算"项目代码"
+# 节点提取和调用关系过滤都基于此
+source_paths:
+  - "hq_ota_service/src"
+  - "hq_ota_service/include"
+
+# 生成代码路径 — 头文件入库接口声明，源文件不入库
+# 调用关系中，callee 在此范围内也保留
+generated_paths:
+  - "src-gen"
+
+# 完全忽略的路径 — 不解析不入库
+exclude_paths:
+  - "thirdparty"
+  - "build"
+  - "test/mock"
+
+# 工具环境
+libclang_path: "/usr/lib/llvm-18/lib/libclang.so.1"
+
+# 交叉编译支持（aarch64 目标）
+# libclang 默认按宿主 x86_64 解析，必须指定 -target 否则 sysroot 的 math-vector.h
+# (NEON/SVE 内建类型 __neon_vector_type__/__SVFloat32_t) 会 fatal。
+# toolchain_includes 指向交叉工具链的 C++ 标准库头目录（compile_commands 不带）。
+target_triple: "aarch64-linux-gnu"
+toolchain_includes:
+  - "/mnt/code1/adc4.0/toolchains/aarch64--glibc--bleeding-edge-2024.02-1/aarch64-buildroot-linux-gnu/include/c++/13.2.0"
+  - "/mnt/code1/adc4.0/toolchains/aarch64--glibc--bleeding-edge-2024.02-1/aarch64-buildroot-linux-gnu/include/c++/13.2.0/aarch64-buildroot-linux-gnu"
+
+# 解析选项
+parse_options:
+  # 是否跳过函数体（加速解析，但无法提取调用关系）
+  skip_function_bodies: false
+  # 并行解析的最大进程数（1=串行，内存最低）
+  max_workers: 1
+
+# 模板白名单（可选，不配则所有模板只导出定义）
+template_whitelist: "config/template_whitelist.yaml"
+
+# 文档配置（阶段 3）
+docs_config: "config/doc_config.yaml"
+
+# 文档根目录（相对于此配置文件所在目录，或绝对路径）
+docs_dir: "../../docs"

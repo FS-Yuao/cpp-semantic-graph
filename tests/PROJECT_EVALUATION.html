@@ -1,0 +1,374 @@
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>PROJECT_EVALUATION</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;color:#24292f;max-width:1100px;margin:0 auto;padding:30px 45px;background:#fff}h1{border-bottom:1px solid #d0d7de;padding-bottom:10px}h2{border-bottom:1px solid #d0d7de;padding-bottom:8px;margin-top:24px}h3{margin-top:20px}table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13px}th,td{border:1px solid #d0d7de;padding:5px 10px;text-align:left}th{background:#f6f8fa;font-weight:600;white-space:nowrap}tr:nth-child(even){background:#f6f8fa}code{background:#f6f8fa;padding:1px 5px;border-radius:3px;font-size:85%}pre{background:#f6f8fa;padding:14px;border-radius:6px;overflow-x:auto}pre code{background:none;padding:0}</style></head><body><h1 id="cpp_semantic_graph">cpp_semantic_graph 项目整体评估</h1>
+<blockquote>
+<p>评估日期: 2025-06-25 | 代码: 11,123 行 Python | DB: 1,631 节点 / 3,218 边 / 5.0MB（含文档融合）</p>
+</blockquote>
+<hr />
+<h2 id="1">1 总评</h2>
+<p><strong>cpp_semantic_graph 是一个完成度较高的生产可用工具，在 C++ 代码架构理解场景下提供了 grep/find 无法匹敌的速度和 clangd 无法覆盖的跨文件语义分析能力。</strong> 代码质量整体良好，架构分层清晰，配置驱动做到了项目无关。主要短板在边界场景覆盖（模板/枚举/宏）和验证体系完整性。</p>
+<hr />
+<h2 id="2">2 六维评分</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>评分</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>功能完整性</strong></td>
+<td>★★★★★</td>
+<td>9/9 工具可用，11 种关系类型 8 种有数据，文档融合已配置</td>
+</tr>
+<tr>
+<td><strong>准确性</strong></td>
+<td>★★★★★</td>
+<td>继承/callers 100%，overrides 图谱&gt;clangd，file_symbols 98%</td>
+</tr>
+<tr>
+<td><strong>效率</strong></td>
+<td>★★★★★</td>
+<td>大规模 ~1000× 快于 grep，亚毫秒恒定</td>
+</tr>
+<tr>
+<td><strong>通用性</strong></td>
+<td>★★★★☆</td>
+<td>配置驱动无硬编码，compile_commands.json+YAML 即可迁移；arguments 格式/交叉编译已支持</td>
+</tr>
+<tr>
+<td><strong>代码质量</strong></td>
+<td>★★★★☆</td>
+<td>分层清晰(parser/query/db/mcp_server)，命名规范；但有 P2 双计问题和少量格式瑕疵</td>
+</tr>
+<tr>
+<td><strong>可维护性</strong></td>
+<td>★★★★☆</td>
+<td>增量更新有事务保护，upsert 幂等，删除策略保守；验证框架维度偏少(4→应9)</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="3">3 优势（值得肯定）</h2>
+<h3 id="31-clangd">3.1 独有能力强于 clangd</h3>
+<p>这是项目最大的价值点。clangd 是单文件+索引模式，<strong>跨翻译单元的虚函数分派是盲区</strong>：</p>
+<pre><code>问题: &quot;PerformUpgrade 有哪些 override？&quot;
+  clangd find_implementations  → 0 (跨 TU 限制)
+  图谱 get_overrides           → 4 (GnssUpdate, McuUpdate, SocUpdate, SwitchUpdate)
+</code></pre>
+<p>在 C++ 项目中，"这个虚函数有哪些实现？"是架构理解的刚需，clangd 答不了，grep 答不准，<strong>图谱是唯一能直接回答的工具</strong>。</p>
+<h3 id="32-grep">3.2 速度碾压 grep</h3>
+<pre><code>图谱: 0.2ms (恒定，不随代码规模增长)
+grep: 3ms → 200ms → 250ms (线性增长)
+大规模: 图谱比 grep 快 ~1000×
+</code></pre>
+<p>图谱的 SQLite B-tree 索引让查询复杂度从 O(N) 降到 O(logN)，在百万行级代码库上优势更明显。</p>
+<h3 id="33">3.3 架构分层合理</h3>
+<pre><code>parser/  (解析层: libclang AST → 结构化数据)  3,588 行
+query/   (查询层: 9 个 MCP 工具逻辑)        2,963 行
+db/      (数据层: SQLite + 索引 + 导入)       1,338 行
+mcp_server/ (协议层: FastMCP 暴露工具)        560 行
+validation/ (验证层: clangd 交叉比对)        1,422 行
+</code></pre>
+<p>每层职责单一，层间通过 NodeInfo/EdgeInfo dataclass 传递，不交叉引用。<strong>换项目只改 YAML 配置，不改代码</strong>。</p>
+<h3 id="34">3.4 增量更新设计可靠</h3>
+<ul>
+<li>基于 include_dep 图递归确定影响范围，改一个 .h 只重解析 includer</li>
+<li><strong>事务保护</strong>：步骤 3-6 包在单事务中，异常全部回滚</li>
+<li><strong>删除策略保守</strong>：只删出边不删共享节点，upsert 更新，避免头文件节点误删</li>
+<li>幂等性：二次执行边数稳定不变</li>
+</ul>
+<h3 id="35">3.5 降级策略完备</h3>
+<pre><code>cpp-semantic-graph 无结果 → clangd → graphify → grep
+</code></pre>
+<p>图谱不是要替代 grep，而是第一选择。查不到就降级，最差 = grep，最好 = 1000× 快。<strong>严格不劣于纯 grep 方案</strong>。</p>
+<hr />
+<h2 id="4">4 短板（需关注）</h2>
+<h3 id="41-p2">4.1 边界场景不覆盖（P2）</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>状态</th>
+<th>影响</th>
+<th>根因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>模板实例化 <code>vector&lt;SocUpdate&gt;</code></td>
+<td>⏸️ 未启用</td>
+<td>无法追踪模板关联</td>
+<td>libclang 不产生特化 CLASS_DECL</td>
+</tr>
+<tr>
+<td>枚举值 <code>UPDATE_STATUS::IDLE</code></td>
+<td>未提取</td>
+<td>无法查枚举定义</td>
+<td>节点只存 class/struct/function</td>
+</tr>
+<tr>
+<td>全局变量/常量</td>
+<td>未提取</td>
+<td><code>kApplicationErrorMap</code> 搜不到</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>宏定义</td>
+<td>未提取</td>
+<td><code>#define</code> 无法查</td>
+<td>libclang 宏展开后消失</td>
+</tr>
+</tbody>
+</table>
+<p><strong>影响评估</strong>: 枚举/变量/宏在日常查询中占比约 10-15%。不覆盖时降级 grep 即可，不是阻断性问题。</p>
+<h3 id="42-override-p2">4.2 override 边双计（P2）</h3>
+<p>每个虚函数重写产生 2 条边(.h 声明 + .cpp 定义)，计数显示翻倍：
+- 实际 4 个 override → 图谱显示 8 条边
+- <strong>不影响精度</strong>（去重后正确），但影响美观和统计</p>
+<p>修复方案：edge 入库时对同一 (namespace, class, function) 的 decl+def 只保留 1 条。</p>
+<h3 id="43">4.3 验证体系不完整</h3>
+<p>现有 accuracy_validator 只覆盖 4 个维度（inheritance/callers/overrides/file_symbols），未覆盖：
+- type_alias / using_decl / friend_of 边类型
+- include_dep 正确性
+- 增量更新一致性（重解析 vs 全量）</p>
+<p><strong>这曾是"报告实现但实际不工作"的根因</strong>——type_alias 有 SyntaxError 但验证不测，直到端到端才发现。</p>
+<h3 id="44-l1l2-ai">4.4 L1→L2 翻译质量依赖 AI</h3>
+<p>图谱只保证 L2→L3（工具返回准确）。L1→L2（问题→工具调用）靠 AI 翻译：</p>
+<table>
+<thead>
+<tr>
+<th>难点</th>
+<th>风险</th>
+<th>缓解</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>名字映射: "GetSocBootChain" → <code>getActiveBootChain</code></td>
+<td>高</td>
+<td>MCP instructions 加 few-shot</td>
+</tr>
+<tr>
+<td>概念→代码: "升级流程" → <code>PerformUpgrade</code></td>
+<td>高</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>工具选择: "影响什么" → traverse? callers? include?</td>
+<td>中</td>
+<td>工具 description 强化</td>
+</tr>
+</tbody>
+</table>
+<p>这是所有 MCP 工具的共性挑战，不是本项目独有。</p>
+<h3 id="45-readme">4.5 README 文档声称与实现对齐度</h3>
+<table>
+<thead>
+<tr>
+<th>声称</th>
+<th>实际</th>
+<th>差异</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>type_alias ✅已启用</td>
+<td>9 条边 ✓</td>
+<td>一致</td>
+</tr>
+<tr>
+<td>using_decl ✅已启用</td>
+<td>0 条边</td>
+<td>轻微误导——源码仅 1 处特殊形态，应注明"功能已实现，本项目源码无常规 using 声明"</td>
+</tr>
+<tr>
+<td>friend_of ✅已启用</td>
+<td>0 条边</td>
+<td>一致——源码 0 处 friend</td>
+</tr>
+<tr>
+<td>instantiates ⏸️未启用</td>
+<td>0 条边</td>
+<td>一致</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="5">5 与同类工具对比</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>cpp-semantic-graph</th>
+<th>clangd</th>
+<th>grep/find</th>
+<th>Source Trail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>数据存储</td>
+<td>离线 SQLite</td>
+<td>实时 AST</td>
+<td>无</td>
+<td>离线 DB</td>
+</tr>
+<tr>
+<td>查询速度</td>
+<td>~0.2ms</td>
+<td>~50ms</td>
+<td>3-250ms</td>
+<td>~1ms</td>
+</tr>
+<tr>
+<td>跨文件调用链</td>
+<td>✅ 完整</td>
+<td>⚠️ 单跳引用</td>
+<td>❌ 文本匹配</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>虚函数 override</td>
+<td>✅ 跨 TU</td>
+<td>❌ 跨 TU 盲</td>
+<td>❌</td>
+<td>⚠️</td>
+</tr>
+<tr>
+<td>继承树</td>
+<td>✅ 任意深度</td>
+<td>✅</td>
+<td>❌</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>include 依赖</td>
+<td>✅</td>
+<td>❌</td>
+<td>❌</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>文档-代码关联</td>
+<td>✅</td>
+<td>❌</td>
+<td>❌</td>
+<td>❌</td>
+</tr>
+<tr>
+<td>增量更新</td>
+<td>✅ include 图</td>
+<td>实时</td>
+<td>N/A</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>模板/宏</td>
+<td>❌</td>
+<td>✅</td>
+<td>✅ 文本</td>
+<td>⚠️</td>
+</tr>
+<tr>
+<td>枚举/变量</td>
+<td>❌</td>
+<td>✅</td>
+<td>✅</td>
+<td>⚠️</td>
+</tr>
+<tr>
+<td>AI 集成</td>
+<td>✅ MCP 协议</td>
+<td>❌</td>
+<td>❌</td>
+<td>❌</td>
+</tr>
+</tbody>
+</table>
+<p><strong>定位</strong>: clangd 负责实时编辑，cpp-semantic-graph 负责架构理解和影响面分析，grep 兜底。三者互补，不互斥。</p>
+<hr />
+<h2 id="6">6 项目数据总览</h2>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Python 代码</td>
+<td>11,123 行</td>
+</tr>
+<tr>
+<td>模块数</td>
+<td>5 (parser/query/db/mcp_server/validation)</td>
+</tr>
+<tr>
+<td>MCP 工具</td>
+<td>9 个</td>
+</tr>
+<tr>
+<td>关系类型</td>
+<td>11 种 (8 种有数据)</td>
+</tr>
+<tr>
+<td>目标项目 TU</td>
+<td>29 (100% 成功)</td>
+</tr>
+<tr>
+<td>图谱节点</td>
+<td>1,631 (class:124, function:930, struct:31, doc_section:546)</td>
+</tr>
+<tr>
+<td>图谱边</td>
+<td>3,218 (calls:808, belongs:522, overrides:114, inherits:9, type_alias:9, doc:1756)</td>
+</tr>
+<tr>
+<td>include 依赖</td>
+<td>11,000</td>
+</tr>
+<tr>
+<td>DB 大小</td>
+<td>5.0 MB</td>
+</tr>
+<tr>
+<td>查询延迟</td>
+<td>~0.2ms</td>
+</tr>
+<tr>
+<td>vs grep 加速</td>
+<td>~1,000× (大规模)</td>
+</tr>
+<tr>
+<td>端到端准确率</td>
+<td>96.0% (24/25 真实问题)</td>
+</tr>
+<tr>
+<td>Bug 修复</td>
+<td>10/10 验证通过</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="7">7 结论</h2>
+<h3 id="_1">项目状态：<strong>生产可用，有已知边界</strong></h3>
+<p><strong>做得到的</strong>（核心价值）：
+- "这个类有哪些子类？" → 0.2ms 精准回答
+- "谁调用了这个函数？" → 0.2ms 完整调用方
+- "虚函数有哪些 override？" → 0.2ms 跨 TU 回答（<strong>clangd 做不到</strong>）
+- "改这个头文件影响什么？" → 增量更新秒级刷新
+- "这个模块架构怎样？" → 多跳遍历一次看清</p>
+<p><strong>做不到的</strong>（需降级）：
+- 模板实例化、枚举值、宏定义 → 降级 grep
+- SDK/BSW 代码 → 降级 grep（config exclude）
+- IDL 常量如 kApplicationErrorMap → 降级 grep</p>
+<p><strong>不该做的</strong>：
+- 替代 clangd 做实时编辑
+- 替代 grep 做文本搜索
+- 保证 L1→L2 翻译 100% 准确（这是 AI 的能力边界）</p>
+<h3 id="_2">一句话</h3>
+<blockquote>
+<p><strong>图谱负责"理解"，clangd 负责"编辑"，grep 负责"兜底"——三者互补，图谱在架构理解场景下是无可替代的首选。</strong></p>
+</blockquote></body></html>

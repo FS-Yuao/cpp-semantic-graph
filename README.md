@@ -102,7 +102,7 @@ python3 -m cpp_semantic_graph full-parse \
 
 解析完成后，数据库包含：
 - **节点**：类、结构体、函数（含签名、命名空间、文件位置）
-- **边**：继承、调用、override、belongs_to、模板实例化等关系
+- **边**：继承、调用、override、belongs_to、类型别名（type_alias）、using 声明（using_decl）、友元（friend_of）等关系（模板实例化边 `instantiates` 因 libclang AST 形态暂未启用，见 [复杂场景说明](#-复杂场景说明)）
 - **include 依赖**：翻译单元间的 include 关系图
 - **文档关联**：文档切片 ↔ 代码实体（可选）
 
@@ -391,6 +391,19 @@ python3 -m cpp_semantic_graph incremental --files soc_update.cpp --skip-associat
 
 ---
 
+## 🧩 复杂场景说明（模板/别名/友元）
+
+| 特性 | 关系边 | 状态 | 说明 |
+|------|--------|------|------|
+| 类型别名 `using Alias = T` | `type_alias` | ✅ 已启用 | 别名节点入库 + 边关联目标；目标来自外部库时边可能悬空丢弃，别名节点仍保留 `target_type` 元信息 |
+| using 声明 `using B::func` | `using_decl` | ✅ 已启用 | 子类函数 → 基类函数；本项目源码无常规 using 声明，仅 1 处 literal operator 未提取 |
+| 友元 `friend class F` | `friend_of` | ✅ 已启用 | friend → 宿主类；本项目源码无 friend 声明，0 条边符合预期 |
+| 模板实例化 | `instantiates` | ⏸️ 暂未启用 | libclang 不为模板特化产生独立 CLASS_DECL 节点（特化名仅出现在 CONSTRUCTOR/TYPE_REF 的 spelling 中），`walk_preorder` 找不到含 `<` 的类声明，提取无产出。提取器代码保留，待改用 LibTooling 或基于 TYPE_REF 重建时启用 |
+
+> 这部分曾存在"提取器已编写但未集成进 pipeline"的问题（死代码），现已将 AliasExtractor/FriendExtractor 集成进 `SemanticExtractor.parse()`，并用 clangd 实测验证产出。
+
+---
+
 ## 🔄 增量更新机制
 
 ```
@@ -413,9 +426,11 @@ python3 -m cpp_semantic_graph incremental --files soc_update.cpp --skip-associat
 
 ---
 
-## 📚 文档融合（可选）
+## 📚 文档融合
 
 将项目文档（Markdown）与代码实体双向关联，让 AI 搜索文档时自动定位相关代码。
+
+**本项目已配置文档融合**：58 个文档 → 546 个切片 → 1,756 条关联边（doc_describes_code + code_refers_to_doc）。`cpp_search_docs` 可直接使用。
 
 ### 配置
 
@@ -598,7 +613,7 @@ ls /usr/lib/llvm-*/lib/libclang.so*
 
 ### Q: 数据库有多大？
 
-典型 C++ 项目（~100 个翻译单元）：约 1500 节点 / 5000 边 / 20000 include 关系，SQLite 文件约 5-10 MB。
+典型 C++ 项目（~100 个翻译单元）：约 1500 节点 / 5000 边 / 20000 include 关系，SQLite 文件约 5-10 MB。含文档融合时节点数和边数翻倍，DB 约 5-15 MB。
 
 ### Q: 和 clangd 有什么区别？
 
@@ -618,3 +633,15 @@ ls /usr/lib/llvm-*/lib/libclang.so*
 ## 📄 License
 
 MIT License
+
+---
+
+## 📋 测试报告
+
+| 报告 | 说明 |
+|------|------|
+| [TEST_REPORT.md](tests/TEST_REPORT.md) | 综合测试报告（功能/准确性/效率/Bug修复） |
+| [TEST_CASES.md](tests/TEST_CASES.md) | 具体测试用例表（62 条，98.4% 通过） |
+| [TEST_THREE_LAYERS.md](tests/TEST_THREE_LAYERS.md) | 三层测试（问题→工具调用→代码验证，25 条真实问题） |
+| [TEST_DOC_FUSION.md](tests/TEST_DOC_FUSION.md) | 文档融合专项测试（27 条，89% 通过） |
+| [PROJECT_EVALUATION.md](tests/PROJECT_EVALUATION.md) | 项目整体评估（六维评分+对比+结论） |
