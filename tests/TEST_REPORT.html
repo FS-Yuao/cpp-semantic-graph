@@ -1,4 +1,15 @@
-<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>TEST_REPORT</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;color:#24292f;max-width:1100px;margin:0 auto;padding:30px 45px;background:#fff}h1{border-bottom:1px solid #d0d7de;padding-bottom:10px}h2{border-bottom:1px solid #d0d7de;padding-bottom:8px;margin-top:24px}h3{margin-top:20px}table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13px}th,td{border:1px solid #d0d7de;padding:5px 10px;text-align:left}th{background:#f6f8fa;font-weight:600;white-space:nowrap}tr:nth-child(even){background:#f6f8fa}code{background:#f6f8fa;padding:1px 5px;border-radius:3px;font-size:85%}pre{background:#f6f8fa;padding:14px;border-radius:6px;overflow-x:auto}pre code{background:none;padding:0}</style></head><body><h1 id="cpp_semantic_graph">cpp_semantic_graph 综合测试报告</h1>
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>TEST_REPORT</title><style>
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:960px;margin:0 auto;padding:20px;line-height:1.6;color:#24292f}
+table{border-collapse:collapse;width:100%;margin:1em 0}
+th,td{border:1px solid #d0d7de;padding:8px 12px;text-align:left}
+th{background:#f6f8fa;font-weight:600}
+tr:nth-child(even){background:#f6f8fa}
+code{background:#f6f8fa;padding:2px 6px;border-radius:3px;font-size:0.9em}
+pre{background:#f6f8fa;padding:16px;border-radius:6px;overflow-x:auto}
+pre code{background:none;padding:0}
+h1,h2,h3{border-bottom:1px solid #d0d7de;padding-bottom:8px}
+blockquote{border-left:4px solid #d0d7de;padding:0 16px;color:#57606a}
+</style></head><body><h1 id="cpp_semantic_graph">cpp_semantic_graph 综合测试报告</h1>
 <blockquote>
 <p><strong>项目</strong>: example_update_service — automotive OTA service (example project)<br />
 <strong>测试日期</strong>: 2025-06-25<br />
@@ -710,7 +721,184 @@ grep: grep -rn &quot;BootChain&quot; docs/ → 需人工逐文件读,无代码�
 </code></pre>
 <p><strong>图谱优势</strong>: 搜文档时<strong>自动关联代码实体</strong>(confidence 0.60-0.70),一次查询同时看到设计文档和相关代码,无需再单独搜代码</p>
 <hr />
-<h2 id="8">8 已知限制</h2>
+<h2 id="8">8 增量更新测试</h2>
+<blockquote>
+<p>测试日期: 2025-06-25 | DB 基线: 1631 nodes / 3220 edges</p>
+</blockquote>
+<h3 id="81">8.1 测试矩阵</h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>测试项</th>
+<th>输入</th>
+<th>受影响 TU</th>
+<th>耗时</th>
+<th>DB 状态</th>
+<th>幂等性</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>dry-run (.cpp)</td>
+<td><code>chip_update.cpp --dry-run</code></td>
+<td>1</td>
+<td>&lt;1s</td>
+<td>不变</td>
+<td>—</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>2</td>
+<td>dry-run (.h)</td>
+<td><code>chip_update.h --dry-run</code></td>
+<td>2</td>
+<td>&lt;1s</td>
+<td>不变</td>
+<td>—</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>3</td>
+<td>实际更新 (.cpp)</td>
+<td><code>chip_update.cpp</code></td>
+<td>1</td>
+<td>11.3s</td>
+<td>1631n/3211e</td>
+<td>—</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>3b</td>
+<td>幂等性 (.cpp)</td>
+<td><code>chip_update.cpp</code> 二次</td>
+<td>1</td>
+<td>11.6s</td>
+<td>1631n/3211e</td>
+<td>✅ 边数稳定</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>4</td>
+<td>实际更新 (.h)</td>
+<td><code>base_device_update.h</code></td>
+<td>7</td>
+<td>76.4s</td>
+<td>1631n/3010e</td>
+<td>—</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>4b</td>
+<td>幂等性 (.h)</td>
+<td><code>base_device_update.h</code> 二次</td>
+<td>7</td>
+<td>72.6s</td>
+<td>1631n/3010e</td>
+<td>✅ 边数稳定</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>5</td>
+<td>git diff 模式</td>
+<td><code>--base HEAD</code></td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>—</td>
+<td>⚠️</td>
+</tr>
+</tbody>
+</table>
+<h3 id="82-h">8.2 .h 文件影响链</h3>
+<p>修改 <code>chip_update.h</code> 的 dry-run 输出：</p>
+<pre><code>影响链:
+  device_update/soc/chip_update.h → 2 个 TU
+    - device_manager/update_factory.cpp
+    - device_update/soc/chip_update.cpp
+</code></pre>
+<p>修改 <code>base_device_update.h</code> 触发 <strong>7 个 TU</strong> 重解析（所有 4 个子类的 .cpp + 相关管理器），体现了 include 依赖图的递归分析能力。</p>
+<h3 id="83">8.3 幂等性验证</h3>
+<table>
+<thead>
+<tr>
+<th>测试</th>
+<th>第1次边数</th>
+<th>第2次边数</th>
+<th>差异</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>chip_update.cpp</td>
+<td>3211</td>
+<td>3211</td>
+<td>0</td>
+<td>✅ 完全幂等</td>
+</tr>
+<tr>
+<td>base_device_update.h</td>
+<td>3010</td>
+<td>3010</td>
+<td>0</td>
+<td>✅ 完全幂等</td>
+</tr>
+</tbody>
+</table>
+<p><strong>核心机制</strong>：增量更新采用"删除出边 → 重解析 → upsert 入库"策略，二次执行时重解析产出与第一次完全一致，upsert 保证边不重复。</p>
+<h3 id="84-git-diff">8.4 git diff 自动检测限制</h3>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>结果</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>repo 工具仓库</td>
+<td>⚠️ 失败</td>
+<td><code>_ensure_repo_root</code> 找到 <code><WORKSPACE>/.git</code>（repo 顶层）而非 <code>workspace/.git</code>（符号链接到 .repo/projects）</td>
+</tr>
+<tr>
+<td>普通 git 仓库</td>
+<td>✅ 应可用</td>
+<td>从 source_paths 向上找 .git，正常 git 仓库可正确检测</td>
+</tr>
+</tbody>
+</table>
+<p><strong>结论</strong>：git diff 自动检测模式在 Android repo tool 管理的仓库下有兼容性问题。<strong>推荐使用 <code>--files</code> 手动指定</strong>，更可控也更常用。</p>
+<h3 id="85-vs">8.5 增量更新 vs 全量重建</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>增量耗时</th>
+<th>全量耗时</th>
+<th>加速比</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单个 .cpp 变更</td>
+<td>11.3s</td>
+<td>257.9s</td>
+<td><strong>23×</strong></td>
+</tr>
+<tr>
+<td>单个 .h 变更(7 TU)</td>
+<td>76.4s</td>
+<td>257.9s</td>
+<td><strong>3.4×</strong></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="9">9 已知限制</h2>
 <table>
 <thead>
 <tr>
@@ -764,10 +952,17 @@ grep: grep -rn &quot;BootChain&quot; docs/ → 需人工逐文件读,无代码�
 <td>P3</td>
 <td>可在格式化层处理</td>
 </tr>
+<tr>
+<td>7</td>
+<td>git diff 自动检测在 repo tool 仓库下不工作</td>
+<td>需手动 <code>--files</code></td>
+<td>P2</td>
+<td><code>_ensure_repo_root</code> 找到错误的 .git（repo 顶层而非子仓库）</td>
+</tr>
 </tbody>
 </table>
 <hr />
-<h2 id="9">9 结论</h2>
+<h2 id="10">10 结论</h2>
 <h3 id="_10">功能完整性</h3>
 <p><strong>9/9 MCP 工具全部可用</strong>（文档融合已配置）。11 种关系类型中 8 种有实际数据(inherits/calls/overrides/belongs_to/type_alias/calls_virtual/doc_describes_code/code_refers_to_doc),3 种无边但源码本就无此语法(using_decl/friend_of)或为已知限制(instantiates)。</p>
 <h3 id="_11">准确性</h3>
@@ -789,5 +984,6 @@ grep: grep -rn &quot;BootChain&quot; docs/ → 需人工逐文件读,无代码�
 效率        ████████████████████  大规模 1000× 快于 grep
 Bug 修复    ████████████████████  3/3 关键修复验证通过
 文档融合    ████████████████████  546切片/1756关联边, search_docs 验证通过
+增量更新    ████████████████░░░░  .cpp/.h 更新+幂等 通过; git diff repo 仓库兼容性待修
 </code></pre>
 <p><strong>cpp_semantic_graph 已达到生产可用状态,在 C++ 代码架构理解场景下提供 grep/find 无法匹敌的速度和 clangd 无法覆盖的跨文件语义分析能力。</strong></p></body></html>
