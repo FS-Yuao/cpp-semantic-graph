@@ -176,6 +176,18 @@
 | RS-06 | "SocUpdate::PerformUpgrade 内部做了什么？" | get_callees | PerformUpgrade(SocUpdate) | 9 个: Logger/ExecuteDU/StartCS/StopCS/… | grep 只能看到文本,无法区分调用 vs 定义 | ✅ |
 | RS-07 | "ota_manager.cpp 里有什么？" | get_file_symbols | ota_manager.cpp | 52 个函数 | clangd 61 (含namespace/variable) | ✅ |
 
+### 7.5 增量更新测试
+
+| ID | 测试项 | 输入 | 预期 | 实际 | 判定 |
+|----|--------|------|------|------|------|
+| IU-01 | dry-run .cpp | `--files soc_update.cpp --dry-run` | 1 受影响 TU | 1 TU | ✅ |
+| IU-02 | dry-run .h | `--files soc_update.h --dry-run` | ≥2 受影响 TU | 2 TU (update_factory.cpp + soc_update.cpp) | ✅ |
+| IU-03 | 实际更新 .cpp | `--files soc_update.cpp` | 1 TU, DB 一致 | 1 TU, 11.3s, 1631n/3211e | ✅ |
+| IU-04 | 幂等性 .cpp | `--files soc_update.cpp` 二次 | 边数不变 | 3211e = 3211e | ✅ |
+| IU-05 | 实际更新 .h | `--files base_peri_update.h` | ≥5 TU, DB 一致 | 7 TU, 76.4s, 1631n/3010e | ✅ |
+| IU-06 | 幂等性 .h | `--files base_peri_update.h` 二次 | 边数不变 | 3010e = 3010e | ✅ |
+| IU-07 | git diff 自动检测 | `--base HEAD` | 检测到变更文件 | repo 仓库兼容性问题 | ⚠️ |
+
 ---
 
 ## 汇总
@@ -188,6 +200,7 @@
 | 效率 | 4 | 4 | 0 | 0 |
 | Bug 修复 | 10 | 10 | 0 | 0 |
 | 真实场景 | 7 | 7 | 0 | 0 |
-| **合计** | **62** | **61** | **1** | **0** |
+| 增量更新 | 7 | 6 | 1 (repo仓库git diff) | 0 |
+| **合计** | **69** | **67** | **2** | **0** |
 
-**通过率: 61/62 = 98.4%** (1 个警告为 using_decl 漏1处 literal operator,影响极小)
+**通过率: 67/69 = 97.1%** (2 个警告: using_decl 漏1处 literal operator + git diff repo 仓库兼容性)

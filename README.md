@@ -420,9 +420,11 @@ python3 -m cpp_semantic_graph incremental --files soc_update.cpp --skip-associat
 
 | 场景 | 受影响 TU | 更新耗时 |
 |------|----------|---------|
-| 单个 .cpp 变更 | 1 个 | ~7.5s |
-| 单个 .h 变更 | 递归 includer | 取决于 TU 数 |
-| 幂等性（二次执行） | 1 个 | 边数稳定不变 |
+| 单个 .cpp 变更 | 1 个 | ~11s |
+| 单个 .h 变更 | 递归 includer | 取决于 TU 数（7 TU ~76s） |
+| 幂等性（二次执行） | 不变 | 边数稳定不变 ✅ |
+
+> **注意**：git diff 自动检测模式（`--base HEAD~1`）在 Android repo tool 管理的仓库下可能不工作（`_ensure_repo_root` 会找到 repo 顶层 .git 而非子仓库）。推荐使用 `--files` 手动指定变更文件，更可控。
 
 ---
 

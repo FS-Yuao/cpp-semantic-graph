@@ -1,4 +1,15 @@
-<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>TEST_CASES</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;font-size:14px;line-height:1.5;color:#24292f;max-width:1100px;margin:0 auto;padding:30px 45px;background:#fff}h1{border-bottom:1px solid #d0d7de;padding-bottom:10px}h2{border-bottom:1px solid #d0d7de;padding-bottom:8px;margin-top:24px}h3{margin-top:20px}table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13px}th,td{border:1px solid #d0d7de;padding:5px 10px;text-align:left}th{background:#f6f8fa;font-weight:600;white-space:nowrap}tr:nth-child(even){background:#f6f8fa}code{background:#f6f8fa;padding:1px 5px;border-radius:3px;font-size:85%}pre{background:#f6f8fa;padding:14px;border-radius:6px;overflow-x:auto}pre code{background:none;padding:0}</style></head><body><h1 id="cpp_semantic_graph">cpp_semantic_graph 测试用例表</h1>
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>TEST_CASES</title><style>
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:960px;margin:0 auto;padding:20px;line-height:1.6;color:#24292f}
+table{border-collapse:collapse;width:100%;margin:1em 0}
+th,td{border:1px solid #d0d7de;padding:8px 12px;text-align:left}
+th{background:#f6f8fa;font-weight:600}
+tr:nth-child(even){background:#f6f8fa}
+code{background:#f6f8fa;padding:2px 6px;border-radius:3px;font-size:0.9em}
+pre{background:#f6f8fa;padding:16px;border-radius:6px;overflow-x:auto}
+pre code{background:none;padding:0}
+h1,h2,h3{border-bottom:1px solid #d0d7de;padding-bottom:8px}
+blockquote{border-left:4px solid #d0d7de;padding:0 16px;color:#57606a}
+</style></head><body><h1 id="cpp_semantic_graph">cpp_semantic_graph 测试用例表</h1>
 <blockquote>
 <p>日期: 2025-06-25 | DB: 1085 节点 / 1462 边 / 29 TU 全成功</p>
 </blockquote>
@@ -871,6 +882,77 @@
 </tr>
 </tbody>
 </table>
+<h3 id="75">7.5 增量更新测试</h3>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>测试项</th>
+<th>输入</th>
+<th>预期</th>
+<th>实际</th>
+<th>判定</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IU-01</td>
+<td>dry-run .cpp</td>
+<td><code>--files soc_update.cpp --dry-run</code></td>
+<td>1 受影响 TU</td>
+<td>1 TU</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>IU-02</td>
+<td>dry-run .h</td>
+<td><code>--files soc_update.h --dry-run</code></td>
+<td>≥2 受影响 TU</td>
+<td>2 TU (update_factory.cpp + soc_update.cpp)</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>IU-03</td>
+<td>实际更新 .cpp</td>
+<td><code>--files soc_update.cpp</code></td>
+<td>1 TU, DB 一致</td>
+<td>1 TU, 11.3s, 1631n/3211e</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>IU-04</td>
+<td>幂等性 .cpp</td>
+<td><code>--files soc_update.cpp</code> 二次</td>
+<td>边数不变</td>
+<td>3211e = 3211e</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>IU-05</td>
+<td>实际更新 .h</td>
+<td><code>--files base_peri_update.h</code></td>
+<td>≥5 TU, DB 一致</td>
+<td>7 TU, 76.4s, 1631n/3010e</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>IU-06</td>
+<td>幂等性 .h</td>
+<td><code>--files base_peri_update.h</code> 二次</td>
+<td>边数不变</td>
+<td>3010e = 3010e</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>IU-07</td>
+<td>git diff 自动检测</td>
+<td><code>--base HEAD</code></td>
+<td>检测到变更文件</td>
+<td>repo 仓库兼容性问题</td>
+<td>⚠️</td>
+</tr>
+</tbody>
+</table>
 <hr />
 <h2 id="_1">汇总</h2>
 <table>
@@ -927,12 +1009,19 @@
 <td>0</td>
 </tr>
 <tr>
+<td>增量更新</td>
+<td>7</td>
+<td>6</td>
+<td>1 (repo仓库git diff)</td>
+<td>0</td>
+</tr>
+<tr>
 <td><strong>合计</strong></td>
-<td><strong>62</strong></td>
-<td><strong>61</strong></td>
-<td><strong>1</strong></td>
+<td><strong>69</strong></td>
+<td><strong>67</strong></td>
+<td><strong>2</strong></td>
 <td><strong>0</strong></td>
 </tr>
 </tbody>
 </table>
-<p><strong>通过率: 61/62 = 98.4%</strong> (1 个警告为 using_decl 漏1处 literal operator,影响极小)</p></body></html>
+<p><strong>通过率: 67/69 = 97.1%</strong> (2 个警告: using_decl 漏1处 literal operator + git diff repo 仓库兼容性)</p></body></html>
