@@ -428,6 +428,7 @@ def cmd_incremental(args):
         files=files,
         rebuild_associations=not args.skip_associations,
         rebuild_embeddings=args.embeddings,
+        doc_only=args.doc_only,
         dry_run=args.dry_run,
     )
 
@@ -467,6 +468,10 @@ def cmd_incremental(args):
           f"+{report.edges_new} 边, +{report.includes_new} includes")
     if report.nodes_removed:
         print(f"  清理残留:   {report.nodes_removed} 节点")
+    if report.docs_updated or report.doc_sections_new or report.doc_sections_updated:
+        print(f"  文档入库:   {report.docs_updated} 文件 "
+              f"(+{report.doc_sections_new} 新切片, "
+              f"{report.doc_sections_updated} 更新切片)")
     print(f"  关联重建:   {'是' if report.associations_rebuilt else '否'}")
     print(f"  数据库:     {report.db_node_count} 节点 / "
           f"{report.db_edge_count} 边")
@@ -609,6 +614,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="跳过文档关联边重建")
     p.add_argument("--embeddings", action="store_true",
                    help="重建 embedding 关联 (慢)")
+    p.add_argument("--doc-only", action="store_true",
+                   help="仅增量入库文档变更（不解析 C++ 代码）")
     p.add_argument("--dry-run", action="store_true",
                    help="仅检测和分析，不执行更新")
     p.set_defaults(func=cmd_incremental)

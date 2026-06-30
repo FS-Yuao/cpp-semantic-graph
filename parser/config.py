@@ -27,6 +27,9 @@ class ProjectConfig:
     # toolchain_includes：工具链 C++ 标准库头所在目录（compile_commands 通常不带）。
     target_triple: str = ""
     toolchain_includes: list[str] = field(default_factory=list)
+    docs_dir: str = ""
+    docs_config: str = ""
+    config_path: str = ""
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "ProjectConfig":
@@ -41,6 +44,16 @@ class ProjectConfig:
         project = data.get("project", {})
         parse_opts = data.get("parse_options", {})
 
+        # 解析 docs_dir 为绝对路径（相对于配置文件所在目录）
+        docs_dir_raw = data.get("docs_dir", "")
+        docs_dir_abs = ""
+        if docs_dir_raw:
+            docs_path = Path(docs_dir_raw)
+            if docs_path.is_absolute():
+                docs_dir_abs = str(docs_path)
+            else:
+                docs_dir_abs = str((path.parent / docs_path).resolve())
+
         return cls(
             name=project.get("name", ""),
             compile_commands=project.get("compile_commands", ""),
@@ -53,6 +66,9 @@ class ProjectConfig:
             template_whitelist=data.get("template_whitelist", ""),
             target_triple=data.get("target_triple", ""),
             toolchain_includes=data.get("toolchain_includes", []),
+            docs_dir=docs_dir_abs,
+            docs_config=data.get("docs_config", ""),
+            config_path=str(path.resolve()),
         )
 
     @property

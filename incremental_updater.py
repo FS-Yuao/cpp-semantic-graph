@@ -51,6 +51,9 @@ class IncrementalReport:
     includes_new: int = 0
     nodes_removed: int = 0
     associations_rebuilt: bool = False
+    docs_updated: int = 0
+    doc_sections_new: int = 0
+    doc_sections_updated: int = 0
     elapsed_seconds: float = 0.0
     db_node_count: int = 0
     db_edge_count: int = 0
@@ -82,6 +85,7 @@ class IncrementalUpdater:
             files: list[str] | None = None,
             rebuild_associations: bool = True,
             rebuild_embeddings: bool = False,
+            doc_only: bool = False,
             dry_run: bool = False) -> IncrementalReport:
         """执行增量更新
 
@@ -90,6 +94,7 @@ class IncrementalUpdater:
             files: 手动指定文件列表（覆盖 base_ref）
             rebuild_associations: 是否重建文档关联边
             rebuild_embeddings: 是否重建 embedding 关联（慢）
+            doc_only: 仅增量入库文档变更（不解析 C++ 代码）
             dry_run: 只检测+分析，不执行删除/解析
 
         Returns:
@@ -97,6 +102,20 @@ class IncrementalUpdater:
         """
         t0 = time.time()
         report = IncrementalReport()
+
+        # --- 0. doc_only 快捷路径 ---
+        if doc_only:
+            doc_result = self._detect_and_ingest_doc_changes(base_ref or "HEAD~1")
+            report.docs_updated = doc_result.get("files_processed", 0)
+            report.doc_sections_new = doc_result.get("sections_created", 0)
+            report.doc_sections_updated = doc_result.get("sections_updated", 0)
+
+            if rebuild_associations:
+                self._rebuild_associations(rebuild_embeddings)
+                report.associations_rebuilt = True
+
+            report.elapsed_seconds = time.time() - t0
+            return report
 
         # --- 1. 检测变更 ---
         detector = ChangeDetector(self.repo_root, self.config)
@@ -187,6 +206,12 @@ class IncrementalUpdater:
         finally:
             # 恢复 autocommit（虽然即将 close，但保持状态一致）
             db._autocommit = True
+
+            # --- 6.5. 增量入库文档变更 ---
+            doc_result = self._detect_and_ingest_doc_changes(base_ref or "HEAD~1")
+            report.docs_updated = doc_result.get("files_processed", 0)
+            report.doc_sections_new = doc_result.get("sections_created", 0)
+            report.doc_sections_updated = doc_result.get("sections_updated", 0)
 
             # --- 7. 重建文档关联（事务外，独立操作）---
             if rebuild_associations:
@@ -367,3 +392,47 @@ class IncrementalUpdater:
 
         ingester.close()
         return stats
+
+    # ------------------------------------------------------------------
+    # 文档增量入库
+    # ------------------------------------------------------------------
+
+    def _detect_and_ingest_doc_changes(self, base_ref: str) -> dict:
+        """检测文档变更并增量入库
+
+        1. 通过 ChangeDetector.detect_doc_changes() 检测 docs/ 下的 .md 变更
+        2. 如有变更，调用 DocIngester.ingest_from_config() 入库（upsert 天然增量）
+        3. 返回统计信息
+
+        Returns:
+            统计信息 dict，含 files_processed/sections_created/sections_updated
+        """
+        detector = ChangeDetector(self.repo_root, self.config)
+        changed_docs = detector.detect_doc_changes(base_ref)
+
+        if not changed_docs:
+            logger.info("无文档变更")
+            return {"files_processed": 0, "sections_created": 0, "sections_updated": 0}
+
+        logger.info("文档变更: %d 个文件", len(changed_docs))
+        for doc in changed_docs:
+            logger.info("  - %s", doc)
+
+        # 增量入库（DocIngester 内部有 upsert 去重，天然增量）
+        try:
+            from .parser.doc_ingester import DocIngester
+            ingester = DocIngester(
+                self.db_path,
+                config_path=None,
+                project_config_path=self.config_path,
+            )
+            stats = ingester.ingest_from_config(verbose=True)
+            ingester.close()
+            logger.info("文档入库完成: %d 文件, %d 新切片, %d 更新切片",
+                        stats.get("files_processed", 0),
+                        stats.get("sections_created", 0),
+                        stats.get("sections_updated", 0))
+            return stats
+        except Exception as e:
+            logger.error("文档增量入库失败: %s", e)
+            return {"files_processed": 0, "sections_created": 0, "sections_updated": 0}
