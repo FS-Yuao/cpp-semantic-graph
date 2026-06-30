@@ -47,10 +47,13 @@ class CompileDB:
 
         Args:
             db_path: compile_commands.json 路径
-            config: ProjectConfig（可选，用于 generated_paths 判断）
+            config: ProjectConfig（可选，用于 generated_paths/exclude_paths 判断）
         """
         self.db_path = Path(db_path)
         self._generated_paths = list(config.generated_paths) if config else []
+        # exclude_paths 命中的翻译单元（如 thirdparty/BSW SDK 的 .cpp）不解析，
+        # 避免每轮白费解析开销；与 should_extract_node 的排除范围保持一致。
+        self._exclude_paths = list(config.exclude_paths) if config else []
         # 交叉编译注入参数：-target + 工具链 C++ stdlib -isystem
         # libclang 默认按宿主 triple 解析，不注入会导致 aarch64 sysroot 头 fatal。
         self._extra_flags = list(config.extra_parse_flags) if config else []
@@ -175,8 +178,17 @@ class CompileDB:
             filter_path: 只返回包含此路径的条目
             include_generated: 是否包含 ARA COM 生成代码
             include_headers: 是否包含头文件（compile_commands.json 通常不含）
+
+        过滤顺序：先排除 exclude_paths（thirdparty/build/SDK 等），再按
+        filter_path/generated/headers 收窄。exclude 命中的翻译单元不解析，
+        避免白费解析开销——其节点本就不入库（should_extract_node 已挡）。
+        config 为空时（如部分测试）不应用 exclude，保持原行为。
         """
         entries = self._entries
+
+        if self._exclude_paths:
+            entries = [e for e in entries
+                       if not any(p in e.file for p in self._exclude_paths)]
 
         if filter_path:
             entries = [e for e in entries if filter_path in e.file]
