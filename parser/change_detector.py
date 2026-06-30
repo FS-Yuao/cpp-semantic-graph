@@ -71,6 +71,82 @@ class ChangeDetector:
         self.repo_root = Path(repo_root) if repo_root else None
         self.config = project_config
 
+    def detect_doc_changes(self, base_ref: str = "HEAD~1") -> list[str]:
+        """检测 docs 目录下的 .md 文件变更
+
+        通过 git diff --name-only 检测，只返回在 docs_dir 范围内的 .md 文件。
+
+        Args:
+            base_ref: git diff 基准 ref（默认 HEAD~1）
+
+        Returns:
+            变更的 .md 文件绝对路径列表
+        """
+        repo_root = self._ensure_repo_root()
+        if not repo_root:
+            logger.warning("无法确定 git 仓库根，文档变更检测失败")
+            return []
+
+        docs_dir = self.config.docs_dir
+        if not docs_dir:
+            logger.info("项目配置中未设置 docs_dir，跳过文档变更检测")
+            return []
+
+        # 解析 docs_dir 为绝对路径
+        docs_path = Path(docs_dir)
+        if not docs_path.is_absolute():
+            # 相对于项目配置文件所在目录解析
+            config_dir = Path(self.config.config_path).parent if hasattr(self.config, 'config_path') and self.config.config_path else repo_root
+            docs_path = (config_dir / docs_dir).resolve()
+
+        if not docs_path.exists():
+            logger.warning("文档目录不存在: %s", docs_path)
+            return []
+
+        # git diff 只看 docs 目录下的 .md 文件
+        docs_git_rel = str(docs_path.relative_to(repo_root)) if docs_path.is_relative_to(repo_root) else ""
+        if not docs_git_rel:
+            # docs_path 不在仓库内，用全量扫描判断
+            return self._detect_doc_changes_by_scan(docs_path, base_ref)
+
+        env = {**os.environ, "GIT_DISCOVERY_ACROSS_FILESYSTEM": "1"}
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_root), "diff", "--name-only", base_ref,
+                 "--", f"{docs_git_rel}/*.md", f"{docs_git_rel}/**/*.md"],
+                capture_output=True, text=True, env=env, timeout=60,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            logger.error("git diff 文档变更检测失败: %s", e)
+            return []
+
+        if result.returncode != 0:
+            logger.warning("git diff 文档变更检测返回非零: %s", result.stderr.strip())
+            return []
+
+        changed_docs: list[str] = []
+        for line in result.stdout.strip().splitlines():
+            if not line.strip():
+                continue
+            abs_path = str(repo_root / line.strip())
+            if abs_path.lower().endswith(".md") and Path(abs_path).exists():
+                changed_docs.append(abs_path)
+
+        return changed_docs
+
+    def _detect_doc_changes_by_scan(self, docs_path: Path, base_ref: str) -> list[str]:
+        """当 docs_path 不在仓库内时，通过文件修改时间判断变更
+
+        返回最近 24 小时内修改的 .md 文件。
+        """
+        import time
+        cutoff = time.time() - 86400  # 24 小时
+        changed: list[str] = []
+        for md_file in docs_path.rglob("*.md"):
+            if md_file.stat().st_mtime >= cutoff:
+                changed.append(str(md_file))
+        return changed
+
     def detect_from_git(self, base_ref: str = "HEAD~1") -> FileChangeSet:
         """通过 git diff 检测变更文件
 
