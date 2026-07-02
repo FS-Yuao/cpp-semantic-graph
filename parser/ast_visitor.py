@@ -420,7 +420,7 @@ class SemanticExtractor:
     # ------------------------------------------------------------------
 
     def _extract_inheritance(self, tu, result: ParseResult):
-        """提取继承关系"""
+        """提取继承关系（含虚继承标记）"""
         for cursor in tu.cursor.walk_preorder():
             if cursor.kind not in (CursorKind.CLASS_DECL, CursorKind.STRUCT_DECL):
                 continue
@@ -453,16 +453,29 @@ class SemanticExtractor:
                 }
                 relation_type = access_map.get(access, RelationType.INHERITS_PUBLIC)
 
+                # 虚继承检测：直接调 libclang C API clang_isVirtualBase
+                # Python 绑定注册表有此函数（cindex.py 函数表），但未封装为 Cursor 方法
+                is_virtual_base = False
+                try:
+                    is_virtual_base = clang.cindex.conf.lib.clang_isVirtualBase(base_spec)
+                except (AttributeError, TypeError):
+                    pass  # C API 不可用时静默降级
+
                 parent_file = ""
                 if parent_ref and parent_ref.location.file:
                     parent_file = self._make_file_path(str(parent_ref.location.file.name))
 
                 parent_key = f"{NodeType.CLASS.value}|{parent_namespace}|{parent_name}|{parent_file}"
 
+                extra_info = {}
+                if is_virtual_base:
+                    extra_info["is_virtual"] = True
+
                 result.edges.append(EdgeInfo(
                     relation_type=relation_type,
                     from_unique_key=child_key,
                     to_unique_key=parent_key,
+                    extra_info=extra_info if extra_info else None,
                 ))
 
     # ------------------------------------------------------------------
@@ -719,15 +732,15 @@ class SemanticExtractor:
             rt = edge.relation_type.value if isinstance(edge.relation_type, RelationType) else edge.relation_type
             # 去重 key 加入 call_line，保留同一函数内多次调用同一目标的每个调用点
             # 修复前：(caller, callee) 去重导致 UpdateThread 内 7 处 HandleError 只保留 1 条
-            call_line = edge.extra_info.get("call_line", 0)
+            call_line = (edge.extra_info or {}).get("call_line", 0)
             if edge.to_unique_key:
                 key = (edge.from_unique_key, edge.to_unique_key, rt, call_line)
             else:
                 # 未解析边：去重 key 需含 callee 的命名空间和父类，
                 # 否则 A::init() 和 B::init() 会被误判为重复
-                callee = edge.extra_info.get("callee_name", "")
-                callee_ns = edge.extra_info.get("callee_namespace", "")
-                callee_parent = edge.extra_info.get("callee_parent_class", "")
+                callee = (edge.extra_info or {}).get("callee_name", "")
+                callee_ns = (edge.extra_info or {}).get("callee_namespace", "")
+                callee_parent = (edge.extra_info or {}).get("callee_parent_class", "")
                 key = (edge.from_unique_key,
                        f"__unresolved__{callee_ns}::{callee_parent}::{callee}@{call_line}", rt)
             if key not in seen_edges:
