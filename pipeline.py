@@ -54,6 +54,10 @@ class ParseReport:
     parse_seconds: float = 0.0
     import_seconds: float = 0.0
     total_seconds: float = 0.0
+    # 文档融合
+    doc_sections_new: int = 0
+    doc_associations_new: int = 0
+    associations_rebuilt: bool = False
     # 验证
     validation: dict | None = None
 
@@ -76,6 +80,9 @@ class ParseReport:
             "parse_seconds": round(self.parse_seconds, 2),
             "import_seconds": round(self.import_seconds, 2),
             "total_seconds": round(self.total_seconds, 2),
+            "doc_sections_new": self.doc_sections_new,
+            "doc_associations_new": self.doc_associations_new,
+            "associations_rebuilt": self.associations_rebuilt,
             "validation": self.validation,
         }
 
@@ -172,6 +179,31 @@ class FullParsePipeline:
         report.db_include_count = db_stats["include_count"]
         report.node_type_dist = db_stats["node_type_distribution"]
         report.edge_type_dist = db_stats["edge_type_distribution"]
+
+        # 3.5 文档融合：解析文档切片 + 重建文档-代码关联边
+        # 全量解析必须包含文档，否则 cpp_search_docs 完全失效
+        try:
+            from .parser.doc_ingester import DocIngester
+            from .parser.association_ingester import AssociationIngester
+
+            doc_ingester = DocIngester(
+                db_path, config_path=None,
+                project_config_path=self.config_path,
+            )
+            doc_stats = doc_ingester.ingest_from_config(verbose=False)
+            doc_ingester.close()
+            report.doc_sections_new = doc_stats.get("sections_created", 0)
+
+            assoc_ingester = AssociationIngester(db_path, self.config)
+            assoc_stats = assoc_ingester.ingest_content_scan_associations()
+            assoc_ingester.close()
+            report.doc_associations_new = assoc_stats.get("edges_created", 0)
+            report.associations_rebuilt = True
+            logger.info("文档融合完成: +{} 切片, +{} 关联边".format(
+                report.doc_sections_new, report.doc_associations_new))
+        except Exception as e:
+            logger.warning("文档融合失败（非致命，cpp_search_docs 将不可用）: %s", e)
+            report.associations_rebuilt = False
 
         # 4. 正确性验证（可选）
         if run_validation:
