@@ -717,8 +717,11 @@ class SemanticExtractor:
         unique_edges = []
         for edge in result.edges:
             rt = edge.relation_type.value if isinstance(edge.relation_type, RelationType) else edge.relation_type
+            # 去重 key 加入 call_line，保留同一函数内多次调用同一目标的每个调用点
+            # 修复前：(caller, callee) 去重导致 UpdateThread 内 7 处 HandleError 只保留 1 条
+            call_line = edge.extra_info.get("call_line", 0)
             if edge.to_unique_key:
-                key = (edge.from_unique_key, edge.to_unique_key, rt)
+                key = (edge.from_unique_key, edge.to_unique_key, rt, call_line)
             else:
                 # 未解析边：去重 key 需含 callee 的命名空间和父类，
                 # 否则 A::init() 和 B::init() 会被误判为重复
@@ -726,7 +729,7 @@ class SemanticExtractor:
                 callee_ns = edge.extra_info.get("callee_namespace", "")
                 callee_parent = edge.extra_info.get("callee_parent_class", "")
                 key = (edge.from_unique_key,
-                       f"__unresolved__{callee_ns}::{callee_parent}::{callee}", rt)
+                       f"__unresolved__{callee_ns}::{callee_parent}::{callee}@{call_line}", rt)
             if key not in seen_edges:
                 seen_edges.add(key)
                 unique_edges.append(edge)

@@ -202,7 +202,7 @@ class CallQuery:
                         caller_class=caller_class,
                         caller_namespace=caller_node.get("namespace", "") if caller_node else "",
                         caller_file=caller_node.get("file_path", "") if caller_node else "",
-                        caller_line=0,
+                        caller_line=extra.get("call_line", 0) or edge.get("call_line", 0),
                         callee_name=callee_node["name"],
                         callee_class=callee_class,
                         callee_namespace=callee_node.get("namespace", ""),
