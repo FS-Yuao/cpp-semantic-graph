@@ -94,10 +94,19 @@ parse_options:
 
 ### 4. 全量解析
 
+> ⚠️ **重要**：全量解析前必须先停掉 MCP Server，否则 MCP Server 持有的 DB 连接会导致写入失败（`disk I/O error`）。
+> 停止方法：`pkill -f "run_server.py"` 或在 Claude Code 设置中禁用 MCP Server 后重启。
+
 ```bash
+# 1. 停掉 MCP Server（必须！）
+pkill -f "run_server.py"
+
+# 2. 全量解析
 python3 -m cpp_semantic_graph full-parse \
   --config cpp_semantic_graph.yaml \
   --db semantic_graph_full.db
+
+# 3. 重新启动 MCP Server（解析完成后）
 ```
 
 解析完成后，数据库包含：
