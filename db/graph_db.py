@@ -69,11 +69,12 @@ class GraphDB:
                 from_id INTEGER NOT NULL,
                 to_id INTEGER NOT NULL,
                 relation_type TEXT NOT NULL,
+                call_line INTEGER DEFAULT 0,
                 extra_info TEXT,
                 created_at TEXT DEFAULT (datetime('now')),
                 FOREIGN KEY(from_id) REFERENCES node(id) ON DELETE CASCADE,
                 FOREIGN KEY(to_id) REFERENCES node(id) ON DELETE CASCADE,
-                UNIQUE(from_id, to_id, relation_type)
+                UNIQUE(from_id, to_id, relation_type, call_line)
             );
             CREATE TABLE IF NOT EXISTS include_dep (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -192,8 +193,11 @@ class GraphDB:
     # ------------------------------------------------------------------
 
     def insert_edge(self, from_id: int, to_id: int, relation_type: str,
-                    extra_info: dict = None) -> int | None:
+                    extra_info: dict = None, call_line: int = 0) -> int | None:
         """插入边，已存在则更新 extra_info
+
+        Args:
+            call_line: 调用行号，用于区分同一函数内多次调用同一目标的多个调用点
 
         Returns:
             edge id，或 None（不应发生）
@@ -201,22 +205,22 @@ class GraphDB:
         extra_json = json.dumps(extra_info, ensure_ascii=False) if extra_info else None
         try:
             cursor = self.conn.execute(
-                """INSERT INTO edge (from_id, to_id, relation_type, extra_info)
-                   VALUES (?, ?, ?, ?)""",
-                (from_id, to_id, relation_type, extra_json)
+                """INSERT INTO edge (from_id, to_id, relation_type, call_line, extra_info)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (from_id, to_id, relation_type, call_line, extra_json)
             )
             return cursor.lastrowid
         except sqlite3.IntegrityError:
-            # (from_id, to_id, relation_type) conflict → update extra_info
+            # (from_id, to_id, relation_type, call_line) conflict → update extra_info
             self.conn.execute(
                 """UPDATE edge SET extra_info=?
-                   WHERE from_id=? AND to_id=? AND relation_type=?""",
-                (extra_json, from_id, to_id, relation_type)
+                   WHERE from_id=? AND to_id=? AND relation_type=? AND call_line=?""",
+                (extra_json, from_id, to_id, relation_type, call_line)
             )
             row = self.conn.execute(
                 """SELECT id FROM edge
-                   WHERE from_id=? AND to_id=? AND relation_type=?""",
-                (from_id, to_id, relation_type)
+                   WHERE from_id=? AND to_id=? AND relation_type=? AND call_line=?""",
+                (from_id, to_id, relation_type, call_line)
             ).fetchone()
             return row["id"] if row else None
 
@@ -561,8 +565,10 @@ class GraphDB:
 
             # Insert edge if we have both endpoints
             if to_id is not None:
+                # 提取 call_line 用于区分同一函数内多次调用同一目标的多个调用点
+                call_line = edge.extra_info.get("call_line", 0) if edge.extra_info else 0
                 extra_json = json.dumps(edge.extra_info, ensure_ascii=False) if edge.extra_info else None
-                edge_id = self.insert_edge(from_id, to_id, rt, edge.extra_info)
+                edge_id = self.insert_edge(from_id, to_id, rt, edge.extra_info, call_line=call_line)
                 if edge_id:
                     stats["edges_new"] += 1
                 else:

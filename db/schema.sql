@@ -19,16 +19,18 @@ CREATE TABLE IF NOT EXISTS node (
 -- 边表：节点间的关系
 -- from_id = 关系起点, to_id = 关系终点
 -- 方向约定: inherits → from=子类 to=父类, calls → from=调用方 to=被调用方
+-- call_line: 调用行号，用于区分同一函数内多次调用同一目标的多个调用点
 CREATE TABLE IF NOT EXISTS edge (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   from_id INTEGER NOT NULL,
   to_id INTEGER NOT NULL,
   relation_type TEXT NOT NULL,   -- 见 models.RelationType 枚举
+  call_line INTEGER DEFAULT 0,  -- 调用行号（0=非调用边或行号未知）
   extra_info TEXT,               -- JSON
   created_at TEXT DEFAULT (datetime('now')),
   FOREIGN KEY(from_id) REFERENCES node(id) ON DELETE CASCADE,
   FOREIGN KEY(to_id) REFERENCES node(id) ON DELETE CASCADE,
-  UNIQUE(from_id, to_id, relation_type)
+  UNIQUE(from_id, to_id, relation_type, call_line)
 );
 
 -- include 依赖表：支持增量更新时的翻译单元影响范围分析
@@ -63,6 +65,7 @@ CREATE INDEX IF NOT EXISTS idx_edge_to_id ON edge(to_id);
 CREATE INDEX IF NOT EXISTS idx_edge_relation_type ON edge(relation_type);
 CREATE INDEX IF NOT EXISTS idx_edge_from_type ON edge(from_id, relation_type);
 CREATE INDEX IF NOT EXISTS idx_edge_to_type ON edge(to_id, relation_type);
+CREATE INDEX IF NOT EXISTS idx_edge_call_line ON edge(call_line);
 CREATE INDEX IF NOT EXISTS idx_include_source ON include_dep(source_file);
 CREATE INDEX IF NOT EXISTS idx_include_included ON include_dep(included_file);
 CREATE INDEX IF NOT EXISTS idx_parse_status_file ON parse_status(source_file);
