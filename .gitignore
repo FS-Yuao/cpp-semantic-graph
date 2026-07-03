@@ -33,3 +33,8 @@ output/*.json
 semantic_graph.db
 *.db-shm
 *.db.bak-*
+rebuild_report.json
+rebuild.log
+semantic_graph_full.db
+semantic_graph_full.db-wal
+semantic_graph_full.db-shm

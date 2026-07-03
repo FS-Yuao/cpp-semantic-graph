@@ -8,7 +8,7 @@ Phase 0 验证结论:
 - 类/继承/虚函数/override 通过 walk_preorder + get_children 提取
 - Proxy 方法调用必须用 MEMBER_REF_EXPR (CALL_EXPR.referenced 对 Proxy 返回 None)
 - CXX_OVERRIDE_ATTR 通过 get_children 检测
-- is_virtual_base() 不可用，虚继承暂无法检测
+- 虚继承通过 clang_isVirtualBase C API 检测（Python 绑定未封装为方法，直接调 conf.lib）
 - MEMBER_REF_EXPR 的 semantic_parent 链可能为空，需行号映射 fallback
 """
 
