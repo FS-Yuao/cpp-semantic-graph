@@ -444,7 +444,7 @@ class GraphDB:
                     to_id = to_row["id"]
 
             # For unresolved edges, try to find target by context
-            if to_id is None and edge.extra_info.get("_needs_resolution"):
+            if to_id is None and edge.extra_info and edge.extra_info.get("_needs_resolution"):
                 resolve_hint = edge.extra_info.get("_resolve_hint", "")
 
                 if resolve_hint == "override":
