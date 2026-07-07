@@ -17,7 +17,8 @@ import logging
 from clang.cindex import CursorKind
 
 from ..db.relation_types import RelationType
-from ..parser.models import NodeInfo, EdgeInfo, NodeType
+from ..parser.models import NodeInfo, EdgeInfo, NodeType, make_func_sig_suffix
+from .cursor_utils import get_namespace, get_parent_class_name  # P2-3: 统一 cursor 工具
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +98,21 @@ class FriendExtractor:
                         unique_key=friend_key,
                     ))
             else:
+                # friend function key 需含参数签名（与 ast_visitor._make_function_key 对齐），
+                # 否则重载友元函数的 friend_of 边 from 端解析失配。
+                friend_params = []
+                friend_is_const = False
+                if friend_cursor is not None:
+                    friend_params = [
+                        (a.type.spelling if a.type else a.spelling)
+                        for a in friend_cursor.get_arguments()
+                        if a.kind == CursorKind.PARM_DECL
+                    ]
+                    if friend_cursor.kind == CursorKind.CXX_METHOD:
+                        friend_is_const = friend_cursor.is_const_method()
+                sig_suffix = make_func_sig_suffix(friend_params, friend_is_const)
                 friend_key = (
-                    f"{NodeType.FUNCTION.value}|{namespace}|{friend_name}|{file_path}"
+                    f"{NodeType.FUNCTION.value}|{namespace}|{friend_name}|{file_path}{sig_suffix}"
                 )
 
             # host（本类）节点 key —— 本类由 ast_viewer._extract_classes 入库
@@ -120,20 +134,10 @@ class FriendExtractor:
 
     @staticmethod
     def _get_namespace(cursor) -> str:
-        """提取命名空间"""
-        parts = []
-        parent = cursor.semantic_parent
-        while parent:
-            if parent.kind == CursorKind.NAMESPACE:
-                parts.append(parent.spelling)
-            parent = parent.semantic_parent
-        return "::".join(reversed(parts)) if parts else ""
+        """提取命名空间（P2-3：统一实现见 cursor_utils.get_namespace）"""
+        return get_namespace(cursor)
 
     @staticmethod
     def _get_parent_class_name(cursor) -> str | None:
-        """获取友元声明的宿主类名"""
-        parent = cursor.semantic_parent
-        if parent and parent.kind in (CursorKind.CLASS_DECL,
-                                       CursorKind.STRUCT_DECL):
-            return parent.spelling
-        return None
+        """获取友元声明的宿主类名（P2-3：统一实现见 cursor_utils.get_parent_class_name）"""
+        return get_parent_class_name(cursor)

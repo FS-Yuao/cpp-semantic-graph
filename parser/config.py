@@ -54,6 +54,17 @@ class ProjectConfig:
             else:
                 docs_dir_abs = str((path.parent / docs_path).resolve())
 
+        # 解析 docs_config 为绝对路径（相对于配置文件所在目录）
+        # 迁移后不依赖 CWD，否则 ingest_config_associations 读不到 manual_links
+        docs_config_raw = data.get("docs_config", "")
+        docs_config_abs = ""
+        if docs_config_raw:
+            docs_config_p = Path(docs_config_raw)
+            if docs_config_p.is_absolute():
+                docs_config_abs = str(docs_config_p)
+            else:
+                docs_config_abs = str((path.parent / docs_config_p).resolve())
+
         return cls(
             name=project.get("name", ""),
             compile_commands=project.get("compile_commands", ""),
@@ -67,7 +78,7 @@ class ProjectConfig:
             target_triple=data.get("target_triple", ""),
             toolchain_includes=data.get("toolchain_includes", []),
             docs_dir=docs_dir_abs,
-            docs_config=data.get("docs_config", ""),
+            docs_config=docs_config_abs,
             config_path=str(path.resolve()),
         )
 

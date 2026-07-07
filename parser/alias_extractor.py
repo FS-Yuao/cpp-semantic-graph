@@ -21,6 +21,7 @@ from clang.cindex import CursorKind
 
 from ..db.relation_types import RelationType
 from ..parser.models import NodeInfo, EdgeInfo, NodeType
+from .cursor_utils import get_namespace, get_parent_class_name  # P2-3: 统一 cursor 工具
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +199,11 @@ class AliasExtractor:
         file_path = make_file_path(abs_path)
 
         # using_decl 边: 子类::func → 基类::func
-        # key 格式与 ast_visitor._make_function_key 对齐：namespace 含类名
+        # 注：using 声明语义是导入基类的「所有」同名重载，不对应单一参数签名，
+        # 故此处 key 为 name 级（无 params 后缀）。该边通过 _needs_resolution 的
+        # using_decl hint 在 graph_db 按 base_class+func_name 解析（name 级匹配）。
+        # 若基类同名函数有多个重载，当前解析取首个（LIMIT 1）——using_decl 边罕见
+        # （本项目 0 条），name 级足够；如需精确到每个重载需展开为多条边（后续）。
         from_key = (
             f"{NodeType.FUNCTION.value}|{namespace}::{derived_class}"
             f"|{func_name}|{file_path}"
@@ -254,20 +259,10 @@ class AliasExtractor:
 
     @staticmethod
     def _get_namespace(cursor) -> str:
-        """提取命名空间"""
-        parts = []
-        parent = cursor.semantic_parent
-        while parent:
-            if parent.kind == CursorKind.NAMESPACE:
-                parts.append(parent.spelling)
-            parent = parent.semantic_parent
-        return "::".join(reversed(parts)) if parts else ""
+        """提取命名空间（P2-3：统一实现见 cursor_utils.get_namespace）"""
+        return get_namespace(cursor)
 
     @staticmethod
     def _get_parent_class_name(cursor) -> str | None:
-        """获取父类名"""
-        parent = cursor.semantic_parent
-        if parent and parent.kind in (CursorKind.CLASS_DECL,
-                                       CursorKind.STRUCT_DECL):
-            return parent.spelling
-        return None
+        """获取父类名（P2-3：统一实现见 cursor_utils.get_parent_class_name）"""
+        return get_parent_class_name(cursor)

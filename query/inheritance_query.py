@@ -70,6 +70,9 @@ class InheritanceQuery:
         Returns:
             继承节点列表（按深度排序）
         """
+        # max_depth=-1（无限）设安全上限，防密集继承图指数级遍历（主题F）
+        if max_depth < 0:
+            max_depth = 20
         visited: dict[str, int] = {}  # name → depth
         result: list[InheritanceNode] = []
         self._walk_inheritance(class_name, direction, 0, max_depth,
@@ -245,9 +248,6 @@ class InheritanceQuery:
             if current == to_class:
                 paths.append(path.copy())
                 return
-            # 防环
-            if current in path[1:]:
-                return
 
             # 找 current 的子类
             nodes = self.db.find_node_by_name(current, "class")
@@ -263,7 +263,8 @@ class InheritanceQuery:
                 if edge["relation_type"] not in rel_types:
                     continue
                 child_node = self.db.get_node_by_id(edge["from_id"])
-                if child_node:
+                # 防环：跳过已在路径上的节点（P0-3 修复，原 path[1:] 检查恒为 True 导致 2+ 跳失效）
+                if child_node and child_node["name"] not in path:
                     dfs(child_node["name"], path + [child_node["name"]],
                         depth + 1)
 

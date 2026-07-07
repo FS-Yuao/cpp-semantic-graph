@@ -13,19 +13,9 @@ from ..db.graph_db import GraphDB
 from ..db.relation_types import RelationType
 from .graph_query import GraphQuery, ClassInfo, FunctionInfo
 from .doc_query import DocQuery, DocSectionInfo, DocWithCode
+from .query_utils import parse_extra as _parse_extra  # P2-3: 统一实现
 
 logger = logging.getLogger(__name__)
-
-
-def _parse_extra(raw) -> dict:
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return {}
-    return {}
 
 
 @dataclass

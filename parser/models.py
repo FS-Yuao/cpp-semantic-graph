@@ -16,7 +16,33 @@ class NodeType(str, Enum):
     DOC_SECTION = "doc_section"
 
 
+def make_func_sig_suffix(param_types: list[str] | None, is_const: bool = False) -> str:
+    """构造 function unique_key 的签名后缀，用于区分重载。
+
+    格式: "|<param1,param2,...>[|c]"（const 方法加 c 标记）
+    非函数节点不调用此函数（key 无此后缀）。
+    节点侧（models.NodeInfo）与提取侧（ast_visitor._make_function_key /
+    friend/alias extractor）必须调用此同一函数，保证 caller key 与 node key
+    逐字节一致，否则调用边 from/to 解析失配。
+    """
+    params = param_types or []
+    suffix = f"|{','.join(params)}"
+    if is_const:
+        suffix += "|c"
+    return suffix
+
+
 class RelationType(str, Enum):
+    """节点间关系类型枚举（本模块为单一权威来源）
+
+    值同时作为数据库 edge.relation_type 的存储值。
+    db/relation_types.py 从此处重导出，勿在两处各自定义（P2-2：消除人工同步）。
+    方向约定:
+    - inherits: from=子类, to=父类
+    - calls:    from=调用方, to=被调用方
+    - belongs_to: from=成员, to=所属类
+    - overrides: from=派生类函数, to=基类函数
+    """
     # 继承关系
     INHERITS_PUBLIC = "inherits_public"
     INHERITS_PROTECTED = "inherits_protected"
@@ -44,6 +70,29 @@ class RelationType(str, Enum):
     DOC_DESCRIBES_CODE = "doc_describes_code"
     CODE_REFERS_TO_DOC = "code_refers_to_doc"
 
+    @classmethod
+    def inherits_types(cls) -> list["RelationType"]:
+        """返回所有继承关系类型"""
+        return [cls.INHERITS_PUBLIC, cls.INHERITS_PROTECTED, cls.INHERITS_PRIVATE]
+
+    @classmethod
+    def call_types(cls) -> list["RelationType"]:
+        """返回所有调用关系类型"""
+        return [cls.CALLS_DIRECT, cls.CALLS_VIRTUAL, cls.CALLS_CALLBACK]
+
+    @classmethod
+    def doc_types(cls) -> list["RelationType"]:
+        """返回所有文档关系类型"""
+        return [cls.DOC_DESCRIBES_CODE, cls.CODE_REFERS_TO_DOC]
+
+    @classmethod
+    def from_str(cls, value: str) -> "RelationType | None":
+        """从字符串值获取枚举，未知值返回 None"""
+        try:
+            return cls(value)
+        except ValueError:
+            return None
+
 
 @dataclass
 class NodeInfo:
@@ -59,7 +108,16 @@ class NodeInfo:
 
     def __post_init__(self):
         if not self.unique_key:
-            self.unique_key = f"{self.type.value}|{self.namespace}|{self.name}|{self.file_path}"
+            # function 节点 key 追加参数签名后缀，区分重载（type|ns|name|file|params[|c]）
+            # class/struct/doc_section 无后缀，key 格式向后兼容
+            sig_suffix = ""
+            type_val = self.type.value if isinstance(self.type, NodeType) else self.type
+            if type_val == NodeType.FUNCTION.value:
+                info = self.extra_info or {}
+                sig_suffix = make_func_sig_suffix(
+                    info.get("param_types", []), info.get("is_const", False)
+                )
+            self.unique_key = f"{type_val}|{self.namespace}|{self.name}|{self.file_path}{sig_suffix}"
 
     def to_dict(self) -> dict:
         return {

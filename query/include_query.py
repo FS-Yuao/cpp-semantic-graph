@@ -102,10 +102,12 @@ class IncludeQuery:
             next_queue: list[str] = []
             for current in queue:
                 # 找谁 include 了 current（current 可能本身也是头文件）
+                # included_file 存 basename，精确匹配避免子串误匹配（主题A-4）
+                current_base = Path(current).name
                 rows = self.conn.execute(
                     "SELECT DISTINCT source_file FROM include_dep "
-                    "WHERE included_file LIKE ?",
-                    (f"%{Path(current).name}%",),
+                    "WHERE included_file = ? OR included_file LIKE '%/' || ?",
+                    (current_base, current_base),
                 ).fetchall()
                 for r in rows:
                     f = r["source_file"]

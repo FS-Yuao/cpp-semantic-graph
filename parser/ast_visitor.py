@@ -21,15 +21,16 @@ from .compile_db import CompileDB, CompileCommand
 from .config import ProjectConfig
 from .models import (
     NodeInfo, EdgeInfo, IncludeDep, ParseResult,
-    NodeType, RelationType,
+    NodeType, RelationType, make_func_sig_suffix,
 )
 from .alias_extractor import AliasExtractor
 from .friend_extractor import FriendExtractor
-# TemplateExtractor 当前不参与提取：libclang 对模板特化（如 ThreadDrivenProxy<X>）
-# 不产生独立的 CLASS_DECL 节点（特化名只出现在 CONSTRUCTOR/TYPE_REF 的 spelling 中），
-# walk_preorder 找不到含 '<' 的类声明，提取产不出数据。保留导入以便后续改用
-# LibTooling 或基于 TYPE_REF 重建特化节点时复用。
-# from .template_extractor import TemplateExtractor
+from .cursor_utils import get_namespace  # P2-3: 统一 cursor 工具
+# 模板特化不参与提取：libclang 对模板特化（如 ThreadDrivenProxy<X>）不产生独立的
+# CLASS_DECL 节点（特化名只出现在 CONSTRUCTOR/TYPE_REF 的 spelling 中），
+# walk_preorder 找不到含 '<' 的类声明，提取产不出数据。
+# P2-5：原 template_extractor.py 为此死代码，已删除；未来若改用 LibTooling 或
+# 基于 TYPE_REF 重建特化节点，再新增相应提取器。
 
 logger = logging.getLogger(__name__)
 
@@ -123,15 +124,8 @@ class SemanticExtractor:
 
     @staticmethod
     def _get_namespace(cursor) -> str:
-        """获取 cursor 的完整命名空间路径"""
-        parts = []
-        parent = cursor.semantic_parent
-        while parent:
-            if parent.kind == CursorKind.NAMESPACE:
-                parts.append(parent.spelling)
-            parent = parent.semantic_parent
-        parts.reverse()
-        return "::".join(parts)
+        """获取 cursor 的完整命名空间路径（P2-3：统一实现见 cursor_utils.get_namespace）"""
+        return get_namespace(cursor)
 
     def _make_file_path(self, file_name: str) -> str:
         """将绝对路径转为相对路径（基于 ProjectConfig）"""
@@ -205,10 +199,23 @@ class SemanticExtractor:
 
         # Include parent class in namespace
         grandparent = func_cursor.semantic_parent
-        if grandparent and grandparent.kind == CursorKind.CLASS_DECL:
+        # P1-E-1: 含 STRUCT_DECL，struct 的成员函数也纳入所属类 namespace
+        if grandparent and grandparent.kind in (CursorKind.CLASS_DECL, CursorKind.STRUCT_DECL):
             namespace = f"{self._get_namespace(grandparent)}::{grandparent.spelling}"
 
-        return f"{NodeType.FUNCTION.value}|{namespace}|{name}|{file_path}"
+        # 参数签名后缀区分重载（与 _extract_functions 的 param_types/is_const 同源）
+        # 用同一 make_func_sig_suffix 保证 caller key 与 node key 逐字节一致
+        params = [
+            (a.type.spelling if a.type else a.spelling)
+            for a in func_cursor.get_arguments()
+            if a.kind == CursorKind.PARM_DECL
+        ]
+        is_const = (
+            func_cursor.is_const_method()
+            if func_cursor.kind == CursorKind.CXX_METHOD else False
+        )
+        sig_suffix = make_func_sig_suffix(params, is_const)
+        return f"{NodeType.FUNCTION.value}|{namespace}|{name}|{file_path}{sig_suffix}"
 
     # ------------------------------------------------------------------
     # Class extraction
@@ -282,10 +289,12 @@ class SemanticExtractor:
 
                 # BELONGS_TO edge for nested classes
                 parent = cursor.semantic_parent
-                if parent and parent.kind == CursorKind.CLASS_DECL:
+                if parent and parent.kind in (CursorKind.CLASS_DECL, CursorKind.STRUCT_DECL):
                     parent_ns = self._get_namespace(parent)
                     parent_file = self._make_file_path(str(parent.location.file.name))
-                    parent_key = f"{NodeType.CLASS.value}|{parent_ns}|{parent.spelling}|{parent_file}"
+                    # P1-E-1: parent 可能是 struct，type 要匹配否则 BELONGS_TO 边解析不到目标节点
+                    parent_type = NodeType.CLASS.value if parent.kind == CursorKind.CLASS_DECL else NodeType.STRUCT.value
+                    parent_key = f"{parent_type}|{parent_ns}|{parent.spelling}|{parent_file}"
                     result.edges.append(EdgeInfo(
                         relation_type=RelationType.BELONGS_TO,
                         from_unique_key=node.unique_key,
@@ -308,6 +317,14 @@ class SemanticExtractor:
             if not self._should_include(cursor):
                 continue
 
+            # P1-E-2: 跳过声明节点（.h），只保留定义（.cpp），避免声明/定义产生两个节点
+            # 例外：纯虚函数只有声明（=0，无定义），必须保留
+            is_pure_virtual_early = (cursor.kind == CursorKind.CXX_METHOD
+                                     and cursor.is_virtual_method()
+                                     and cursor.is_pure_virtual_method())
+            if not cursor.is_definition() and not is_pure_virtual_early:
+                continue
+
             name = cursor.spelling
             if not name:
                 continue
@@ -317,10 +334,18 @@ class SemanticExtractor:
 
             # Determine parent class
             parent_class = ""
+            parent_type = NodeType.CLASS.value  # P1-E-1: struct 时改为 STRUCT，BELONGS_TO 边 type 匹配
+            parent_file_for_key = file_path  # 默认同文件（.h 内联定义）
             parent = cursor.semantic_parent
-            if parent and parent.kind == CursorKind.CLASS_DECL:
+            if parent and parent.kind in (CursorKind.CLASS_DECL, CursorKind.STRUCT_DECL):
                 parent_class = parent.spelling
+                parent_type = NodeType.CLASS.value if parent.kind == CursorKind.CLASS_DECL else NodeType.STRUCT.value
                 namespace = self._get_namespace(parent)
+                # belongs_to 回归修复：out-of-line 定义（.cpp）的成员函数，其类节点在 .h。
+                # parent_key 必须用父类 cursor 的 location file（.h），否则 file_path 用
+                # 函数的 .cpp 路径 → 与 .h 的 class 节点 unique_key 失配 → belongs_to 边丢失。
+                if parent.location.file:
+                    parent_file_for_key = self._make_file_path(str(parent.location.file.name))
 
             # Function properties
             is_virtual = cursor.is_virtual_method() if cursor.kind == CursorKind.CXX_METHOD else False
@@ -390,7 +415,7 @@ class SemanticExtractor:
 
                 # BELONGS_TO edge
                 if parent_class:
-                    parent_key = f"{NodeType.CLASS.value}|{namespace}|{parent_class}|{file_path}"
+                    parent_key = f"{parent_type}|{namespace}|{parent_class}|{parent_file_for_key}"
                     result.edges.append(EdgeInfo(
                         relation_type=RelationType.BELONGS_TO,
                         from_unique_key=node.unique_key,
@@ -560,6 +585,17 @@ class SemanticExtractor:
         if callee.location.file:
             callee_file = self._make_file_path(str(callee.location.file))
 
+        # callee 参数类型：供 graph_db 精确匹配到具体重载（区分同名重载）
+        callee_params = [
+            (a.type.spelling if a.type else a.spelling)
+            for a in callee.get_arguments()
+            if a.kind == CursorKind.PARM_DECL
+        ]
+        callee_is_const = (
+            callee.is_const_method()
+            if callee.kind == CursorKind.CXX_METHOD else False
+        )
+
         result.edges.append(EdgeInfo(
             relation_type=RelationType.CALLS_DIRECT if call_type == "direct" else RelationType.CALLS_VIRTUAL,
             from_unique_key=caller_key,
@@ -569,6 +605,8 @@ class SemanticExtractor:
                 "callee_namespace": callee_namespace,
                 "callee_parent_class": callee_parent_class,
                 "callee_file": callee_file,
+                "callee_param_types": callee_params,
+                "callee_is_const": callee_is_const,
                 "call_type": call_type,
                 "call_line": cursor.location.line,
                 "_needs_resolution": True,
@@ -583,6 +621,12 @@ class SemanticExtractor:
         """
         ref = cursor.referenced
         if not ref:
+            return
+
+        # 只处理方法/函数调用，过滤字段访问（P0-6 修复）
+        # obj.field 的 ref 是 FIELD_DECL，其 semantic_parent 也是 CLASS_DECL，
+        # 不加此过滤会产生 callee_name=字段名 的虚假调用边
+        if ref.kind not in (CursorKind.CXX_METHOD, CursorKind.FUNCTION_DECL):
             return
 
         callee_name = ref.spelling
@@ -613,6 +657,17 @@ class SemanticExtractor:
 
         is_virtual = ref.is_virtual_method()
 
+        # callee 参数类型：供 graph_db 精确匹配到具体重载
+        callee_params = [
+            (a.type.spelling if a.type else a.spelling)
+            for a in ref.get_arguments()
+            if a.kind == CursorKind.PARM_DECL
+        ]
+        callee_is_const = (
+            ref.is_const_method()
+            if ref.kind == CursorKind.CXX_METHOD else False
+        )
+
         result.edges.append(EdgeInfo(
             relation_type=RelationType.CALLS_VIRTUAL if is_virtual else RelationType.CALLS_DIRECT,
             from_unique_key=caller_key,
@@ -622,6 +677,8 @@ class SemanticExtractor:
                 "callee_namespace": callee_namespace,
                 "callee_parent_class": callee_parent_class,
                 "callee_file": callee_file,
+                "callee_param_types": callee_params,
+                "callee_is_const": callee_is_const,
                 "call_type": "virtual_dispatch" if is_virtual else "member_call",
                 "call_line": cursor.location.line,
                 "_needs_resolution": True,

@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 
 from ..db.graph_db import GraphDB
 from ..db.relation_types import RelationType
+from .query_utils import parse_extra as _parse_extra  # P2-3: 统一实现
 
 logger = logging.getLogger(__name__)
 
@@ -42,18 +43,6 @@ class OverrideInfo:
     signature: str
     base_class: str              # 被重写的基类
     base_function_signature: str  # 基类虚函数签名
-
-
-def _parse_extra(raw) -> dict:
-    """安全解析 extra_info（可能是 JSON 字符串或 dict）"""
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return {}
-    return {}
 
 
 class PolymorphismQuery:
@@ -199,8 +188,13 @@ class PolymorphismQuery:
         base_class: str,
         results: list[OverrideInfo],
         seen: set[str],
+        depth: int = 0,
     ):
         """递归收集 override（通过 overrides 边）"""
+        # 深度上限防深层 override 链栈溢出（主题F）
+        if depth > 20:
+            logger.warning("override 递归达深度上限 20，可能截断: %s::%s", base_class, func_name)
+            return
         # 查 overrides 边: to_id = base_func_id
         override_edges = self.db.get_edges_to(base_func_id, "overrides")
 
@@ -324,6 +318,13 @@ class PolymorphismQuery:
             class_node = self.db.get_node_by_id(edges[0]["to_id"])
             if class_node:
                 return class_node["name"]
+        # fallback：belongs_to 边缺失（如类在其他文件、边未解析）时，从函数
+        # namespace 末段推断类名（E-3 后 function 节点 namespace 末段=所属类名，稳定契约）
+        node = self.db.get_node_by_id(func_id)
+        if node:
+            ns = node.get("namespace", "") or ""
+            if "::" in ns:
+                return ns.rsplit("::", 1)[-1]
         return None
 
     def _get_ancestor_classes(self, class_name: str) -> list[str]:
