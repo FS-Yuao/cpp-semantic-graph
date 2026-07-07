@@ -14,14 +14,17 @@ source_paths:
 
 # 生成代码路径 — 头文件入库接口声明，源文件不入库
 # 调用关系中，callee 在此范围内也保留
-generated_paths:
-  - "src-gen"
+# 注：src-gen（ARA COM 生成代码）已移出——每次 AP 建模都变，占 43% 节点且不稳定，
+#     业务查询用不到（业务继承 src-gen 0 边、业务调用 src-gen 仅 1 条错误码样板边）。
+#     见 exclude_paths。如需恢复接口方法查询，把 "src-gen" 移回此处并重跑 full-parse。
+generated_paths: []
 
 # 完全忽略的路径 — 不解析不入库
 exclude_paths:
   - "thirdparty"
   - "build"
   - "test/mock"
+  - "src-gen"  # ARA COM 生成代码：建模后频繁变化，排除以稳定业务图谱 + 加速增量解析
 
 # 工具环境
 libclang_path: "/usr/lib/llvm-18/lib/libclang.so.1"
@@ -40,7 +43,7 @@ parse_options:
   # 是否跳过函数体（加速解析，但无法提取调用关系）
   skip_function_bodies: false
   # 并行解析的最大进程数（1=串行，内存最低）
-  max_workers: 1
+  max_workers: 8  # 16 核机器，并行 8 worker（full-parse ~6 分钟 vs 串行 19 分钟）
 
 # 模板白名单（可选，不配则所有模板只导出定义）
 template_whitelist: "config/template_whitelist.yaml"
@@ -49,4 +52,5 @@ template_whitelist: "config/template_whitelist.yaml"
 docs_config: "config/doc_config.yaml"
 
 # 文档根目录（相对于此配置文件所在目录，或绝对路径）
-docs_dir: "../../docs"
+# 迁移到 /mnt/code1/cpp_semantic_graph 后用绝对路径，避免 ../../docs 解析到 /mnt/docs
+docs_dir: "/mnt/code1/adc4.0/drive-vendor/ap/ap-aa/app/hq_ota_service/docs"

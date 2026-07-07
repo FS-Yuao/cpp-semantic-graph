@@ -161,9 +161,10 @@ class IncrementalUpdater:
 
         # --- 3~6: 删旧+重解析+导入+清理，包进单事务确保原子性 ---
         db = GraphDB(self.db_path)
+        success = False
         try:
-            # 禁用内部自动 commit，由本函数统一控制事务边界
-            db._autocommit = False
+            # 禁用内部自动 commit，由本函数统一控制事务边界（P2-7：用公共接口）
+            db.begin_manual_transaction()
 
             # --- 3. 删除旧数据 ---
             del_stats = self._delete_stale_data(changes, impact, db)
@@ -191,32 +192,37 @@ class IncrementalUpdater:
             report.nodes_removed = self._cleanup_removed_nodes(
                 changes.reparse_files, results, db)
 
-            # 全部成功，统一提交
-            db.conn.commit()
+            # 全部成功，统一提交（P2-7：公共接口，同时恢复 autocommit）
+            db.commit_manual_transaction()
+            success = True
 
         except Exception:
             # 异常回滚：删旧数据+新导入全部撤销，保持 DB 一致
             logger.exception("增量更新异常，回滚事务")
             try:
-                db.conn.rollback()
+                db.rollback_manual_transaction()
             except Exception as rb_err:
                 logger.error("回滚失败: %s", rb_err)
             raise
 
         finally:
-            # 恢复 autocommit（虽然即将 close，但保持状态一致）
+            # commit/rollback 已恢复 autocommit；此处兜底确保状态一致（防中途异常）
             db._autocommit = True
 
-            # --- 6.5. 增量入库文档变更 ---
-            doc_result = self._detect_and_ingest_doc_changes(base_ref or "HEAD~1")
-            report.docs_updated = doc_result.get("files_processed", 0)
-            report.doc_sections_new = doc_result.get("sections_created", 0)
-            report.doc_sections_updated = doc_result.get("sections_updated", 0)
+            if success:
+                # --- 6.5. 增量入库文档变更 ---
+                # P1-B 修复：事务回滚后不执行，避免基于回滚后的旧 C++ 数据建文档关联
+                doc_result = self._detect_and_ingest_doc_changes(base_ref or "HEAD~1")
+                report.docs_updated = doc_result.get("files_processed", 0)
+                report.doc_sections_new = doc_result.get("sections_created", 0)
+                report.doc_sections_updated = doc_result.get("sections_updated", 0)
 
-            # --- 7. 重建文档关联（事务外，独立操作）---
-            if rebuild_associations:
-                self._rebuild_associations(rebuild_embeddings)
-                report.associations_rebuilt = True
+                # --- 7. 重建文档关联（事务外，独立操作）---
+                if rebuild_associations:
+                    self._rebuild_associations(rebuild_embeddings)
+                    report.associations_rebuilt = True
+            else:
+                logger.warning("主事务回滚，跳过文档入库与关联重建以保持一致")
 
             # --- 8. 统计 + 关闭 ---
             try:
@@ -358,6 +364,10 @@ class IncrementalUpdater:
         # 按 file_path 分组收集 unique_keys（所有受影响 TU 的并集）
         file_to_keys: dict[str, set[str]] = {}
         for result in results:
+            # 跳过解析失败的 TU（P0-2 修复）
+            # 失败的 ParseResult nodes=[]，若不跳过会导致该文件 retained=空集 → 误删全部节点
+            if result.status == "failed":
+                continue
             for node in result.nodes:
                 file_to_keys.setdefault(node.file_path, set()).add(node.unique_key)
 
@@ -385,6 +395,10 @@ class IncrementalUpdater:
 
         ingester = AssociationIngester(self.db_path, self.config)
         stats = ingester.ingest_content_scan_associations()
+
+        # P0-4 修复：接入 manual_links 配置关联（原为死代码，配置了却不生效）
+        config_stats = ingester.ingest_config_associations(self.config.docs_config)
+        stats.update(config_stats)
 
         if rebuild_embeddings:
             emb_stats = ingester.ingest_embedding_associations()

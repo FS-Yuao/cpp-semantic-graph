@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from ..db.graph_db import GraphDB
 from ..db.relation_types import RelationType
 from .path_filter import PathFilter
+from .query_utils import parse_extra as _parse_extra  # P2-3: 统一实现
 
 logger = logging.getLogger(__name__)
 
@@ -43,17 +44,6 @@ class TraverseResult:
     edges: list[dict] = field(default_factory=list)
     paths: list[Path] = field(default_factory=list)
     stats: TraverseStats = field(default_factory=TraverseStats)
-
-
-def _parse_extra(raw) -> dict:
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return {}
-    return {}
 
 
 class TraverseQuery:
@@ -131,16 +121,16 @@ class TraverseQuery:
     ):
         """BFS 遍历"""
         visited: set[int] = set()
-        # 队列: (node_id, unique_key, depth, path_edges)
-        queue: deque[tuple[int, str, int, list[dict]]] = deque()
+        # 队列: (node_id, unique_key, depth, path_edges, start_key)（主题F：start_key 记录本路径起始节点）
+        queue: deque[tuple[int, str, int, list[dict], str]] = deque()
 
         # 初始化队列
         for nid, nkey in start_ids:
-            queue.append((nid, nkey, 0, []))
+            queue.append((nid, nkey, 0, [], nkey))
             visited.add(nid)
 
         while queue:
-            node_id, node_key, current_depth, path_edges = queue.popleft()
+            node_id, node_key, current_depth, path_edges, start_key = queue.popleft()
 
             if current_depth > max_depth:
                 continue
@@ -161,7 +151,7 @@ class TraverseQuery:
                 result.nodes.append(node)
                 if path_edges:
                     result.paths.append(Path(
-                        start_key=start_ids[0][1],
+                        start_key=start_key,
                         end_key=node["unique_key"] if "unique_key" in node else "",
                         hop_count=current_depth,
                         edges=path_edges,
@@ -193,7 +183,7 @@ class TraverseQuery:
                     nkey = neighbor_node["unique_key"] if neighbor_node else ""
 
                     queue.append((neighbor_id, nkey, current_depth + 1,
-                                  path_edges + [edge_info]))
+                                  path_edges + [edge_info], start_key))
 
     def _dfs_traverse(
         self,
@@ -209,7 +199,7 @@ class TraverseQuery:
         visited: set[int] = set()
 
         def dfs(node_id: int, node_key: str, current_depth: int,
-                path_edges: list[dict]):
+                path_edges: list[dict], start_key: str):
             if current_depth > max_depth:
                 return
             if len(result.nodes) >= max_results:
@@ -234,7 +224,7 @@ class TraverseQuery:
                 result.nodes.append(node)
                 if path_edges:
                     result.paths.append(Path(
-                        start_key=start_ids[0][1],
+                        start_key=start_key,
                         end_key=node.get("unique_key", ""),
                         hop_count=current_depth,
                         edges=path_edges,
@@ -258,10 +248,10 @@ class TraverseQuery:
                     result.stats.total_edges_traversed += 1
 
                     dfs(neighbor_id, "", current_depth + 1,
-                        path_edges + [edge_info])
+                        path_edges + [edge_info], start_key)
 
         for nid, nkey in start_ids:
-            dfs(nid, nkey, 0, [])
+            dfs(nid, nkey, 0, [], nkey)
 
     def _get_neighbors(
         self,

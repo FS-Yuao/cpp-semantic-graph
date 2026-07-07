@@ -18,6 +18,11 @@ from ..parser.models import (
 
 logger = logging.getLogger(__name__)
 
+# P2-6：schema 版本号，写入 SQLite PRAGMA user_version。
+# 变更 schema（表结构 / unique_key 格式 / 边语义）时递增，便于未来迁移检测。
+# 历史：1 = 初始；2 = unique_key 加参数签名区分重载（E-3，function key 含 params 后缀）
+SCHEMA_VERSION = 2
+
 
 class GraphDB:
     """SQLite 图谱数据库操作封装"""
@@ -33,6 +38,13 @@ class GraphDB:
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.execute("PRAGMA journal_mode=WAL")      # 并发读写
         self.conn.execute("PRAGMA foreign_keys=ON")        # 外键约束
+        # 性能调优（主题C）：WAL 下 synchronous=NORMAL 安全且更快（默认 FULL 每事务 fsync）；
+        # 内存临时存储 + 大页缓存 + mmap 加速查询；WAL 大小限制防无限增长
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA temp_store=MEMORY")
+        self.conn.execute("PRAGMA cache_size=-65536")            # 64MB 页缓存（负值=KB）
+        self.conn.execute("PRAGMA mmap_size=268435456")          # 256MB 内存映射读
+        self.conn.execute("PRAGMA journal_size_limit=67108864")  # WAL 文件上限 64MB
         self.conn.row_factory = sqlite3.Row
         self._autocommit = True  # False 时 _commit() 变 no-op，由外部事务控制
         self._init_schema()
@@ -46,7 +58,28 @@ class GraphDB:
         else:
             # Fallback: inline schema
             self._create_tables_inline()
+        self._apply_schema_version()
         self._commit()
+
+    def _apply_schema_version(self):
+        """P2-6：记录/校验 schema 版本（PRAGMA user_version）。
+
+        - 新库（user_version=0）：写入当前 SCHEMA_VERSION。
+        - 旧库版本 < 当前：仅告警（不自动迁移，避免静默破坏数据），提示重建。
+        """
+        cur_ver = self.conn.execute("PRAGMA user_version").fetchone()[0]
+        if cur_ver == 0:
+            self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        elif cur_ver < SCHEMA_VERSION:
+            logger.warning(
+                "DB schema 版本 %d < 当前 %d，可能与新代码不兼容（如 unique_key 格式），"
+                "建议 full-parse 重建库。路径: %s",
+                cur_ver, SCHEMA_VERSION, self.db_path,
+            )
+
+    def schema_version(self) -> int:
+        """返回当前 DB 的 schema 版本（PRAGMA user_version）"""
+        return self.conn.execute("PRAGMA user_version").fetchone()[0]
 
     def _create_tables_inline(self):
         """内联建表（schema.sql 不可用时的 fallback）"""
@@ -114,6 +147,23 @@ class GraphDB:
         """提交事务（当 _autocommit=True 时生效，否则由外部事务控制）"""
         if self._autocommit:
             self.conn.commit()
+
+    # P2-7：外部事务控制的公共接口，替代直接改私有属性 _autocommit。
+    # 用法：begin_manual_transaction() → 多次写操作（_commit 变 no-op）
+    #       → commit_manual_transaction() / rollback_manual_transaction()
+    def begin_manual_transaction(self):
+        """进入手动事务模式：内部 _commit() 变 no-op，由调用方统一提交/回滚。"""
+        self._autocommit = False
+
+    def commit_manual_transaction(self):
+        """提交手动事务并恢复自动提交模式。"""
+        self.conn.commit()
+        self._autocommit = True
+
+    def rollback_manual_transaction(self):
+        """回滚手动事务并恢复自动提交模式。"""
+        self.conn.rollback()
+        self._autocommit = True
 
     # ------------------------------------------------------------------
     # Node operations
@@ -273,25 +323,31 @@ class GraphDB:
             header_path: 头文件路径
             recursive: 是否递归查询间接 include
         """
+        # included_file 存 basename，按 basename 精确匹配避免子串误匹配（主题A-3）
+        # 'util.h' 不再误匹配 'my_util.h'；兼容偶尔存带路径的 included_file
+        header_base = Path(header_path).name
         if not recursive:
             rows = self.conn.execute(
-                "SELECT DISTINCT source_file FROM include_dep WHERE included_file LIKE ?",
-                (f"%{header_path}%",)
+                """SELECT DISTINCT source_file FROM include_dep
+                   WHERE included_file = ? OR included_file LIKE '%/' || ?""",
+                (header_base, header_base)
             ).fetchall()
             return [row["source_file"] for row in rows]
 
         # Recursive: BFS through include chain
         result = set()
-        queue = [header_path]
+        queue = [header_base]
         visited = set()
         while queue:
             current = queue.pop(0)
             if current in visited:
                 continue
             visited.add(current)
+            current_base = Path(current).name
             rows = self.conn.execute(
-                "SELECT DISTINCT source_file FROM include_dep WHERE included_file LIKE ?",
-                (f"%{current}%",)
+                """SELECT DISTINCT source_file FROM include_dep
+                   WHERE included_file = ? OR included_file LIKE '%/' || ?""",
+                (current_base, current_base)
             ).fetchall()
             for row in rows:
                 result.add(row["source_file"])
@@ -317,12 +373,16 @@ class GraphDB:
         """
         # 先找子类节点
         if namespace:
+            # namespace 是 '::' 分隔路径，按完整段匹配避免子串误匹配（主题A-1）
+            # 'foo' 匹配 'foo' / 'foo::bar' / 'bar::foo'，不匹配 'foobar'
             child_rows = self.conn.execute(
                 """SELECT id FROM node
                    WHERE name=? AND type IN ('class', 'struct')
-                   AND (namespace=? OR namespace LIKE ?)
+                   AND (namespace = ?
+                        OR namespace LIKE ? || '::%'
+                        OR namespace LIKE '%::' || ?)
                    LIMIT 5""",
-                (class_name, namespace, f"%{namespace}%")
+                (class_name, namespace, namespace, namespace)
             ).fetchall()
         else:
             child_rows = self.conn.execute(
@@ -406,10 +466,13 @@ class GraphDB:
             ).fetchone()
 
             if existing:
+                # 刷新行号/命名空间/文件路径（P1-B 修复：原只更新 extra_info，函数移行后 DB 存旧行号）
                 self.conn.execute(
-                    """UPDATE node SET extra_info=?, updated_at=datetime('now')
+                    """UPDATE node SET extra_info=?, start_line=?, end_line=?,
+                                       namespace=?, file_path=?, updated_at=datetime('now')
                        WHERE unique_key=?""",
-                    (extra_json, node.unique_key)
+                    (extra_json, node.start_line, node.end_line,
+                     node.namespace, node.file_path, node.unique_key)
                 )
                 stats["nodes_updated"] += 1
             else:
@@ -464,42 +527,56 @@ class GraphDB:
                             if func_name.startswith("~"):
                                 search_name = f"~{base_name}"
 
-                            # 在基类中找同名函数
-                            to_row = self.conn.execute(
-                                """SELECT id FROM node
-                                   WHERE name=? AND type='function'
-                                   AND (namespace LIKE ? OR namespace LIKE ?)
-                                   AND unique_key LIKE ?
-                                   LIMIT 1""",
-                                (search_name, f"%{base_name}%", f"%{base_ns}%",
-                                 f"function|%{base_name}%{search_name}%")
-                            ).fetchone()
-                            if to_row:
-                                to_id = to_row["id"]
+                            # 在基类中找同名函数（主题A-2：Python 端精确匹配 namespace 末段=base_name）
+                            # 函数节点 namespace 末段=所属类名，按末段精确匹配，
+                            # 避免 LIKE '%base_name%' 子串误匹配（'Base' 命中 'Database'）
+                            # 及 '_' 通配符误匹配
+                            cand_rows = self.conn.execute(
+                                "SELECT id, namespace FROM node WHERE name=? AND type='function'",
+                                (search_name,)
+                            ).fetchall()
+                            for cr in cand_rows:
+                                ns = cr["namespace"] or ""
+                                ns_tail = ns.rsplit("::", 1)[-1] if ns else ""
+                                if ns_tail != base_name:
+                                    continue
+                                if base_ns and not ns.startswith(base_ns + "::"):
+                                    continue
+                                to_id = cr["id"]
+                                break
+                            if to_id is not None:
                                 break
 
-                        # Fallback: 只按函数名+命名空间找虚函数
-                        # 注意：排除自身节点，避免析构函数自引用
-                        if to_id is None and func_name:
-                            # 先查 from 节点的 ID，用于排除
+                        # Fallback: 主路径未命中时，在基类链中找同名虚函数（P0-1：限定 base_classes）
+                        # 加 is_virtual + belongs_to 过滤，末段精确匹配（主题A-2）
+                        if to_id is None and func_name and base_classes:
                             from_row = self.conn.execute(
                                 "SELECT id FROM node WHERE unique_key=?",
                                 (edge.from_unique_key,)
                             ).fetchone()
                             from_node_id = from_row["id"] if from_row else -1
 
-                            to_row = self.conn.execute(
-                                """SELECT n.id FROM node n
-                                   JOIN edge e ON e.from_id = n.id
-                                   WHERE n.name=? AND n.type='function'
-                                   AND e.relation_type IN ('belongs_to')
-                                   AND n.extra_info LIKE '%is_virtual%'
-                                   AND n.id != ?
-                                   LIMIT 1""",
-                                (func_name, from_node_id)
-                            ).fetchone()
-                            if to_row:
-                                to_id = to_row["id"]
+                            for base_name in base_classes:
+                                search_name = func_name
+                                if func_name.startswith("~"):
+                                    search_name = f"~{base_name}"
+                                cand_rows = self.conn.execute(
+                                    """SELECT n.id, n.namespace FROM node n
+                                       JOIN edge e ON e.from_id = n.id
+                                       WHERE n.name=? AND n.type='function'
+                                       AND e.relation_type='belongs_to'
+                                       AND json_extract(n.extra_info, '$.is_virtual') = 1
+                                       AND n.id != ?""",
+                                    (search_name, from_node_id)
+                                ).fetchall()
+                                for cr in cand_rows:
+                                    ns = cr["namespace"] or ""
+                                    ns_tail = ns.rsplit("::", 1)[-1] if ns else ""
+                                    if ns_tail == base_name:
+                                        to_id = cr["id"]
+                                        break
+                                if to_id is not None:
+                                    break
 
                 elif resolve_hint == "type_alias":
                     # ── 类型别名边解析 ──
@@ -535,13 +612,42 @@ class GraphDB:
                             to_id = to_row["id"]
 
                 else:
-                    # ── 调用边解析（原逻辑） ──
+                    # ── 调用边解析 ──
                     callee_name = edge.extra_info.get("callee_name", "")
                     callee_parent = edge.extra_info.get("callee_parent_class", "")
                     callee_ns = edge.extra_info.get("callee_namespace", "")
+                    callee_params = edge.extra_info.get("callee_param_types", None)
 
-                    # Try exact match: name + parent class in namespace
-                    if callee_name and callee_parent:
+                    # 第 1 级：name + parent + 参数精确匹配 → 唯一重载
+                    # 取回同名 function 候选，Python 端比对 param_types（区分重载）。
+                    # 仅当调用点提供了 callee_param_types 时启用（旧数据/无参数信息回退）。
+                    if callee_name and callee_params is not None:
+                        cand_rows = self.conn.execute(
+                            """SELECT id, namespace, extra_info FROM node
+                               WHERE name=? AND type='function'""",
+                            (callee_name,)
+                        ).fetchall()
+                        # 优先在 parent/namespace 匹配的候选里找参数一致的重载
+                        best = None
+                        for cr in cand_rows:
+                            ns = cr["namespace"] or ""
+                            # parent 约束：namespace 末段=parent 或含 callee_ns
+                            if callee_parent:
+                                ns_tail = ns.rsplit("::", 1)[-1] if ns else ""
+                                if ns_tail != callee_parent and callee_parent not in ns:
+                                    continue
+                            try:
+                                info = json.loads(cr["extra_info"]) if cr["extra_info"] else {}
+                            except (json.JSONDecodeError, TypeError):
+                                info = {}
+                            if info.get("param_types", None) == callee_params:
+                                best = cr["id"]
+                                break
+                        if best is not None:
+                            to_id = best
+
+                    # 第 2 级：name + parent class 匹配（回退，参数对不齐时）
+                    if to_id is None and callee_name and callee_parent:
                         to_row = self.conn.execute(
                             """SELECT id FROM node
                                WHERE name=? AND type='function'
@@ -552,7 +658,7 @@ class GraphDB:
                         if to_row:
                             to_id = to_row["id"]
 
-                    # Fallback: match by name only (less precise)
+                    # 第 3 级：仅按 name 匹配（最后回退，least precise）
                     if to_id is None and callee_name:
                         to_row = self.conn.execute(
                             """SELECT id FROM node
@@ -614,6 +720,7 @@ class GraphDB:
             "includes_new": 0,
         }
 
+        # 第一轮：导入所有 TU（跨 TU 边可能因 to 节点尚未入库而丢弃）
         for result in results:
             stats = self.import_parse_result(result)
             total_stats["files_processed"] += 1
@@ -624,6 +731,18 @@ class GraphDB:
             total_stats["edges_new"] += stats["edges_new"]
             total_stats["edges_skipped"] += stats["edges_skipped"]
             total_stats["includes_new"] += stats["includes_new"]
+
+        # P1-B 修复（第4项：未解析边多趟补全）
+        # 第一轮所有节点已入库，第二轮重试之前因 to 节点缺失而丢弃的跨 TU 边
+        # （如 derived.cpp 先导入时，override 边 to=基类虚函数还没入库；type_alias 跨 TU 等）
+        # 已插入的边由 UNIQUE 约束跳过，仅补全之前未解析的
+        if any(r.status != "failed" for r in results):
+            for result in results:
+                if result.status == "failed":
+                    continue
+                stats = self.import_parse_result(result)
+                total_stats["edges_new"] += stats["edges_new"]
+                total_stats["edges_skipped"] += stats["edges_skipped"]
 
         return total_stats
 
@@ -754,6 +873,16 @@ class GraphDB:
             return 0
 
         placeholders = ",".join("?" * len(to_delete))
+        # P1-B 修复（第3项）：删节点 CASCADE 会删其他文件的入边，记录来源以便追加重解析
+        # 完整修复需在增量更新末尾对这些来源文件追加重解析（见审查报告 P1-B 主题）
+        incoming = self.conn.execute(
+            f"""SELECT DISTINCT n.file_path FROM edge e
+                JOIN node n ON e.from_id = n.id
+                WHERE e.to_id IN ({placeholders})""", to_delete
+        ).fetchall()
+        if incoming:
+            logger.warning("删除 %s 的 %d 个节点将 CASCADE 删除来自其他文件的入边（建议追加重解析来源）: %s",
+                           file_path, len(to_delete), [r["file_path"] for r in incoming])
         self.conn.execute(
             f"DELETE FROM node WHERE id IN ({placeholders})",
             to_delete

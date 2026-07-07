@@ -107,6 +107,14 @@ def _get_queries() -> tuple[GraphQuery, CallQuery, PolymorphismQuery,
     return _gq, _cq, _pq, _tq, _dq
 
 
+def _query_error(e: Exception) -> str:
+    """统一处理查询异常，避免 database is locked 等异常传播到 MCP 框架层（主题D）"""
+    if isinstance(e, FileNotFoundError):
+        return str(e)
+    logger.exception("MCP 查询异常")
+    return f"查询失败（{type(e).__name__}）: {e}"
+
+
 # ── Markdown 格式化 ──
 
 def _fmt_class(ci) -> str:
@@ -223,8 +231,8 @@ def cpp_search_class(name: str, exact: bool = False) -> str:
     try:
         gq, _, _, _, _ = _get_queries()
         results = gq.search_class(name, exact=exact)
-    except FileNotFoundError as e:
-        return str(e)
+    except Exception as e:
+        return _query_error(e)
 
     if not results:
         return f'未找到匹配 "{name}" 的类。'
@@ -246,8 +254,8 @@ def cpp_search_function(name: str, class_name: str = "") -> str:
     try:
         gq, _, _, _, _ = _get_queries()
         results = gq.search_function(name, class_name=class_name or None)
-    except FileNotFoundError as e:
-        return str(e)
+    except Exception as e:
+        return _query_error(e)
 
     if not results:
         return f'未找到匹配 "{name}" 的函数。'
@@ -268,11 +276,16 @@ def cpp_get_inheritance(class_name: str, direction: str = "down",
         direction: 查询方向，"down" 查子类，"up" 查父类
         depth: 递归深度（1=直接，-1=全部）
     """
+    # 输入边界校验（主题D）
+    if direction not in ("up", "down"):
+        return 'direction 必须是 "up" 或 "down"'
+    if depth < -1 or depth > 10:
+        return "depth 范围 [-1, 10]（-1=全部），过大会导致遍历过深"
     try:
         gq, _, _, _, _ = _get_queries()
         results = gq.get_inheritance(class_name, direction=direction, depth=depth)
-    except FileNotFoundError as e:
-        return str(e)
+    except Exception as e:
+        return _query_error(e)
 
     if not results:
         dir_text = "子类" if direction == "down" else "父类"
@@ -296,8 +309,8 @@ def cpp_get_callers(function_name: str, class_name: str = "") -> str:
     try:
         _, cq, _, _, _ = _get_queries()
         results = cq.get_callers(function_name, class_name=class_name or None)
-    except FileNotFoundError as e:
-        return str(e)
+    except Exception as e:
+        return _query_error(e)
 
     if not results:
         return f'未找到调用 "{function_name}" 的代码。'
@@ -319,8 +332,8 @@ def cpp_get_callees(function_name: str, class_name: str = "") -> str:
     try:
         _, cq, _, _, _ = _get_queries()
         results = cq.get_callees(function_name, class_name=class_name or None)
-    except FileNotFoundError as e:
-        return str(e)
+    except Exception as e:
+        return _query_error(e)
 
     if not results:
         return f'未找到 "{function_name}" 调用的代码。'
@@ -342,8 +355,8 @@ def cpp_get_overrides(function_name: str, class_name: str) -> str:
     try:
         _, _, pq, _, _ = _get_queries()
         results = pq.get_all_overrides(function_name, class_name=class_name)
-    except FileNotFoundError as e:
-        return str(e)
+    except Exception as e:
+        return _query_error(e)
 
     if not results:
         return f'未找到 "{function_name}" 的重写实现。'
@@ -364,8 +377,8 @@ def cpp_get_file_symbols(file_path: str) -> str:
     try:
         gq, _, _, _, _ = _get_queries()
         results = gq.get_file_symbols(file_path)
-    except FileNotFoundError as e:
-        return str(e)
+    except Exception as e:
+        return _query_error(e)
 
     if not results:
         return f'未找到文件 "{file_path}" 中的符号。'
@@ -411,14 +424,21 @@ def cpp_traverse_graph(start: str, relation_types: list[str] | None = None,
         depth: 最大遍历深度（默认 3）
         max_results: 最大返回节点数（默认 50）
     """
+    # 输入边界校验（主题D）
+    if direction not in ("outgoing", "incoming"):
+        return 'direction 必须是 "outgoing" 或 "incoming"'
+    if depth < 1 or depth > 6:
+        return "depth 范围 [1, 6]，过大会导致遍历指数级膨胀"
+    if max_results < 1 or max_results > 500:
+        return "max_results 范围 [1, 500]"
     try:
         _, _, _, tq, _ = _get_queries()
         result = tq.traverse_graph(
             start, relation_types=relation_types, direction=direction,
             depth=depth, max_results=max_results,
         )
-    except FileNotFoundError as e:
-        return str(e)
+    except Exception as e:
+        return _query_error(e)
 
     if not result.nodes:
         return f'从 "{start}" 出发未找到关联节点。'
@@ -463,8 +483,8 @@ def cpp_search_docs(keyword: str, tag: str = "", max_results: int = 10,
             keyword, tag=tag or None, max_results=max_results,
             min_confidence=min_confidence,
         )
-    except FileNotFoundError as e:
-        return str(e)
+    except Exception as e:
+        return _query_error(e)
 
     if not results:
         return f'未找到关键词 "{keyword}" 相关的文档。'
@@ -480,12 +500,29 @@ def cpp_search_docs(keyword: str, tag: str = "", max_results: int = 10,
 def _infer_project_name(db_path: str) -> str:
     """从 DB 路径推断项目名称
 
-    策略：按常见项目目录结构从 DB 路径中提取项目名。
-    例如: .../app/hq_ota_service/_tools/... → hq_ota_service
-          .../app/my_project/_tools/... → my_project
+    策略（按优先级）：
+    1. 环境变量 CPP_PROJECT_NAME
+    2. DB 同目录 cpp_semantic_graph.yaml 的 project.name（P2-1：迁移后路径正则失效，读配置更可靠）
+    3. 路径正则 /app/<project>/ 或 /src/<project>/（fallback）
     """
     import re
-    # 匹配 /app/<project>/ 或 /src/<project>/ 模式
+    # 1. 环境变量
+    env_name = os.environ.get("CPP_PROJECT_NAME", "").strip()
+    if env_name:
+        return env_name
+    # 2. DB 同目录 yaml 的 project.name
+    try:
+        yaml_path = Path(db_path).parent / "cpp_semantic_graph.yaml"
+        if yaml_path.exists():
+            import yaml
+            with open(yaml_path) as f:
+                cfg = yaml.safe_load(f) or {}
+            proj = (cfg.get("project") or {}).get("name", "").strip()
+            if proj:
+                return proj
+    except Exception:
+        pass
+    # 3. 路径正则（fallback）
     m = re.search(r'/(?:app|src)/([^/_][^/]*)/', db_path)
     if m:
         return m.group(1)

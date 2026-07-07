@@ -11,19 +11,9 @@ from dataclasses import dataclass, field
 
 from ..db.graph_db import GraphDB
 from ..db.relation_types import RelationType
+from .query_utils import parse_extra as _parse_extra  # P2-3: 统一实现
 
 logger = logging.getLogger(__name__)
-
-
-def _parse_extra(raw) -> dict:
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return {}
-    return {}
 
 
 @dataclass
@@ -81,15 +71,19 @@ class DocQuery:
             文档+关联代码列表
         """
         conn = self.db.conn
-        # 搜索 doc_section 节点
+        # 搜结构化字段而非整个 JSON 字符串，避免命中 JSON key/无关字段（主题A-6）
+        # 如 'ota' 不再因 'data'/'content_hash' 等字段名误匹配
         sql = """SELECT * FROM node
                  WHERE type='doc_section'
-                 AND (name LIKE ? OR extra_info LIKE ?)"""
-        params = [f"%{keyword}%", f"%{keyword}%"]
+                 AND (name LIKE ?
+                      OR json_extract(extra_info, '$.doc_title') LIKE ?
+                      OR json_extract(extra_info, '$.content_preview') LIKE ?)"""
+        params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
 
         if tag:
-            sql += " AND extra_info LIKE ?"
-            params.append(f"%{tag}%")
+            # tag 是 JSON 数组，用 json_each 精确匹配元素，避免子串误匹配
+            sql += " AND EXISTS (SELECT 1 FROM json_each(json_extract(extra_info, '$.tags')) WHERE value = ?)"
+            params.append(tag)
 
         sql += " ORDER BY start_line LIMIT ?"
         params.append(max_results)

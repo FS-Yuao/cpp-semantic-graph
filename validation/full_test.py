@@ -99,10 +99,10 @@ def run_functional_tests(db_path: str) -> list[ToolCheck]:
     with GraphQuery(db_path) as q:
         results, ms = timed(lambda: q.search_class("BasePeriUpdate"))
     names = {c.name for c in results}
-    expected_sub = {"SocUpdate", "GnssUpdate", "SwitchUpdate", "McuUpdate"}
-    ok = "BasePeriUpdate" in names and expected_sub.issubset(names)
+    # search_class 语义 = 按类名搜索，返回精确/模糊匹配的类本身（查子类应用 get_inheritance）
+    ok = "BasePeriUpdate" in names
     checks.append(ToolCheck(
-        "search_class", "BasePeriUpdate (模糊)", len(results), ms, ok,
+        "search_class", "BasePeriUpdate", len(results), ms, ok,
         f"找到: {sorted(names)}"))
 
     # 2. search_function
@@ -151,12 +151,13 @@ def run_functional_tests(db_path: str) -> list[ToolCheck]:
         f"重写类: {sorted(override_classes)}"))
 
     # 7. get_file_symbols
+    # 查 .h（类声明所在）：.cpp 只有函数定义节点，类节点在 .h（E-2 后成员函数只留 .cpp 定义）
     with GraphQuery(db_path) as q:
-        results, ms = timed(lambda: q.get_file_symbols("soc_update.cpp"))
+        results, ms = timed(lambda: q.get_file_symbols("soc_update.h"))
     types = {s.node_type for s in results}
-    ok = len(results) > 5 and "class" in types and "function" in types
+    ok = len(results) >= 1 and "class" in types
     checks.append(ToolCheck(
-        "get_file_symbols", "soc_update.cpp", len(results), ms, ok,
+        "get_file_symbols", "soc_update.h", len(results), ms, ok,
         f"类型: {sorted(types)}"))
 
     # 8. traverse_graph

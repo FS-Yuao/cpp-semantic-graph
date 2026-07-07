@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 from ..db.graph_db import GraphDB
 from ..db.relation_types import RelationType
+from .query_utils import parse_extra as _parse_extra  # P2-3: 统一实现
 
 logger = logging.getLogger(__name__)
 
@@ -43,18 +44,6 @@ class CallChainNode:
     file_path: str
     depth: int
     call_type: str | None = None  # 到达此节点的调用类型
-
-
-def _parse_extra(raw) -> dict:
-    """安全解析 extra_info"""
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            return {}
-    return {}
 
 
 class CallQuery:
@@ -330,7 +319,7 @@ class CallQuery:
         from .polymorphism_query import PolymorphismQuery
 
         results: list[CallInfo] = []
-        with PolymorphismQuery(self.db.conn.execute("PRAGMA database_list").fetchone()[2]) as pq:
+        with PolymorphismQuery(str(self.db.db_path)) as pq:
             overrides = pq.get_all_overrides(func_name, class_name)
 
         for o in overrides:
@@ -362,7 +351,7 @@ class CallQuery:
         from .polymorphism_query import PolymorphismQuery
 
         try:
-            with PolymorphismQuery(self.db.conn.execute("PRAGMA database_list").fetchone()[2]) as pq:
+            with PolymorphismQuery(str(self.db.db_path)) as pq:
                 overrides = pq.get_all_overrides(func_name, class_name or "")
         except Exception:
             return
@@ -432,10 +421,13 @@ class CallQuery:
         """
         if class_name:
             # 按 namespace 匹配类名 + 函数名查找
-            # namespace 格式如 "update::SocUpdate"，用 LIKE 匹配
+            # namespace 是 '::' 分隔路径（末段=所属类名），按段精确匹配避免子串误匹配（主题A-5）
+            # 'Update' 不再误匹配 'SocUpdate'
             all_funcs = self.db.find_node_by_name(func_name, "function")
-            matched = [n for n in all_funcs
-                       if class_name in (n.get("namespace", "") or "")]
+            matched = [
+                n for n in all_funcs
+                if class_name in ((n.get("namespace", "") or "").split("::"))
+            ]
         else:
             # 只按函数名查找
             matched = self.db.find_node_by_name(func_name, "function")

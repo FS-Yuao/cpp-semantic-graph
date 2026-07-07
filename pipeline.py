@@ -102,10 +102,11 @@ def _worker_init(config_path: str):
     _WORKER_EXTRACTOR = SemanticExtractor(_WORKER_CONFIG)
 
 
-def _worker_parse(entry_file: str, entry_args: list[str]):
+def _worker_parse(entry_file: str, entry_args: list[str], directory: str = ""):
     """单个翻译单元解析（在 worker 进程内执行）"""
     from .parser.compile_db import CompileCommand
-    entry = CompileCommand(file=entry_file, directory="", args=entry_args)
+    # directory 是编译工作目录，相对 -I 路径相对于它解析（主题D：原硬编码 "" 导致 -I 解析失败、图谱不完整）
+    entry = CompileCommand(file=entry_file, directory=directory, args=entry_args)
     result = _WORKER_EXTRACTOR.parse(entry)
     # ParseResult 含 NodeInfo/EdgeInfo（dataclass），可 pickle 跨进程返回
     return result
@@ -196,6 +197,9 @@ class FullParsePipeline:
 
             assoc_ingester = AssociationIngester(db_path, self.config)
             assoc_stats = assoc_ingester.ingest_content_scan_associations()
+            # P0-4 修复：接入 manual_links 配置关联（原为死代码，配置了却不生效）
+            config_stats = assoc_ingester.ingest_config_associations(self.config.docs_config)
+            assoc_stats.update(config_stats)
             assoc_ingester.close()
             report.doc_associations_new = assoc_stats.get("edges_created", 0)
             report.associations_rebuilt = True
@@ -232,7 +236,7 @@ class FullParsePipeline:
             initargs=(self.config_path,),
         ) as pool:
             future_to_entry = {
-                pool.submit(_worker_parse, e.file, e.args): e for e in entries
+                pool.submit(_worker_parse, e.file, e.args, e.directory): e for e in entries
             }
             for i, fut in enumerate(as_completed(future_to_entry), 1):
                 entry = future_to_entry[fut]

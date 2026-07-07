@@ -1,38 +1,41 @@
 # C++ 语义图谱全量测试报告
 
-生成时间: 2026-06-25 16:52:47
-数据库: semantic_graph_full.db (7.54 MB)
-节点: 1182 | 边: 1362 | includes: 36749
+生成时间: 2026-07-07 14:16:55
+数据库: semantic_graph_full.db (11.89 MB)
+节点: 1280 | 边: 4921 | includes: 63097
 
 ## 数据分布
 
 | 类型 | 数量 |
 |------|------|
-| node: function | 922 |
-| node: class | 212 |
-| node: struct | 48 |
-| edge: belongs_to | 611 |
-| edge: calls_direct | 514 |
-| edge: overrides | 151 |
-| edge: calls_virtual | 48 |
-| edge: type_alias | 31 |
-| edge: inherits_public | 7 |
+| node: doc_section | 657 |
+| node: function | 523 |
+| node: class | 77 |
+| node: struct | 23 |
+| edge: calls_direct | 2224 |
+| edge: code_refers_to_doc | 1023 |
+| edge: doc_describes_code | 1023 |
+| edge: belongs_to | 479 |
+| edge: calls_virtual | 103 |
+| edge: overrides | 57 |
+| edge: inherits_public | 9 |
+| edge: type_alias | 3 |
 
 ## 一、功能正确性验证（9 个 MCP 工具）
 
 | 工具 | 查询 | 结果数 | 耗时 | 结果 |
 |------|------|--------|------|------|
-| search_class | BasePeriUpdate (模糊) | 1 | 10.2ms | ❌ |
-| search_function | PerformUpgrade | 11 | 20.4ms | ✅ |
-| get_inheritance | BasePeriUpdate down depth=1 | 4 | 1.6ms | ✅ |
-| get_callers | PerformUpgrade | 1 | 4.6ms | ❌ |
-| get_callees | PerformUpgrade (SocUpdate) | 13 | 4.7ms | ✅ |
-| get_overrides | PerformUpgrade (BasePeriUpdate) | 4 | 1.5ms | ✅ |
-| get_file_symbols | soc_update.cpp | 29 | 1.1ms | ❌ |
-| traverse_graph | SocUpdate depth=2 | 42 | 4.4ms | ✅ |
-| search_docs | OTA | 0 | 0.1ms | ✅ |
+| search_class | BasePeriUpdate | 1 | 0.2ms | ✅ |
+| search_function | PerformUpgrade | 6 | 0.3ms | ✅ |
+| get_inheritance | BasePeriUpdate down depth=1 | 4 | 0.8ms | ✅ |
+| get_callers | PerformUpgrade | 2 | 1.2ms | ✅ |
+| get_callees | PerformUpgrade (SocUpdate) | 36 | 6.7ms | ✅ |
+| get_overrides | PerformUpgrade (BasePeriUpdate) | 4 | 0.7ms | ✅ |
+| get_file_symbols | soc_update.h | 1 | 0.4ms | ✅ |
+| traverse_graph | SocUpdate depth=2 | 50 | 7.6ms | ✅ |
+| search_docs | OTA | 10 | 5.3ms | ✅ |
 
-**结论**: 存在失败 ❌
+**结论**: 全部通过 ✅
 
 ## 二、准确性验证（与 clangd ground truth 对比）
 
@@ -41,11 +44,11 @@
 | 类定义 | 2 | 0 | 0 | 100.0% | 100.0% | P≥98%/R≥95% | ✅ |
 | 继承关系 | 5 | 0 | 0 | 100.0% | 100.0% | P≥95%/R≥90% | ✅ |
 | 函数签名 | 6 | 0 | 0 | 100.0% | 100.0% | P≥95%/R≥90% | ✅ |
-| 调用关系 | 1 | 0 | 2 | 100.0% | 33.3% | P≥85%/R≥80% | ❌ |
-| type_alias边 | 31 | 0 | 0 | 100.0% | 100.0% | — | ✅ |
+| 调用关系 | 3 | 0 | 0 | 100.0% | 100.0% | P≥85%/R≥80% | ✅ |
+| type_alias边 | 3 | 0 | 0 | 100.0% | 100.0% | — | ✅ |
 | friend_of边 | 0 | 0 | 0 | 100.0% | 100.0% | — | ✅ |
 
-**结论**: 存在不达标 ❌
+**结论**: 全部达标 ✅
 
 ## 三、性能对比：图谱查询 vs find+grep
 
@@ -53,12 +56,12 @@
 
 | 场景 | 图谱耗时 | find+grep 耗时 | 图谱结果数 | grep 结果数 | 加速比 |
 |------|---------|---------------|-----------|-----------|--------|
-| S1:查类定义 | 0.2ms | 4.7ms | 1 | 1 | **28.5x** |
-| S2:查继承关系 | 0.5ms | 4.9ms | 4 | 4 | **9.5x** |
-| S3:查调用方 | 1.6ms | 6.0ms | 1 | 6 | **3.7x** |
-| S4:查override | 1.2ms | 9.0ms | 4 | 4 | **7.5x** |
-| S5:查文件符号 | 0.8ms | 4.7ms | 29 | 29 | **6.0x** |
-| S6:多跳遍历 | 3.8ms | 6.0ms | 42 | 7 | **1.6x** |
+| S1:查类定义 | 0.1ms | 2.3ms | 1 | 1 | **40.7x** |
+| S2:查继承关系 | 0.4ms | 2.2ms | 4 | 4 | **5.1x** |
+| S3:查调用方 | 0.8ms | 2.6ms | 2 | 6 | **3.1x** |
+| S4:查override | 0.4ms | 2.9ms | 4 | 4 | **6.8x** |
+| S5:查文件符号 | 0.4ms | 2.3ms | 29 | 29 | **5.7x** |
+| S6:多跳遍历 | 7.2ms | 2.9ms | 50 | 8 | **0.4x** |
 
 ### 补充说明
 
@@ -66,7 +69,7 @@
 - **S5:查文件符号**: grep 为粗略正则匹配，无法区分类/函数/变量
 - **S6:多跳遍历**: grep 仅完成第1轮，完整多跳需 3-5 轮串联，耗时成倍增长
 
-**平均加速比**: 9.4x
+**平均加速比**: 10.3x
 
 ### 关键优势
 
@@ -77,4 +80,5 @@
 
 ## 四、增量更新验证
 
-错误: compile_commands.json not found: /mnt/code1/adc4.0/drive-vendor/ap/ap-aa/compile_commands.json
+- 变更文件: 0
+- 受影响 TU: 0
