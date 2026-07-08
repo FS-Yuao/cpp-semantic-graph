@@ -1,6 +1,8 @@
 -- SQLite 图谱库建表语句
 -- 项目无关设计：表结构不绑定任何特定项目
 -- schema 版本由 graph_db.py SCHEMA_VERSION 管理，写入 PRAGMA user_version（P2-6）
+-- v3: extra_info JSON blob 拆入独立列（docs/extra_info_columnar_design.md）
+-- v4: DROP extra_info 列，独立列成为唯一数据源（docs/task/p1_needs_resolution_drop_extrainfo_design.md）
 
 -- 节点表：类、函数、文件、文档切片
 CREATE TABLE IF NOT EXISTS node (
@@ -11,8 +13,35 @@ CREATE TABLE IF NOT EXISTS node (
   file_path TEXT NOT NULL,
   start_line INTEGER,
   end_line INTEGER,
-  extra_info TEXT,              -- JSON: 模板参数、访问权限、签名等
   unique_key TEXT NOT NULL UNIQUE,  -- type|namespace|name|file_path[|params[|c]]（function 含参数签名区分重载, E-3）
+  -- v3: class/struct 专用列
+  is_abstract INTEGER DEFAULT 0,
+  is_template_spec INTEGER DEFAULT 0,    -- is_template_specialization
+  is_type_alias INTEGER DEFAULT 0,
+  is_typedef INTEGER DEFAULT 0,
+  template_params TEXT,                  -- JSON array（低频，保留 JSON）
+  target_type TEXT,                      -- alias 目标类型
+  -- v3: function 专用列
+  is_virtual INTEGER DEFAULT 0,
+  is_pure_virtual INTEGER DEFAULT 0,
+  is_override INTEGER DEFAULT 0,
+  is_static INTEGER DEFAULT 0,
+  is_const INTEGER DEFAULT 0,
+  access TEXT,                           -- public/protected/private/invalid
+  parent_class TEXT,
+  signature TEXT,
+  result_type TEXT,
+  param_types TEXT,                      -- JSON array（重载区分用）
+  is_project INTEGER,                    -- 是否项目代码（vs SDK/BSW），NULL=未知
+  -- v3: doc_section 专用列
+  doc_title TEXT,
+  heading TEXT,
+  section_level INTEGER,
+  content_preview TEXT,
+  content_hash TEXT,
+  word_count INTEGER,
+  tags TEXT,                             -- JSON array（json_each 查询用）
+  -- 时间戳
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -27,7 +56,34 @@ CREATE TABLE IF NOT EXISTS edge (
   to_id INTEGER NOT NULL,
   relation_type TEXT NOT NULL,   -- 见 models.RelationType 枚举
   call_line INTEGER DEFAULT 0,  -- 调用行号（0=非调用边或行号未知）
-  extra_info TEXT,               -- JSON
+  -- v3: calls_direct/calls_virtual 专用列
+  callee_name TEXT,
+  callee_namespace TEXT,
+  callee_parent_class TEXT,
+  callee_file TEXT,
+  callee_param_types TEXT,              -- JSON array
+  callee_is_const INTEGER DEFAULT 0,
+  call_type TEXT,                       -- direct/virtual/callback
+  -- v3: type_alias 专用列
+  alias_name TEXT,
+  target_simple_name TEXT,
+  target_type TEXT,                    -- alias 目标类型（完整限定名）
+  -- v3: overrides 专用列
+  function_name TEXT,                   -- 被重写的虚函数名
+  derived_class TEXT,
+  base_namespace TEXT,
+  -- v3: 解析状态（原 _needs_resolution / _resolve_hint）
+  needs_resolution INTEGER DEFAULT 0,
+  resolve_hint TEXT,
+  -- v3: doc 关系专用列
+  confidence REAL,
+  match_method TEXT,                    -- 原 method
+  matched_name TEXT,
+  code_type TEXT,
+  link_text TEXT,
+  -- v3: belongs_to / 其他
+  access TEXT,                          -- 访问权限（belongs_to 边）
+  -- 时间戳
   created_at TEXT DEFAULT (datetime('now')),
   FOREIGN KEY(from_id) REFERENCES node(id) ON DELETE CASCADE,
   FOREIGN KEY(to_id) REFERENCES node(id) ON DELETE CASCADE,
@@ -56,7 +112,7 @@ CREATE TABLE IF NOT EXISTS parse_status (
 );
 
 -- 索引
--- 索引（主题C：删除 4 个被 UNIQUE 约束自动索引覆盖的冗余索引）
+-- 原有索引
 --   idx_node_unique_key    ← node.unique_key UNIQUE 自动建索引
 --   idx_edge_from_id       ← edge UNIQUE(from_id,to_id,relation_type,call_line) 最左前缀覆盖
 --   idx_include_source     ← include_dep UNIQUE(source_file,included_file) 最左前缀覆盖
@@ -74,3 +130,11 @@ CREATE INDEX IF NOT EXISTS idx_edge_from_type ON edge(from_id, relation_type);
 CREATE INDEX IF NOT EXISTS idx_edge_to_type ON edge(to_id, relation_type);
 CREATE INDEX IF NOT EXISTS idx_edge_call_line ON edge(call_line);
 CREATE INDEX IF NOT EXISTS idx_include_included ON include_dep(included_file);
+
+-- v3: 新增索引（替代 json_extract 全表扫描）
+CREATE INDEX IF NOT EXISTS idx_node_is_virtual ON node(is_virtual) WHERE is_virtual = 1;
+CREATE INDEX IF NOT EXISTS idx_node_doc_title ON node(doc_title);
+CREATE INDEX IF NOT EXISTS idx_node_parent_class ON node(parent_class);
+CREATE INDEX IF NOT EXISTS idx_node_is_project ON node(is_project) WHERE is_project IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_edge_callee_name ON edge(callee_name);
+CREATE INDEX IF NOT EXISTS idx_edge_needs_resolution ON edge(needs_resolution) WHERE needs_resolution = 1;

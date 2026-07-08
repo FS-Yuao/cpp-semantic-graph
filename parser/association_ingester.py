@@ -10,7 +10,7 @@ import json
 import logging
 import time
 
-from ..db.graph_db import GraphDB
+from ..db.graph_db import GraphDB, _hydrate_node
 from ..db.relation_types import RelationType
 from .doc_association import DocAssociationParser, Association
 
@@ -172,18 +172,14 @@ class AssociationIngester:
         # 查所有 doc_section 节点
         conn = self.db.conn
         rows = conn.execute(
-            "SELECT id, unique_key, extra_info FROM node WHERE type='doc_section'"
+            "SELECT * FROM node WHERE type='doc_section'"
         ).fetchall()
 
         for row in rows:
-            doc_id = row["id"]
-            doc_key = row["unique_key"]
-            extra = row["extra_info"]
-            if isinstance(extra, str):
-                try:
-                    extra = json.loads(extra)
-                except (json.JSONDecodeError, TypeError):
-                    extra = {}
+            hydrated = _hydrate_node(row)
+            doc_id = hydrated["id"]
+            doc_key = hydrated["unique_key"]
+            extra = hydrated.get("extra_info") or {}
 
             content = extra.get("content_preview", "")
             if not content:
@@ -253,7 +249,7 @@ class AssociationIngester:
 
         # 查所有 doc_section
         doc_rows = conn.execute(
-            "SELECT id, unique_key, name, extra_info FROM node WHERE type='doc_section'"
+            "SELECT * FROM node WHERE type='doc_section'"
         ).fetchall()
 
         # 查所有类节点
@@ -323,9 +319,9 @@ class AssociationIngester:
         # 1. 收集代码节点名称，按项目范围过滤
         has_project_config = self.project_config is not None
 
-        # 类名（含 extra_info 用于 is_project 判断）
+        # 类名（含 is_project 判断）
         class_rows = conn.execute(
-            "SELECT id, unique_key, name, namespace, file_path, extra_info FROM node WHERE type='class'"
+            "SELECT * FROM node WHERE type='class'"
         ).fetchall()
 
         # 函数名（去重，含 namespace + file_path 用于过滤）
@@ -339,18 +335,14 @@ class AssociationIngester:
 
         # 过滤非项目代码节点
         if has_project_config:
-            def _parse_extra(row):
-                extra = row["extra_info"] if "extra_info" in row.keys() else None
-                if isinstance(extra, str):
-                    try:
-                        return json.loads(extra)
-                    except (json.JSONDecodeError, TypeError):
-                        return {}
-                return extra or {}
+            def _get_extra(row):
+                """从行获取 extra_info dict（优先列值，fallback JSON）"""
+                h = _hydrate_node(row)
+                return h.get("extra_info") or {}
 
             class_rows = [r for r in class_rows
                           if self._is_project_code_node(r["file_path"], r["namespace"],
-                                                         _parse_extra(r))]
+                                                         _get_extra(r))]
             filtered_func_rows = [r for r in func_rows
                                   if self._is_project_code_node(r["file_path"], r["namespace"])]
             stats["skipped_out_of_scope"] = (total_class - len(class_rows)) + (total_func - len(filtered_func_rows))
@@ -410,7 +402,7 @@ class AssociationIngester:
 
         # 2. 扫描文档内容
         doc_rows = conn.execute(
-            "SELECT id, unique_key, name, extra_info FROM node WHERE type='doc_section'"
+            "SELECT * FROM node WHERE type='doc_section'"
         ).fetchall()
 
         # 合并类名和函数名，统一匹配
@@ -435,12 +427,8 @@ class AssociationIngester:
 
         for doc_row in doc_rows:
             doc_id = doc_row["id"]
-            extra = doc_row["extra_info"]
-            if isinstance(extra, str):
-                try:
-                    extra = json.loads(extra)
-                except (json.JSONDecodeError, TypeError):
-                    extra = {}
+            h = _hydrate_node(doc_row)
+            extra = h.get("extra_info") or {}
 
             content = extra.get("content_preview", "")
             if not content:
@@ -631,28 +619,24 @@ class AssociationIngester:
 
         # 1. 收集代码节点（只取项目代码）
         code_rows = conn.execute('''
-            SELECT id, name, namespace, type, file_path, extra_info
+            SELECT *
             FROM node
             WHERE type IN ('class', 'function')
         ''').fetchall()
 
         if self.project_config:
-            def _parse_extra(row):
-                extra = row["extra_info"] if "extra_info" in row.keys() else None
-                if isinstance(extra, str):
-                    try:
-                        return json.loads(extra)
-                    except (json.JSONDecodeError, TypeError):
-                        return {}
-                return extra or {}
+            def _get_extra_emb(row):
+                h = _hydrate_node(row)
+                return h.get("extra_info") or {}
             code_rows = [r for r in code_rows
                          if self._is_project_code_node(r["file_path"], r["namespace"],
-                                                        _parse_extra(r))]
+                                                        _get_extra_emb(r))]
 
         # 构造代码描述文本
         code_texts = []
         for r in code_rows:
-            extra = json.loads(r["extra_info"]) if isinstance(r["extra_info"], str) else (r["extra_info"] or {})
+            h = _hydrate_node(r)
+            extra = h.get("extra_info") or {}
             ns = r["namespace"]
             name = r["name"]
             ctype = r["type"]
@@ -680,12 +664,13 @@ class AssociationIngester:
 
         # 2. 收集文档切片
         doc_rows = conn.execute('''
-            SELECT id, name, extra_info FROM node WHERE type='doc_section'
+            SELECT * FROM node WHERE type='doc_section'
         ''').fetchall()
 
         doc_texts = []
         for r in doc_rows:
-            extra = json.loads(r["extra_info"]) if isinstance(r["extra_info"], str) else (r["extra_info"] or {})
+            h = _hydrate_node(r)
+            extra = h.get("extra_info") or {}
             heading = r["name"]
             preview = extra.get("content_preview", "")
             tags = extra.get("tags", [])

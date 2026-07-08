@@ -8,13 +8,11 @@
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
 
 from ..db.graph_db import GraphDB
 from ..db.relation_types import RelationType
-from .query_utils import parse_extra as _parse_extra  # P2-3: 统一实现
 
 logger = logging.getLogger(__name__)
 
@@ -108,9 +106,9 @@ class CallQuery:
                         continue
 
                     callee_node = self.db.get_node_by_id(target_id)
-                    extra = _parse_extra(edge.get("extra_info", {}))
+                    call_line = edge.get("call_line", 0)
 
-                    dedup = f"{caller_node['name']}@{caller_node.get('file_path', '')}@{extra.get('call_line', 0)}"
+                    dedup = f"{caller_node['name']}@{caller_node.get('file_path', '')}@{call_line}"
                     if dedup in seen:
                         continue
                     seen.add(dedup)
@@ -123,7 +121,7 @@ class CallQuery:
                         caller_class=caller_class,
                         caller_namespace=caller_node.get("namespace", ""),
                         caller_file=caller_node.get("file_path", ""),
-                        caller_line=extra.get("call_line", 0),
+                        caller_line=call_line,
                         callee_name=func_name,
                         callee_class=callee_class,
                         callee_namespace=callee_node.get("namespace", "") if callee_node else "",
@@ -176,9 +174,9 @@ class CallQuery:
                         continue
 
                     caller_node = self.db.get_node_by_id(source_id)
-                    extra = _parse_extra(edge.get("extra_info", {}))
+                    call_line = edge.get("call_line", 0)
 
-                    dedup = f"{callee_node['name']}@{callee_node.get('file_path', '')}@{extra.get('call_line', 0)}"
+                    dedup = f"{callee_node['name']}@{callee_node.get('file_path', '')}@{call_line}"
                     if dedup in seen:
                         continue
                     seen.add(dedup)
@@ -191,7 +189,7 @@ class CallQuery:
                         caller_class=caller_class,
                         caller_namespace=caller_node.get("namespace", "") if caller_node else "",
                         caller_file=caller_node.get("file_path", "") if caller_node else "",
-                        caller_line=extra.get("call_line", 0) or edge.get("call_line", 0),
+                        caller_line=call_line,
                         callee_name=callee_node["name"],
                         callee_class=callee_class,
                         callee_namespace=callee_node.get("namespace", ""),
@@ -367,8 +365,8 @@ class CallQuery:
                         caller_node = self.db.get_node_by_id(edge["from_id"])
                         if not caller_node:
                             continue
-                        extra = _parse_extra(edge.get("extra_info", {}))
-                        dedup = f"{caller_node['name']}@{caller_node.get('file_path', '')}@{extra.get('call_line', 0)}"
+                        call_line = edge.get("call_line", 0)
+                        dedup = f"{caller_node['name']}@{caller_node.get('file_path', '')}@{call_line}"
                         if dedup in seen:
                             continue
                         seen.add(dedup)
@@ -378,7 +376,7 @@ class CallQuery:
                             caller_class=self._get_owning_class(edge["from_id"]),
                             caller_namespace=caller_node.get("namespace", ""),
                             caller_file=caller_node.get("file_path", ""),
-                            caller_line=extra.get("call_line", 0),
+                            caller_line=call_line,
                             callee_name=o.function_name,
                             callee_class=o.class_name,
                             callee_namespace=o.namespace,

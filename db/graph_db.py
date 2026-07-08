@@ -21,7 +21,205 @@ logger = logging.getLogger(__name__)
 # P2-6：schema 版本号，写入 SQLite PRAGMA user_version。
 # 变更 schema（表结构 / unique_key 格式 / 边语义）时递增，便于未来迁移检测。
 # 历史：1 = 初始；2 = unique_key 加参数签名区分重载（E-3，function key 含 params 后缀）
-SCHEMA_VERSION = 2
+#        3 = extra_info JSON 拆入独立列（docs/extra_info_columnar_design.md）
+#        4 = 清 needs_resolution 陈旧标记 + DROP extra_info 列（列成为唯一数据源，
+#            docs/task/p1_needs_resolution_drop_extrainfo_design.md）
+SCHEMA_VERSION = 4
+
+
+# ── v3: extra_info → 列 映射 ──
+# extra_info JSON key → 数据库列名（key 名与列名不同时映射，相同则省略）
+# 写入时从 extra_info dict 提取值写入对应列；读取时反向合并回 extra_info dict
+
+# node: extra_info key → 列名（仅列名与 key 不同的需要映射）
+_NODE_EXTRA_KEY_TO_COL = {
+    "is_template_specialization": "is_template_spec",
+    # 其余 key 与列名相同：is_abstract, is_type_alias, is_typedef, template_params,
+    # target_type, is_virtual, is_pure_virtual, is_override, is_static, is_const,
+    # access, parent_class, signature, result_type, param_types, is_project,
+    # doc_title, heading, section_level, content_preview, content_hash, word_count, tags
+}
+
+# node: 列名 → extra_info key（反向映射，用于 hydrate）
+_NODE_COL_TO_EXTRA_KEY = {v: k for k, v in _NODE_EXTRA_KEY_TO_COL.items()}
+
+# edge: extra_info key → 列名
+_EDGE_EXTRA_KEY_TO_COL = {
+    "_needs_resolution": "needs_resolution",
+    "_resolve_hint": "resolve_hint",
+    "method": "match_method",
+    # 其余 key 与列名相同：callee_name, callee_namespace, callee_parent_class,
+    # callee_file, callee_param_types, callee_is_const, call_type,
+    # function_name, derived_class, base_namespace,
+    # confidence, matched_name, code_type, link_text, access
+}
+
+# edge: 列名 → extra_info key（反向映射）
+_EDGE_COL_TO_EXTRA_KEY = {v: k for k, v in _EDGE_EXTRA_KEY_TO_COL.items()}
+
+# node 表所有 v3 新列（用于 INSERT/UPDATE 语句构造）
+_NODE_V3_COLUMNS = [
+    "is_abstract", "is_template_spec", "is_type_alias", "is_typedef",
+    "template_params", "target_type",
+    "is_virtual", "is_pure_virtual", "is_override", "is_static", "is_const",
+    "access", "parent_class", "signature", "result_type", "param_types", "is_project",
+    "doc_title", "heading", "section_level", "content_preview", "content_hash",
+    "word_count", "tags",
+]
+_NODE_V3_COLUMNS_JOIN = ", ".join(_NODE_V3_COLUMNS)
+
+# edge 表所有 v3 新列
+_EDGE_V3_COLUMNS = [
+    "callee_name", "callee_namespace", "callee_parent_class", "callee_file",
+    "callee_param_types", "callee_is_const", "call_type",
+    "alias_name", "target_simple_name", "target_type",
+    "function_name", "derived_class", "base_namespace",
+    "needs_resolution", "resolve_hint",
+    "confidence", "match_method", "matched_name", "code_type", "link_text",
+    "access",
+]
+_EDGE_V3_COLUMNS_JOIN = ", ".join(_EDGE_V3_COLUMNS)
+
+
+def _flatten_node_extra(extra_info: dict | None) -> dict:
+    """从 node.extra_info dict 提取已知 key → 返回 {列名: 值} 映射
+
+    布尔值转 INTEGER（True→1, False→0），其余原样保留。
+    未知 key 不提取（留在 extra_info JSON 中）。
+    """
+    if not extra_info:
+        return {col: None for col in _NODE_V3_COLUMNS}
+
+    result = {}
+    for col in _NODE_V3_COLUMNS:
+        # 找到对应的 extra_info key
+        # 反向查找：列名 → key 名
+        key = _NODE_COL_TO_EXTRA_KEY.get(col, col)
+        value = extra_info.get(key)
+
+        if value is None:
+            result[col] = None
+        elif isinstance(value, bool):
+            result[col] = 1 if value else 0
+        else:
+            # list/dict 仍序列化为 JSON 字符串存入 TEXT 列
+            if isinstance(value, (list, dict)):
+                result[col] = json.dumps(value, ensure_ascii=False)
+            else:
+                result[col] = value
+
+    return result
+
+
+def _flatten_edge_extra(extra_info: dict | None) -> dict:
+    """从 edge.extra_info dict 提取已知 key → 返回 {列名: 值} 映射"""
+    if not extra_info:
+        return {col: None for col in _EDGE_V3_COLUMNS}
+
+    result = {}
+    for col in _EDGE_V3_COLUMNS:
+        key = _EDGE_COL_TO_EXTRA_KEY.get(col, col)
+        value = extra_info.get(key)
+
+        if value is None:
+            result[col] = None
+        elif isinstance(value, bool):
+            result[col] = 1 if value else 0
+        else:
+            if isinstance(value, (list, dict)):
+                result[col] = json.dumps(value, ensure_ascii=False)
+            else:
+                result[col] = value
+
+    return result
+
+
+def _hydrate_node(row: sqlite3.Row) -> dict:
+    """将数据库行转为 dict，从列重建 extra_info dict
+
+    v4 起 extra_info 列已 DROP，列是唯一数据源，纯从列重建。
+    对下游查询层透明：它们仍通过 d["extra_info"]["is_virtual"] 取值。
+    （v3 兼容：若行中仍有 extra_info 列，作为 fallback 底座合并。）
+    """
+    d = dict(row)
+
+    # v3 兼容：extra_info 列若存在则作为底座（v4 已 DROP，此时为 None → 空 dict）
+    raw_extra = d.get("extra_info")
+    if isinstance(raw_extra, str):
+        try:
+            extra = json.loads(raw_extra)
+        except (json.JSONDecodeError, TypeError):
+            extra = {}
+    elif isinstance(raw_extra, dict):
+        extra = raw_extra
+    else:
+        extra = {}
+
+    # 从列值重建 extra_info（列值优先）
+    for col in _NODE_V3_COLUMNS:
+        col_val = d.get(col)
+        if col_val is not None:
+            # 找到对应的 extra_info key
+            key = _NODE_COL_TO_EXTRA_KEY.get(col, col)
+            # TEXT 列存 JSON array/dict 的需要反序列化
+            if isinstance(col_val, str) and col in (
+                "template_params", "param_types", "tags",
+            ):
+                try:
+                    extra[key] = json.loads(col_val)
+                except (json.JSONDecodeError, TypeError):
+                    extra[key] = col_val
+            # INTEGER 列的布尔值转回 bool
+            elif isinstance(col_val, int) and col in (
+                "is_abstract", "is_template_spec", "is_type_alias", "is_typedef",
+                "is_virtual", "is_pure_virtual", "is_override", "is_static", "is_const",
+                "is_project",
+            ):
+                extra[key] = bool(col_val)
+            else:
+                extra[key] = col_val
+        # 列值为 NULL 且 extra_info 中有值 → 保留 extra_info 值（fallback）
+
+    d["extra_info"] = extra if extra else None
+    return d
+
+
+def _hydrate_edge(row: sqlite3.Row) -> dict:
+    """将数据库行转为 dict，从列重建 extra_info dict
+
+    v4 起 extra_info 列已 DROP，纯从列重建（v3 兼容：extra_info 列存在时作底座）。
+    """
+    d = dict(row)
+
+    raw_extra = d.get("extra_info")
+    if isinstance(raw_extra, str):
+        try:
+            extra = json.loads(raw_extra)
+        except (json.JSONDecodeError, TypeError):
+            extra = {}
+    elif isinstance(raw_extra, dict):
+        extra = raw_extra
+    else:
+        extra = {}
+
+    for col in _EDGE_V3_COLUMNS:
+        col_val = d.get(col)
+        if col_val is not None:
+            key = _EDGE_COL_TO_EXTRA_KEY.get(col, col)
+            if isinstance(col_val, str) and col in ("callee_param_types",):
+                try:
+                    extra[key] = json.loads(col_val)
+                except (json.JSONDecodeError, TypeError):
+                    extra[key] = col_val
+            elif isinstance(col_val, int) and col in (
+                "callee_is_const", "needs_resolution",
+            ):
+                extra[key] = bool(col_val)
+            else:
+                extra[key] = col_val
+
+    d["extra_info"] = extra if extra else None
+    return d
 
 
 class GraphDB:
@@ -58,6 +256,8 @@ class GraphDB:
         else:
             # Fallback: inline schema
             self._create_tables_inline()
+        # v3: 先迁移旧库，再设版本号
+        self._auto_migrate()
         self._apply_schema_version()
         self._commit()
 
@@ -81,8 +281,31 @@ class GraphDB:
         """返回当前 DB 的 schema 版本（PRAGMA user_version）"""
         return self.conn.execute("PRAGMA user_version").fetchone()[0]
 
+    def _auto_migrate(self):
+        """自动迁移：检测旧版本并逐级执行迁移脚本
+
+        新库由 schema.sql / inline DDL 直接建成 v4（无 extra_info 列），
+        此时 user_version 虽为 0 但无需迁移——以 extra_info 列是否存在为准：
+        列不存在 = 已是 v4 结构，跳过迁移（版本号由 _apply_schema_version 落定）。
+        """
+        from .migrate_v3 import migrate_v2_to_v3, migrate_v3_to_v31
+        cur_ver = self.conn.execute("PRAGMA user_version").fetchone()[0]
+
+        # 新建的 v4 库没有 extra_info 列，v2→v3 回填会失败——直接跳过
+        node_cols = [r[1] for r in self.conn.execute("PRAGMA table_info(node)")]
+        if "extra_info" not in node_cols:
+            return
+
+        if cur_ver < 3:
+            logger.info("检测到 schema 版本 %d < 3，执行 v2→v3 迁移", cur_ver)
+            migrate_v2_to_v3(self.conn)
+            cur_ver = 3
+        if cur_ver < 4:
+            logger.info("检测到 schema 版本 %d < 4，执行 v3→v4 迁移", cur_ver)
+            migrate_v3_to_v31(self.conn)
+
     def _create_tables_inline(self):
-        """内联建表（schema.sql 不可用时的 fallback）"""
+        """内联建表（schema.sql 不可用时的 fallback，v4：列是唯一数据源，无 extra_info）"""
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS node (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,8 +315,31 @@ class GraphDB:
                 file_path TEXT NOT NULL,
                 start_line INTEGER,
                 end_line INTEGER,
-                extra_info TEXT,
                 unique_key TEXT NOT NULL UNIQUE,
+                is_abstract INTEGER DEFAULT 0,
+                is_template_spec INTEGER DEFAULT 0,
+                is_type_alias INTEGER DEFAULT 0,
+                is_typedef INTEGER DEFAULT 0,
+                template_params TEXT,
+                target_type TEXT,
+                is_virtual INTEGER DEFAULT 0,
+                is_pure_virtual INTEGER DEFAULT 0,
+                is_override INTEGER DEFAULT 0,
+                is_static INTEGER DEFAULT 0,
+                is_const INTEGER DEFAULT 0,
+                access TEXT,
+                parent_class TEXT,
+                signature TEXT,
+                result_type TEXT,
+                param_types TEXT,
+                is_project INTEGER,
+                doc_title TEXT,
+                heading TEXT,
+                section_level INTEGER,
+                content_preview TEXT,
+                content_hash TEXT,
+                word_count INTEGER,
+                tags TEXT,
                 created_at TEXT DEFAULT (datetime('now')),
                 updated_at TEXT DEFAULT (datetime('now'))
             );
@@ -103,7 +349,27 @@ class GraphDB:
                 to_id INTEGER NOT NULL,
                 relation_type TEXT NOT NULL,
                 call_line INTEGER DEFAULT 0,
-                extra_info TEXT,
+                callee_name TEXT,
+                callee_namespace TEXT,
+                callee_parent_class TEXT,
+                callee_file TEXT,
+                callee_param_types TEXT,
+                callee_is_const INTEGER DEFAULT 0,
+                call_type TEXT,
+                alias_name TEXT,
+                target_simple_name TEXT,
+                target_type TEXT,
+                function_name TEXT,
+                derived_class TEXT,
+                base_namespace TEXT,
+                needs_resolution INTEGER DEFAULT 0,
+                resolve_hint TEXT,
+                confidence REAL,
+                match_method TEXT,
+                matched_name TEXT,
+                code_type TEXT,
+                link_text TEXT,
+                access TEXT,
                 created_at TEXT DEFAULT (datetime('now')),
                 FOREIGN KEY(from_id) REFERENCES node(id) ON DELETE CASCADE,
                 FOREIGN KEY(to_id) REFERENCES node(id) ON DELETE CASCADE,
@@ -130,11 +396,17 @@ class GraphDB:
             CREATE INDEX IF NOT EXISTS idx_node_type ON node(type);
             CREATE INDEX IF NOT EXISTS idx_node_file_path ON node(file_path);
             CREATE INDEX IF NOT EXISTS idx_node_unique_key ON node(unique_key);
+            CREATE INDEX IF NOT EXISTS idx_node_is_virtual ON node(is_virtual) WHERE is_virtual = 1;
+            CREATE INDEX IF NOT EXISTS idx_node_doc_title ON node(doc_title);
+            CREATE INDEX IF NOT EXISTS idx_node_parent_class ON node(parent_class);
+            CREATE INDEX IF NOT EXISTS idx_node_is_project ON node(is_project) WHERE is_project IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_edge_from_id ON edge(from_id);
             CREATE INDEX IF NOT EXISTS idx_edge_to_id ON edge(to_id);
             CREATE INDEX IF NOT EXISTS idx_edge_relation_type ON edge(relation_type);
             CREATE INDEX IF NOT EXISTS idx_edge_from_type ON edge(from_id, relation_type);
             CREATE INDEX IF NOT EXISTS idx_edge_to_type ON edge(to_id, relation_type);
+            CREATE INDEX IF NOT EXISTS idx_edge_callee_name ON edge(callee_name);
+            CREATE INDEX IF NOT EXISTS idx_edge_needs_resolution ON edge(needs_resolution) WHERE needs_resolution = 1;
             CREATE INDEX IF NOT EXISTS idx_include_source ON include_dep(source_file);
             CREATE INDEX IF NOT EXISTS idx_include_included ON include_dep(included_file);
         """)
@@ -173,28 +445,34 @@ class GraphDB:
         """插入或更新节点，返回 node id
 
         - unique_key 不存在 → INSERT
-        - unique_key 已存在 → UPDATE 可变字段（行号、命名空间、extra_info 等）
+        - unique_key 已存在 → UPDATE 可变字段（行号、命名空间、v3 新列等）
         """
         type_val = node.type.value if isinstance(node.type, NodeType) else node.type
-        extra_json = json.dumps(node.extra_info, ensure_ascii=False) if node.extra_info else None
+        flat = _flatten_node_extra(node.extra_info)
+        v3_cols = ", ".join(_NODE_V3_COLUMNS)
+        v3_placeholders = ", ".join("?" * len(_NODE_V3_COLUMNS))
+        v3_values = [flat[c] for c in _NODE_V3_COLUMNS]
 
-        # Try insert first
+        # Try insert first（v4：extra_info 列已 DROP，仅写列）
         try:
             cursor = self.conn.execute(
-                """INSERT INTO node (type, name, namespace, file_path, start_line, end_line, extra_info, unique_key)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                f"""INSERT INTO node (type, name, namespace, file_path, start_line, end_line,
+                                       unique_key, {_NODE_V3_COLUMNS_JOIN})
+                   VALUES (?, ?, ?, ?, ?, ?, ?, {v3_placeholders})""",
                 (type_val, node.name, node.namespace, node.file_path,
-                 node.start_line, node.end_line, extra_json, node.unique_key)
+                 node.start_line, node.end_line, node.unique_key,
+                 *v3_values)
             )
             return cursor.lastrowid
         except sqlite3.IntegrityError:
-            # unique_key conflict → update 可变字段
+            # unique_key conflict → update 可变字段 + v3 新列
+            v3_set = ", ".join(f"{c}=?" for c in _NODE_V3_COLUMNS)
             self.conn.execute(
-                """UPDATE node SET namespace=?, file_path=?, start_line=?, end_line=?,
-                          extra_info=?, updated_at=datetime('now')
+                f"""UPDATE node SET namespace=?, file_path=?, start_line=?, end_line=?,
+                          {v3_set}, updated_at=datetime('now')
                    WHERE unique_key=?""",
                 (node.namespace, node.file_path, node.start_line, node.end_line,
-                 extra_json, node.unique_key)
+                 *v3_values, node.unique_key)
             )
             row = self.conn.execute(
                 "SELECT id FROM node WHERE unique_key=?", (node.unique_key,)
@@ -206,14 +484,14 @@ class GraphDB:
         row = self.conn.execute(
             "SELECT * FROM node WHERE unique_key=?", (unique_key,)
         ).fetchone()
-        return dict(row) if row else None
+        return _hydrate_node(row) if row else None
 
     def get_node_by_id(self, node_id: int) -> dict | None:
         """按 id 查询节点"""
         row = self.conn.execute(
             "SELECT * FROM node WHERE id=?", (node_id,)
         ).fetchone()
-        return dict(row) if row else None
+        return _hydrate_node(row) if row else None
 
     def find_node_by_name(self, name: str, node_type: str = None,
                           exact: bool = True) -> list[dict]:
@@ -236,7 +514,7 @@ class GraphDB:
             params.append(node_type)
 
         sql += " ORDER BY name LIMIT 100"
-        return [dict(row) for row in self.conn.execute(sql, params).fetchall()]
+        return [_hydrate_node(row) for row in self.conn.execute(sql, params).fetchall()]
 
     # ------------------------------------------------------------------
     # Edge operations
@@ -244,7 +522,7 @@ class GraphDB:
 
     def insert_edge(self, from_id: int, to_id: int, relation_type: str,
                     extra_info: dict = None, call_line: int = 0) -> int | None:
-        """插入边，已存在则更新 extra_info
+        """插入边，已存在则更新 extra_info + v3 新列
 
         Args:
             call_line: 调用行号，用于区分同一函数内多次调用同一目标的多个调用点
@@ -252,20 +530,25 @@ class GraphDB:
         Returns:
             edge id，或 None（不应发生）
         """
-        extra_json = json.dumps(extra_info, ensure_ascii=False) if extra_info else None
+        flat = _flatten_edge_extra(extra_info)
+        v3_placeholders = ", ".join("?" * len(_EDGE_V3_COLUMNS))
+        v3_values = [flat[c] for c in _EDGE_V3_COLUMNS]
+
         try:
             cursor = self.conn.execute(
-                """INSERT INTO edge (from_id, to_id, relation_type, call_line, extra_info)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (from_id, to_id, relation_type, call_line, extra_json)
+                f"""INSERT INTO edge (from_id, to_id, relation_type, call_line,
+                                      {_EDGE_V3_COLUMNS_JOIN})
+                   VALUES (?, ?, ?, ?, {v3_placeholders})""",
+                (from_id, to_id, relation_type, call_line, *v3_values)
             )
             return cursor.lastrowid
         except sqlite3.IntegrityError:
-            # (from_id, to_id, relation_type, call_line) conflict → update extra_info
+            # (from_id, to_id, relation_type, call_line) conflict → update v3 新列
+            v3_set = ", ".join(f"{c}=?" for c in _EDGE_V3_COLUMNS)
             self.conn.execute(
-                """UPDATE edge SET extra_info=?
+                f"""UPDATE edge SET {v3_set}
                    WHERE from_id=? AND to_id=? AND relation_type=? AND call_line=?""",
-                (extra_json, from_id, to_id, relation_type, call_line)
+                (*v3_values, from_id, to_id, relation_type, call_line)
             )
             row = self.conn.execute(
                 """SELECT id FROM edge
@@ -286,7 +569,7 @@ class GraphDB:
                      FROM edge e JOIN node n ON e.to_id=n.id
                      WHERE e.from_id=?"""
             params = [node_id]
-        return [dict(row) for row in self.conn.execute(sql, params).fetchall()]
+        return [_hydrate_edge(row) for row in self.conn.execute(sql, params).fetchall()]
 
     def get_edges_to(self, node_id: int, relation_type: str = None) -> list[dict]:
         """查询指向指定节点的边"""
@@ -300,7 +583,7 @@ class GraphDB:
                      FROM edge e JOIN node n ON e.from_id=n.id
                      WHERE e.to_id=?"""
             params = [node_id]
-        return [dict(row) for row in self.conn.execute(sql, params).fetchall()]
+        return [_hydrate_edge(row) for row in self.conn.execute(sql, params).fetchall()]
 
     # ------------------------------------------------------------------
     # Include dependency operations
@@ -458,7 +741,8 @@ class GraphDB:
         # 1. Import nodes
         for node in result.nodes:
             type_val = node.type.value if isinstance(node.type, NodeType) else node.type
-            extra_json = json.dumps(node.extra_info, ensure_ascii=False) if node.extra_info else None
+            flat = _flatten_node_extra(node.extra_info)
+            v3_values = [flat[c] for c in _NODE_V3_COLUMNS]
 
             # Check if exists
             existing = self.conn.execute(
@@ -466,21 +750,25 @@ class GraphDB:
             ).fetchone()
 
             if existing:
-                # 刷新行号/命名空间/文件路径（P1-B 修复：原只更新 extra_info，函数移行后 DB 存旧行号）
+                # 刷新行号/命名空间/文件路径 + v3 新列（v4：不再写 extra_info）
+                v3_set = ", ".join(f"{c}=?" for c in _NODE_V3_COLUMNS)
                 self.conn.execute(
-                    """UPDATE node SET extra_info=?, start_line=?, end_line=?,
-                                       namespace=?, file_path=?, updated_at=datetime('now')
+                    f"""UPDATE node SET start_line=?, end_line=?,
+                                       namespace=?, file_path=?, {v3_set}, updated_at=datetime('now')
                        WHERE unique_key=?""",
-                    (extra_json, node.start_line, node.end_line,
-                     node.namespace, node.file_path, node.unique_key)
+                    (node.start_line, node.end_line,
+                     node.namespace, node.file_path, *v3_values, node.unique_key)
                 )
                 stats["nodes_updated"] += 1
             else:
+                v3_placeholders = ", ".join("?" * len(_NODE_V3_COLUMNS))
                 self.conn.execute(
-                    """INSERT INTO node (type, name, namespace, file_path, start_line, end_line, extra_info, unique_key)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    f"""INSERT INTO node (type, name, namespace, file_path, start_line, end_line,
+                                          unique_key, {_NODE_V3_COLUMNS_JOIN})
+                       VALUES (?, ?, ?, ?, ?, ?, ?, {v3_placeholders})""",
                     (type_val, node.name, node.namespace, node.file_path,
-                     node.start_line, node.end_line, extra_json, node.unique_key)
+                     node.start_line, node.end_line, node.unique_key,
+                     *v3_values)
                 )
                 stats["nodes_new"] += 1
 
@@ -565,7 +853,7 @@ class GraphDB:
                                        JOIN edge e ON e.from_id = n.id
                                        WHERE n.name=? AND n.type='function'
                                        AND e.relation_type='belongs_to'
-                                       AND json_extract(n.extra_info, '$.is_virtual') = 1
+                                       AND n.is_virtual = 1
                                        AND n.id != ?""",
                                     (search_name, from_node_id)
                                 ).fetchall()
@@ -623,7 +911,7 @@ class GraphDB:
                     # 仅当调用点提供了 callee_param_types 时启用（旧数据/无参数信息回退）。
                     if callee_name and callee_params is not None:
                         cand_rows = self.conn.execute(
-                            """SELECT id, namespace, extra_info FROM node
+                            """SELECT id, namespace, param_types FROM node
                                WHERE name=? AND type='function'""",
                             (callee_name,)
                         ).fetchall()
@@ -636,11 +924,12 @@ class GraphDB:
                                 ns_tail = ns.rsplit("::", 1)[-1] if ns else ""
                                 if ns_tail != callee_parent and callee_parent not in ns:
                                     continue
+                            # param_types 列是 TEXT(JSON array)，v4 直接读列 parse
                             try:
-                                info = json.loads(cr["extra_info"]) if cr["extra_info"] else {}
+                                cand_params = json.loads(cr["param_types"]) if cr["param_types"] else None
                             except (json.JSONDecodeError, TypeError):
-                                info = {}
-                            if info.get("param_types", None) == callee_params:
+                                cand_params = None
+                            if cand_params == callee_params:
                                 best = cr["id"]
                                 break
                         if best is not None:
@@ -671,9 +960,12 @@ class GraphDB:
 
             # Insert edge if we have both endpoints
             if to_id is not None:
+                # 已解析成功 → 清 _needs_resolution 陈旧标记（防复发，P1-1 逻辑修复）
+                # 入库的边 to_id 都有效，语义上不再是 pending。
+                if edge.extra_info:
+                    edge.extra_info["_needs_resolution"] = False
                 # 提取 call_line 用于区分同一函数内多次调用同一目标的多个调用点
                 call_line = edge.extra_info.get("call_line", 0) if edge.extra_info else 0
-                extra_json = json.dumps(edge.extra_info, ensure_ascii=False) if edge.extra_info else None
                 edge_id = self.insert_edge(from_id, to_id, rt, edge.extra_info, call_line=call_line)
                 if edge_id:
                     stats["edges_new"] += 1

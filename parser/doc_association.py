@@ -139,21 +139,13 @@ class DocAssociationParser:
         # 查所有 doc_section 节点
         conn = self.db.conn
         rows = conn.execute(
-            "SELECT unique_key, extra_info FROM node WHERE type='doc_section'"
+            "SELECT unique_key, content_preview FROM node WHERE type='doc_section'"
         ).fetchall()
 
         for row in rows:
             doc_key = row["unique_key"]
-            extra = row["extra_info"]
-            if isinstance(extra, str):
-                import json
-                try:
-                    extra = json.loads(extra)
-                except (json.JSONDecodeError, TypeError):
-                    extra = {}
-
             # 获取文档内容预览（包含 [[...]] 标记）
-            content = extra.get("content_preview", "")
+            content = row["content_preview"] or ""
             if not content:
                 continue
 
