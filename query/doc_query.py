@@ -9,7 +9,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 
-from ..db.graph_db import GraphDB
+from ..db.graph_db import GraphDB, _hydrate_node
 from ..db.relation_types import RelationType
 from .query_utils import parse_extra as _parse_extra  # P2-3: 统一实现
 
@@ -76,13 +76,13 @@ class DocQuery:
         sql = """SELECT * FROM node
                  WHERE type='doc_section'
                  AND (name LIKE ?
-                      OR json_extract(extra_info, '$.doc_title') LIKE ?
-                      OR json_extract(extra_info, '$.content_preview') LIKE ?)"""
+                      OR doc_title LIKE ?
+                      OR content_preview LIKE ?)"""
         params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
 
         if tag:
             # tag 是 JSON 数组，用 json_each 精确匹配元素，避免子串误匹配
-            sql += " AND EXISTS (SELECT 1 FROM json_each(json_extract(extra_info, '$.tags')) WHERE value = ?)"
+            sql += " AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)"
             params.append(tag)
 
         sql += " ORDER BY start_line LIMIT ?"
@@ -92,20 +92,21 @@ class DocQuery:
 
         results: list[DocWithCode] = []
         for row in rows:
-            extra = _parse_extra(row["extra_info"])
+            hydrated = _hydrate_node(row)
+            extra = hydrated.get("extra_info") or {}
             doc_info = DocSectionInfo(
-                title=row["name"],
+                title=hydrated["name"],
                 doc_title=extra.get("doc_title", ""),
-                file_path=row["file_path"],
-                start_line=row["start_line"],
-                end_line=row["end_line"],
+                file_path=hydrated["file_path"],
+                start_line=hydrated["start_line"],
+                end_line=hydrated["end_line"],
                 content_preview=extra.get("content_preview", ""),
                 tags=extra.get("tags", []),
                 word_count=extra.get("word_count", 0),
             )
 
             # 查关联代码
-            related = self._find_related_code(row["id"], min_confidence=min_confidence)
+            related = self._find_related_code(hydrated["id"], min_confidence=min_confidence)
             results.append(DocWithCode(doc=doc_info, related_code=related))
 
         return results

@@ -17,7 +17,7 @@ import logging
 import time
 from pathlib import Path
 
-from ..db.graph_db import GraphDB
+from ..db.graph_db import GraphDB, _hydrate_node
 from ..db.relation_types import RelationType
 from .query_models import ClassInfo, InheritanceInfo, FunctionInfo, SymbolInfo
 
@@ -316,7 +316,7 @@ class GraphQuery:
             (f"%{file_path}%",)
         ).fetchall()
 
-        return [_row_to_symbol_info(dict(r)) for r in rows]
+        return [_row_to_symbol_info(_hydrate_node(r)) for r in rows]
 
     # ------------------------------------------------------------------
     # 辅助：按 unique_key 精确查节点

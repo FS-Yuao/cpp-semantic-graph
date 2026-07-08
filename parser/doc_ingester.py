@@ -159,10 +159,8 @@ class DocIngester:
                 node = self._section_to_node(sec, str(md_file))
                 existing = self.db.get_node_by_key(node.unique_key)
                 if existing:
-                    # 检查内容是否变化
-                    old_extra = json.loads(existing.get("extra_info", "{}")) \
-                        if isinstance(existing.get("extra_info"), str) \
-                        else existing.get("extra_info", {})
+                    # 检查内容是否变化（existing 已 hydrate，extra_info 为 dict/None）
+                    old_extra = existing.get("extra_info") or {}
                     if old_extra.get("content_hash") != sec.content_hash:
                         self.db.upsert_node(node)
                         stats["sections_updated"] += 1

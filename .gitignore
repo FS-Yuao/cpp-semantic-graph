@@ -33,6 +33,10 @@ output/*.json
 semantic_graph.db
 *.db-shm
 *.db.bak-*
+*.db.bak_*
+*.db.v3bak
+*.db.v4copy*
+verify_*.db
 rebuild_report.json
 rebuild.log
 semantic_graph_full.db
