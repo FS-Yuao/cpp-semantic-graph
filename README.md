@@ -1,135 +1,202 @@
 # cpp-semantic-graph
 
-> C++ 语义图谱 — 让 AI 精准理解你的 C++ 代码库
+> A C++ semantic knowledge graph — let AI understand your C++ codebase precisely
 
-为 AI 编程助手（Claude Code、Cursor、Windsurf 等）构建 C++ 代码的语义知识图谱，通过 [MCP 协议](https://modelcontextprotocol.io/) 暴露 9 个查询工具，让 AI 能直接搜索类定义、查继承关系、追踪调用链、分析影响面——无需翻文件、无需 grep。
+[中文文档](README_zh.md)
 
-## 为什么需要它？
+Builds a semantic knowledge graph of a C++ codebase for AI coding assistants
+(Claude Code, Cursor, Windsurf, etc.) and exposes it through 9 query tools over
+the [MCP protocol](https://modelcontextprotocol.io/). The AI can then search
+class definitions, look up inheritance, trace call chains, and analyze the blast
+radius of a change — no file hopping, no grep.
 
-AI 编程助手理解 C++ 代码的常见痛点：
+## Why this project exists: clang, not tree-sitter
 
-| 痛点 | cpp-semantic-graph 的解法 |
-|------|--------------------------|
-| "这个类在哪定义的？" | `cpp_search_class("SocUpdate")` → 命名空间 + 文件位置 |
-| "谁调用了这个函数？" | `cpp_get_callers("GetSocBootChain")` → 所有调用方 |
-| "改这个头文件会影响什么？" | 增量更新自动递归 include 依赖，只重解析受影响的 TU |
-| "虚函数有哪些 override？" | `cpp_get_overrides("PerformUpgrade", "BasePeriUpdate")` → 所有实现 |
-| "这个模块的架构是怎样的？" | `cpp_traverse_graph("SocUpdate")` → 多跳遍历关联节点 |
+Most general-purpose code-graph tooling parses source with **tree-sitter** — a
+fast, incremental **syntax** parser. That choice is fine for many languages,
+but it is the wrong tool for a **C++ semantic** graph.
 
-## ✨ 核心特性
+**The distinction is syntax vs. semantics:**
 
-- **9 个 MCP 工具**：类搜索、函数搜索、继承关系、调用链（caller/callee）、override、文件符号、多跳遍历、文档搜索
-- **增量更新**：基于 include 依赖图，改一个 `.cpp` 秒级刷新（16× 快于全量重建）
-- **文档融合**：项目文档与代码双向关联，搜索文档时自动定位相关代码
-- **开箱即用**：一个 YAML 配置 + `compile_commands.json` 即可启动，MCP Server 自动注册到 AI 工具
-- **项目无关**：表结构和工具定义不含任何项目硬编码，可迁移到任何 C++ 项目
+- A **syntax parser** answers *"do these tokens form a valid C++ program, and
+  what does the tree look like?"* — it does **not** resolve what a name refers
+  to.
+- **Semantic analysis** (what a compiler front-end does) answers *"which entity
+  does this symbol denote, what is its type, and how does it relate to
+  others?"* — this requires **type resolution and name lookup**.
 
-## 🚀 快速开始
+C++ is a language where a great deal of information lives **in the type system,
+not on the page**. Consider:
 
-### 前置条件
+```cpp
+namespace nv {
+struct Base { virtual void PerformUpgrade() = 0; };
+template<typename T> struct Middle : virtual Base {     // virtual inheritance + template
+    void PerformUpgrade() override {}
+};
+struct SoCUpdate : Middle<SoC>, NonCopyable, public Logger {};   // multiple inheritance
+}
+```
+
+A syntax parser (tree-sitter) can see that `SoCUpdate` is a class followed by
+three base-specifier text fragments. It **cannot** determine:
+
+- That `Middle<SoC>` is the specialization `nv::Middle<SoC>` — requires
+  **template instantiation**.
+- Which namespace `Logger` lives in — requires **name lookup**.
+- That the root of the chain is `virtual Base` — requires **expanding the
+  template and following the referenced declaration**.
+- Which base-class method `PerformUpgrade() override` actually overrides —
+  requires **cross-class virtual-function matching**.
+
+These all require type resolution, which is exactly what a compiler front-end
+(clang) provides and what a syntax parser structurally cannot. This is not
+tree-sitter being "bad" — it is intentionally type-free, single-file, and fast,
+designed for syntax highlighting and code folding. Using it to build a C++
+*semantic* graph is simply the wrong tool for the job.
+
+**This project uses clang/libclang's semantic AST instead.** The difference is
+visible in the parser:
+
+- `base_spec.referenced` — resolves a base class to its **real declaration
+  cursor** across files and namespaces (`parser/ast_visitor.py`).
+- `clang_isVirtualBase` — detects **virtual inheritance**, the C++-specific
+  diamond-inheritance semantics that syntax trees have no notion of.
+- `cursor.is_virtual_method()` / `is_pure_virtual_method()` — virtual-function
+  semantics.
+- `access_specifier` — distinguishes public/protected/private inheritance.
+- Cross-TU override matching — base and derived classes often live in different
+  files; clang's `referenced` cursor links them, which a per-file syntax parse
+  cannot.
+
+## Why do you need it?
+
+Common pain points when an AI assistant tries to understand C++ code:
+
+| Pain point | cpp-semantic-graph's answer |
+|------------|------------------------------|
+| "Where is this class defined?" | `cpp_search_class("SocUpdate")` → namespace + file location |
+| "Who calls this function?" | `cpp_get_callers("GetSocBootChain")` → all callers |
+| "What does changing this header affect?" | Incremental update recursively walks include deps, re-parses only affected TUs |
+| "Which overrides exist for this virtual?" | `cpp_get_overrides("PerformUpgrade", "BasePeriUpdate")` → all implementations |
+| "What does this module's architecture look like?" | `cpp_traverse_graph("SocUpdate")` → multi-hop traversal |
+
+## ✨ Core features
+
+- **9 MCP tools**: class search, function search, inheritance, call chains (caller/callee), overrides, file symbols, multi-hop traversal, doc search
+- **Incremental updates**: based on the include-dependency graph, a single `.cpp` change refreshes in seconds (16× faster than a full rebuild)
+- **Doc fusion**: bidirectional linking between project docs and code; searching docs auto-locates related code
+- **Plug-and-play**: one YAML config + `compile_commands.json` to start; the MCP server auto-registers with AI tools
+- **Project-agnostic**: no project-specific hardcoding in the schema or tool definitions — portable to any C++ project
+
+## 🚀 Quick start
+
+### Prerequisites
 
 - Python 3.10+
-- libclang（与你的 LLVM 版本匹配）
-- `compile_commands.json`（由 CMake/Bear 生成）
+- libclang (matching your LLVM version)
+- `compile_commands.json` (generated by CMake/Bear)
 
-### 1. 安装
+### 1. Install
 
 ```bash
 git clone https://github.com/your-org/cpp-semantic-graph.git
 cd cpp-semantic-graph
 
-# 创建虚拟环境
+# Create a virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
 
-# 安装依赖
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 2. 准备 compile_commands.json
+### 2. Prepare compile_commands.json
 
-如果你的项目用 CMake 构建：
+If your project builds with CMake:
 
 ```bash
 cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ...
 ```
 
-如果没有 CMake，用 [Bear](https://github.com/rizsotto/Bear) 拦截编译命令：
+Without CMake, use [Bear](https://github.com/rizsotto/Bear) to intercept build commands:
 
 ```bash
 bear -- make
 ```
 
-### 3. 编写配置文件
+### 3. Write the config file
 
-创建 `cpp_semantic_graph.yaml`（这是唯一需要改的文件）：
+Create `cpp_semantic_graph.yaml` (the only file you need to edit):
 
 ```yaml
 project:
   name: "your_project"
   compile_commands: "/path/to/your/project/compile_commands.json"
 
-# 源码范围 — 决定哪些代码算"项目代码"
+# Source scope — decides what counts as "project code"
 source_paths:
   - "src"
   - "include"
 
-# 生成代码路径（如 ARA COM src-gen、protobuf）
+# Generated-code paths (e.g. ARA COM src-gen, protobuf)
 generated_paths:
   - "src-gen"
 
-# 完全忽略的路径
+# Paths to ignore entirely
 exclude_paths:
   - "thirdparty"
   - "build"
   - "test/mock"
 
-# libclang 路径（按你的系统调整）
+# libclang path (adjust for your system)
 libclang_path: "/usr/lib/llvm-18/lib/libclang.so.1"
 
 parse_options:
-  skip_function_bodies: false  # false 才能提取调用关系
-  max_workers: 4               # 并行解析进程数
+  skip_function_bodies: false  # must be false to extract call relations
+  max_workers: 4               # parallel parse processes
 ```
 
-### 4. 全量解析
+### 4. Full parse
 
-> ⚠️ **重要**：全量解析前必须先停掉 MCP Server，否则 MCP Server 持有的 DB 连接会导致写入失败（`disk I/O error`）。
-> 停止方法：`pkill -f "run_server.py"` 或在 Claude Code 设置中禁用 MCP Server 后重启。
+> ⚠️ **Important**: stop the MCP server before a full parse, or the DB connection
+> it holds will cause write failures (`disk I/O error`).
+> Stop with `pkill -f "run_server.py"`, or disable the MCP server in Claude Code
+> settings and restart.
 
 ```bash
-# 1. 停掉 MCP Server（必须！）
+# 1. Stop the MCP server (required!)
 pkill -f "run_server.py"
 
-# 2. 全量解析
+# 2. Full parse
 python3 -m cpp_semantic_graph full-parse \
   --config cpp_semantic_graph.yaml \
   --db semantic_graph_full.db
 
-# 3. 重新启动 MCP Server（解析完成后）
+# 3. Restart the MCP server (after parsing finishes)
 ```
 
-解析完成后，数据库包含：
-- **节点**：类、结构体、函数（含签名、命名空间、文件位置）
-- **边**：继承、调用、override、belongs_to、类型别名（type_alias）、using 声明（using_decl）、友元（friend_of）等关系（模板实例化边 `instantiates` 因 libclang AST 形态暂未启用，见 [复杂场景说明](#-复杂场景说明)）
-- **include 依赖**：翻译单元间的 include 关系图
-- **文档关联**：文档切片 ↔ 代码实体（可选）
+After parsing, the database contains:
+- **Nodes**: classes, structs, functions (with signature, namespace, file location)
+- **Edges**: inheritance, calls, overrides, belongs_to, type aliases (`type_alias`), using-declarations (`using_decl`), friends (`friend_of`), etc. (the `instantiates` template-instantiation edge is not yet enabled due to libclang AST shape — see [Complex scenarios](#-complex-scenarios-templatealiasfriend))
+- **Include dependencies**: the include graph between translation units
+- **Doc associations**: doc sections ↔ code entities (optional)
 
-### 5. 启动 MCP Server
+### 5. Start the MCP server
 
 ```bash
-# 设置数据库路径
+# Set the database path
 export CPP_GRAPH_DB=/path/to/semantic_graph_full.db
 
-# 启动 MCP Server（stdio 传输）
+# Start the MCP server (stdio transport)
 python3 -m cpp_semantic_graph.mcp_server.server
 ```
 
-### 6. 注册到 AI 工具
+### 6. Register with AI tools
 
 #### Claude Code
 
-编辑 `~/.claude.json`，在 `mcpServers` 中添加：
+Edit `~/.claude.json`, add under `mcpServers`:
 
 ```json
 {
@@ -148,7 +215,7 @@ python3 -m cpp_semantic_graph.mcp_server.server
 
 #### Cursor
 
-编辑 `.cursor/mcp.json`：
+Edit `.cursor/mcp.json`:
 
 ```json
 {
@@ -164,63 +231,63 @@ python3 -m cpp_semantic_graph.mcp_server.server
 }
 ```
 
-#### Windsurf / 其他 MCP 客户端
+#### Windsurf / other MCP clients
 
-配置方式类似，参考各工具的 MCP 文档。核心参数：
+Configuration is similar; refer to each tool's MCP docs. The core parameters:
 - **command**: `python3`
 - **args**: `["/path/to/mcp_server/run_server.py"]`
-- **env.CPP_GRAPH_DB**: 数据库绝对路径
+- **env.CPP_GRAPH_DB**: absolute path to the database
 
-> 💡 **提示**：`CPP_GRAPH_PROJECT` 环境变量可指定项目名（用于 MCP instructions），不设则自动从 DB 路径推断。
+> 💡 **Tip**: the `CPP_GRAPH_PROJECT` env var sets the project name (used in MCP instructions); if unset it is inferred from the DB path.
 
 ---
 
-## 🛠️ 9 个 MCP 工具
+## 🛠️ 9 MCP tools
 
-| # | 工具名 | 用途 | 典型场景 |
-|---|--------|------|---------|
-| 1 | `cpp_search_class` | 按类名搜索类定义 | "SocUpdate 类在哪定义？" |
-| 2 | `cpp_search_function` | 按函数名搜索函数定义 | "PerformUpgrade 的签名是什么？" |
-| 3 | `cpp_get_inheritance` | 查询类的继承关系 | "BasePeriUpdate 有哪些子类？" |
-| 4 | `cpp_get_callers` | 查询谁调用了指定函数 | "谁调用了 GetSocBootChain？" |
-| 5 | `cpp_get_callees` | 查询指定函数调用了谁 | "PerformUpgrade 内部调用了什么？" |
-| 6 | `cpp_get_overrides` | 查询虚函数的所有重写 | "PerformUpgrade 有哪些 override？" |
-| 7 | `cpp_get_file_symbols` | 查询文件内的所有符号 | "soc_update.cpp 里有什么？" |
-| 8 | `cpp_traverse_graph` | 多跳遍历图谱 | "修改 SocUpdate 会影响什么？" |
-| 9 | `cpp_search_docs` | 搜索项目文档 | "OTA 升级流程的设计文档" |
+| # | Tool | Purpose | Typical scenario |
+|---|------|---------|------------------|
+| 1 | `cpp_search_class` | Search class definitions by name | "Where is SocUpdate defined?" |
+| 2 | `cpp_search_function` | Search function definitions by name | "What's the signature of PerformUpgrade?" |
+| 3 | `cpp_get_inheritance` | Query a class's inheritance | "Which classes derive from BasePeriUpdate?" |
+| 4 | `cpp_get_callers` | Who calls a given function | "Who calls GetSocBootChain?" |
+| 5 | `cpp_get_callees` | What a given function calls | "What does PerformUpgrade call internally?" |
+| 6 | `cpp_get_overrides` | All overrides of a virtual function | "Which overrides exist for PerformUpgrade?" |
+| 7 | `cpp_get_file_symbols` | All symbols in a file | "What's in soc_update.cpp?" |
+| 8 | `cpp_traverse_graph` | Multi-hop graph traversal | "What does changing SocUpdate affect?" |
+| 9 | `cpp_search_docs` | Search project docs | "The OTA upgrade-flow design doc" |
 
-### 工具详情
+### Tool details
 
 #### `cpp_search_class(name, exact=False)`
 
-按类名搜索 C++ 类定义。支持模糊匹配。
+Search C++ class definitions by name. Supports fuzzy matching.
 
 ```
 cpp_search_class("SocUpdate")
-→ ## 搜索结果：类 "SocUpdate"（1 个）
+-> ## Search results: class "SocUpdate" (1)
   ### update::SocUpdate
-  - 文件: soc_update.h:15-120
+  - File: soc_update.h:15-120
 ```
 
 #### `cpp_search_function(name, class_name="")`
 
-按函数名搜索函数定义。可限定所属类名。
+Search function definitions by name. Optionally restrict by owning class.
 
 ```
 cpp_search_function("PerformUpgrade", class_name="SocUpdate")
-→ ## 搜索结果：函数 "PerformUpgrade"（1 个）
+-> ## Search results: function "PerformUpgrade" (1)
   ### SocUpdate::PerformUpgrade [virtual, override]
-  - 签名: void PerformUpgrade() override
-  - 文件: soc_update.cpp:45
+  - Signature: void PerformUpgrade() override
+  - File: soc_update.cpp:45
 ```
 
 #### `cpp_get_inheritance(class_name, direction="down", depth=1)`
 
-查询类的继承关系。`direction="down"` 查子类，`"up"` 查父类。`depth=-1` 递归全部。
+Query inheritance. `direction="down"` for subclasses, `"up"` for base classes. `depth=-1` recurses fully.
 
 ```
 cpp_get_inheritance("BasePeriUpdate", direction="down", depth=-1)
-→ ## BasePeriUpdate 的子类（4 条）
+-> ## Subclasses of BasePeriUpdate (4)
   - update::SocUpdate --public--> BasePeriUpdate
   - update::McuUpdate --public--> BasePeriUpdate
   - ...
@@ -228,63 +295,63 @@ cpp_get_inheritance("BasePeriUpdate", direction="down", depth=-1)
 
 #### `cpp_get_callers(function_name, class_name="")`
 
-查询谁调用了指定函数（影响面分析）。
+Who calls a given function (impact analysis).
 
 ```
 cpp_get_callers("GetSocBootChain")
-→ ## 调用 "GetSocBootChain" 的代码（3 个）
+-> ## Code that calls "GetSocBootChain" (3)
   ### OtaManager::CheckBootChain
-  - 文件: ota_manager.cpp:128
-  - 调用类型: calls_direct
+  - File: ota_manager.cpp:128
+  - Call type: calls_direct
 ```
 
 #### `cpp_get_callees(function_name, class_name="")`
 
-查询指定函数调用了谁（调用链分析）。
+What a given function calls (call-chain analysis).
 
 ```
 cpp_get_callees("PerformUpgrade", class_name="SocUpdate")
-→ ## "PerformUpgrade" 调用的代码（8 个）
+-> ## Code called by "PerformUpgrade" (8)
   ...
 ```
 
 #### `cpp_get_overrides(function_name, class_name)`
 
-查询虚函数的所有重写实现。`class_name` 为声明该虚函数的基类名（必填）。
+All override implementations of a virtual function. `class_name` is the base class that declares the virtual (required).
 
 ```
 cpp_get_overrides("PerformUpgrade", class_name="BasePeriUpdate")
-→ ## "PerformUpgrade" 的重写实现（4 个）
+-> ## Overrides of "PerformUpgrade" (4)
   ### update::SocUpdate::PerformUpgrade
-  - 签名: void PerformUpgrade() override
-  - 文件: soc_update.cpp:45
-  - 重写基类: BasePeriUpdate
+  - Signature: void PerformUpgrade() override
+  - File: soc_update.cpp:45
+  - Overrides base: BasePeriUpdate
 ```
 
 #### `cpp_get_file_symbols(file_path)`
 
-查询文件内的所有类和函数符号。`file_path` 支持部分匹配。
+All class and function symbols in a file. `file_path` supports partial matching.
 
 ```
 cpp_get_file_symbols("soc_update.h")
-→ ## 文件符号：soc_update.h（共 12 个）
-  ### 类/结构体（2 个）
+-> ## File symbols: soc_update.h (12 total)
+  ### Classes/structs (2)
     1. ### [class] update::SocUpdate
-  ### 函数（10 个）
+  ### Functions (10)
     ...
 ```
 
 #### `cpp_traverse_graph(start, relation_types=None, direction="outgoing", depth=3, max_results=50)`
 
-多跳遍历图谱，最灵活的查询。沿指定关系类型遍历关联节点。
+Multi-hop graph traversal — the most flexible query. Walks related nodes along specified relation types.
 
-常用关系类型：`inherits_public`, `inherits_protected`, `overrides`, `belongs_to`, `calls_direct`, `calls_virtual`, `calls_callback`, `doc_describes_code`, `code_refers_to_doc`
+Common relation types: `inherits_public`, `inherits_protected`, `overrides`, `belongs_to`, `calls_direct`, `calls_virtual`, `calls_callback`, `doc_describes_code`, `code_refers_to_doc`
 
 ```
 cpp_traverse_graph("SocUpdate", depth=2, max_results=30)
-→ ## 遍历结果：从 "SocUpdate" 出发（18 个节点）
-  深度: 2, 遍历边数: 22
-  ### 关联节点
+-> ## Traversal results: from "SocUpdate" (18 nodes)
+  Depth: 2, edges traversed: 22
+  ### Related nodes
     - [class] update::SocUpdate (soc_update.h)
     - [class] update::BasePeriUpdate (base_peri_update.h)
     - [function] update::SocUpdate::PerformUpgrade (soc_update.cpp)
@@ -293,159 +360,159 @@ cpp_traverse_graph("SocUpdate", depth=2, max_results=30)
 
 #### `cpp_search_docs(keyword, tag="", max_results=10, min_confidence=0.0)`
 
-搜索项目文档，返回文档切片 + 关联代码。
+Search project docs, returns doc sections + associated code.
 
 ```
 cpp_search_docs("升级", tag="架构设计")
-→ ## 文档搜索："升级"（3 个结果）
-  ### OTA 完整升级流程
-  - 文件: docs/OTA_flow/OTA_COMPLETE_FLOW.md
-  - 字数: 2450
-  - 标签: 架构设计, OTA
+-> ## Doc search: "升级" (3 results)
+  ### OTA complete upgrade flow
+  - File: docs/OTA_flow/OTA_COMPLETE_FLOW.md
+  - Word count: 2450
+  - Tags: 架构设计, OTA
 
-  关联代码:
+  Associated code:
     - [class] BasePeriUpdate confidence=0.92
     - [class] SocUpdate confidence=0.88
 ```
 
 ---
 
-## 📖 CLI 用法
+## 📖 CLI usage
 
-除了 MCP 工具，还提供 CLI 直接查询：
+Besides MCP tools, a CLI is provided for direct queries:
 
 ```bash
-# 搜索类
+# Search a class
 python3 -m cpp_semantic_graph search-class "SocUpdate"
 
-# 查继承
+# Query inheritance
 python3 -m cpp_semantic_graph inheritance "BasePeriUpdate" --direction down --depth -1
 
-# 搜索函数
+# Search a function
 python3 -m cpp_semantic_graph search-func "PerformUpgrade"
 
-# 查文件符号
+# File symbols
 python3 -m cpp_semantic_graph file-symbols "soc_update.cpp"
 
-# 查 include 依赖
+# Include dependencies
 python3 -m cpp_semantic_graph include "base_peri_update.h" --mode all
 
-# 数据库统计
+# DB stats
 python3 -m cpp_semantic_graph stats
 ```
 
-### 增量更新
+### Incremental update
 
-代码修改后，增量更新只重解析受影响的翻译单元：
+After a code change, the incremental update re-parses only affected translation units:
 
 ```bash
-# 基于 git diff（默认 HEAD~1）
+# Based on git diff (default HEAD~1)
 python3 -m cpp_semantic_graph incremental --base HEAD~1
 
-# 手动指定文件
+# Specify files manually
 python3 -m cpp_semantic_graph incremental --files soc_update.cpp,base_peri_update.h
 
-# 仅检测不执行
+# Detect only, don't execute
 python3 -m cpp_semantic_graph incremental --files soc_update.cpp --dry-run
 
-# 跳过文档关联重建（更快）
+# Skip doc-association rebuild (faster)
 python3 -m cpp_semantic_graph incremental --files soc_update.cpp --skip-associations
 ```
 
 ---
 
-## 📐 架构
+## 📐 Architecture
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                  AI 工具层                       │
-│  Claude Code / Cursor / Windsurf / 其他 MCP 客户端 │
+│                  AI tool layer                   │
+│  Claude Code / Cursor / Windsurf / other MCP     │
 └────────────────────┬────────────────────────────┘
-                     │ MCP 协议 (stdio)
+                     │ MCP protocol (stdio)
 ┌────────────────────▼────────────────────────────┐
-│              MCP Server (9 工具)                 │
-│  FastMCP + Lazy Init DB 连接 + Markdown 格式化    │
+│              MCP Server (9 tools)                │
+│  FastMCP + Lazy-init DB connection + Markdown    │
 └────────────────────┬────────────────────────────┘
                      │ Python API
 ┌────────────────────▼────────────────────────────┐
-│                查询层 (query/)                    │
+│                Query layer (query/)              │
 │  GraphQuery │ CallQuery │ PolymorphismQuery      │
-│  TraverseQuery │ DocQuery │ IncludeQuery          │
+│  TraverseQuery │ DocQuery │ IncludeQuery         │
 └────────────────────┬────────────────────────────┘
                      │
 ┌────────────────────▼────────────────────────────┐
-│             数据层 (db/)                         │
-│  SQLite + 9 索引 + CASCADE 约束                  │
+│                Data layer (db/)                  │
+│  SQLite + 9 indexes + CASCADE constraints        │
 │  node │ edge │ include_dep │ parse_status        │
 └─────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────┐
-│              解析层 (parser/)                     │
+│              Parser layer (parser/)              │
 │  AST Visitor (libclang) │ CompileDB │ Config     │
 │  ChangeDetector │ ImpactAnalyzer                 │
 └─────────────────────────────────────────────────┘
 ```
 
-### 核心数据模型
+### Core data model
 
-**节点（node 表）**：类、结构体、函数，含命名空间、文件位置、签名等
+**Nodes (node table)**: classes, structs, functions — with namespace, file location, signature, etc.
 
-**边（edge 表）**：节点间关系，方向约定：
-- `inherits`: from=子类 → to=父类
-- `calls`: from=调用方 → to=被调用方
-- `belongs_to`: from=函数 → to=所属类
-- `overrides`: from=派生类函数 → to=基类函数
+**Edges (edge table)**: relations between nodes; direction convention:
+- `inherits`: from=subclass → to=base class
+- `calls`: from=caller → to=callee
+- `belongs_to`: from=function → to=owning class
+- `overrides`: from=derived function → to=base function
 
-**include_dep 表**：翻译单元的 include 依赖，增量更新的核心依据
-
----
-
-## 🧩 复杂场景说明（模板/别名/友元）
-
-| 特性 | 关系边 | 状态 | 说明 |
-|------|--------|------|------|
-| 类型别名 `using Alias = T` | `type_alias` | ✅ 已启用 | 别名节点入库 + 边关联目标；目标来自外部库时边可能悬空丢弃，别名节点仍保留 `target_type` 元信息 |
-| using 声明 `using B::func` | `using_decl` | ✅ 已启用 | 子类函数 → 基类函数；本项目源码无常规 using 声明，仅 1 处 literal operator 未提取 |
-| 友元 `friend class F` | `friend_of` | ✅ 已启用 | friend → 宿主类；本项目源码无 friend 声明，0 条边符合预期 |
-| 模板实例化 | `instantiates` | ⏸️ 暂未启用 | libclang 不为模板特化产生独立 CLASS_DECL 节点（特化名仅出现在 CONSTRUCTOR/TYPE_REF 的 spelling 中），`walk_preorder` 找不到含 `<` 的类声明，提取无产出。提取器代码保留，待改用 LibTooling 或基于 TYPE_REF 重建时启用 |
-
-> 这部分曾存在"提取器已编写但未集成进 pipeline"的问题（死代码），现已将 AliasExtractor/FriendExtractor 集成进 `SemanticExtractor.parse()`，并用 clangd 实测验证产出。
+**include_dep table**: include dependencies between translation units — the core basis for incremental updates.
 
 ---
 
-## 🔄 增量更新机制
+## 🧩 Complex scenarios (template/alias/friend)
+
+| Feature | Relation edge | Status | Notes |
+|---------|---------------|--------|-------|
+| Type alias `using Alias = T` | `type_alias` | ✅ Enabled | Alias node stored + edge links to target; when the target comes from an external library the edge may be dropped as dangling, but the alias node keeps `target_type` metadata |
+| using-declaration `using B::func` | `using_decl` | ✅ Enabled | Subclass function → base function; this project's source has no ordinary using-declarations, only 1 literal operator not extracted |
+| Friend `friend class F` | `friend_of` | ✅ Enabled | friend → host class; this project's source has no friend declarations, 0 edges as expected |
+| Template instantiation | `instantiates` | ⏸️ Not yet enabled | libclang does not produce a standalone CLASS_DECL node for template specializations (the specialization name only appears in the spelling of CONSTRUCTOR/TYPE_REF), so `walk_preorder` finds no class declaration containing `<` and extraction yields nothing. The extractor code is retained, to be enabled once we switch to LibTooling or rebuild from TYPE_REF |
+
+> This area previously had "extractors written but not wired into the pipeline" (dead code). AliasExtractor/FriendExtractor are now integrated into `SemanticExtractor.parse()`, and output was verified against clangd.
+
+---
+
+## 🔄 Incremental-update mechanism
 
 ```
-1. ChangeDetector  ──→ 检测文件变更（git diff / 手动指定）
-2. ImpactAnalyzer   ──→ 分析影响范围（.h → 递归 includer）
-3. 删除旧数据        ──→ 删出边（不删共享节点）+ include_dep + parse_status
-4. 重新解析          ──→ SemanticExtractor.parse() × 受影响 TU
-5. upsert 新数据     ──→ 节点更新/边去重
-6. 清理残留节点      ──→ 删除文件中已消失的函数/类
-7. 重建文档关联      ──→ content_scan（可选 embedding）
+1. ChangeDetector   ──-> detect file changes (git diff / manual)
+2. ImpactAnalyzer    ──-> analyze blast radius (.h -> recursive includers)
+3. Delete stale data ──-> delete out-edges (not shared nodes) + include_dep + parse_status
+4. Re-parse          ──-> SemanticExtractor.parse() × affected TUs
+5. Upsert new data   ──-> node update / edge dedup
+6. Cleanup remnants  ──-> delete functions/classes no longer in the file
+7. Rebuild doc links ──-> content_scan (optional embedding)
 ```
 
-**删除策略核心**：只删出边（from_id 在该文件的边），保留入边；节点用 upsert 更新。这保证了头文件中共享的类/函数节点不会被误删。
+**Core deletion strategy**: only out-edges (edges whose from_id is in that file) are deleted; in-edges are kept; nodes are updated via upsert. This ensures classes/functions shared in headers are never mistakenly deleted.
 
-| 场景 | 受影响 TU | 更新耗时 |
-|------|----------|---------|
-| 单个 .cpp 变更 | 1 个 | ~11s |
-| 单个 .h 变更 | 递归 includer | 取决于 TU 数（7 TU ~76s） |
-| 幂等性（二次执行） | 不变 | 边数稳定不变 ✅ |
+| Scenario | Affected TUs | Update time |
+|----------|-------------|-------------|
+| Single .cpp change | 1 | ~11s |
+| Single .h change | recursive includers | depends on TU count (7 TUs ~76s) |
+| Idempotency (second run) | unchanged | edge count stable ✅ |
 
-> **注意**：git diff 自动检测模式（`--base HEAD~1`）在 Android repo tool 管理的仓库下可能不工作（`_ensure_repo_root` 会找到 repo 顶层 .git 而非子仓库）。推荐使用 `--files` 手动指定变更文件，更可控。
+> **Note**: the git-diff auto-detect mode (`--base HEAD~1`) may not work under Android repo-tool-managed repos (`_ensure_repo_root` finds the repo top-level `.git` rather than the sub-repo's). Using `--files` to specify changed files manually is more reliable.
 
 ---
 
-## 📚 文档融合
+## 📚 Doc fusion
 
-将项目文档（Markdown）与代码实体双向关联，让 AI 搜索文档时自动定位相关代码。
+Bidirectionally links project docs (Markdown) with code entities, so searching docs auto-locates related code.
 
-**本项目已配置文档融合**：58 个文档 → 546 个切片 → 1,756 条关联边（doc_describes_code + code_refers_to_doc）。`cpp_search_docs` 可直接使用。
+**This project has doc fusion configured**: 58 docs → 546 sections → 1,756 association edges (doc_describes_code + code_refers_to_doc). `cpp_search_docs` works out of the box.
 
-### 配置
+### Configuration
 
-创建 `config/doc_config.yaml`：
+Create `config/doc_config.yaml`:
 
 ```yaml
 doc_dirs:
@@ -455,7 +522,7 @@ exclude_patterns:
   - "*.html"
   - "*/build/*"
 
-# 按目录自动打标签
+# Auto-tag by directory
 tag_rules:
   - path_pattern: "architecture/**"
     tags: ["架构设计"]
@@ -463,10 +530,10 @@ tag_rules:
     tags: ["接口规约"]
 
 section_split:
-  min_level: 2          # 按 ## 切片
-  min_word_count: 20    # 少于 20 字的切片合并
+  min_level: 2          # split on ##
+  min_word_count: 20    # sections under 20 words are merged
 
-# 手动精准关联（不侵入文档原文）
+# Manual precise links (no intrusion into doc text)
 manual_links:
   - doc: "architecture/OTA_FLOW.md"
     heading: "升级流程"
@@ -476,21 +543,21 @@ manual_links:
       - "PerformUpgrade"
 ```
 
-### Embedding 关联（可选）
+### Embedding association (optional)
 
-安装 `sentence-transformers` 后，可基于语义相似度自动关联文档与代码：
+After installing `sentence-transformers`, docs and code can be auto-associated by semantic similarity:
 
 ```bash
 pip install sentence-transformers
 ```
 
-默认使用 `all-MiniLM-L6-v2` 模型。中文项目建议换 `bge-small-zh-v1.5` 或 `multilingual-e5-small`。
+Defaults to `all-MiniLM-L6-v2`. For Chinese projects, `bge-small-zh-v1.5` or `multilingual-e5-small` is recommended.
 
 ---
 
-## 🧪 验证
+## 🧪 Validation
 
-全量解析后可运行正确性验证（与 clangd 交叉比对）：
+After a full parse, you can run correctness validation (cross-checked against clangd):
 
 ```bash
 python3 -m cpp_semantic_graph full-parse \
@@ -501,143 +568,143 @@ python3 -m cpp_semantic_graph full-parse \
 
 ---
 
-## 📋 依赖
+## 📋 Dependencies
 
-### 核心（必装）
+### Core (required)
 
-| 包 | 版本 | 用途 |
-|----|------|------|
-| `clang` | ≥18 | libclang Python 绑定，AST 解析 |
-| `PyYAML` | ≥6.0 | 配置文件解析 |
-| `mcp` | ≥1.0 | MCP 协议实现（FastMCP） |
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `clang` | ≥18 | libclang Python bindings, AST parsing |
+| `PyYAML` | ≥6.0 | Config file parsing |
+| `mcp` | ≥1.0 | MCP protocol implementation (FastMCP) |
 
-### 文档融合（可选）
+### Doc fusion (optional)
 
-| 包 | 版本 | 用途 |
-|----|------|------|
-| `sentence-transformers` | ≥2.0 | 文档-代码语义关联 |
-| `torch` | ≥2.0 | sentence-transformers 依赖 |
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `sentence-transformers` | ≥2.0 | doc-code semantic association |
+| `torch` | ≥2.0 | sentence-transformers dependency |
 
-### 安装
+### Install
 
 ```bash
-# 核心依赖
+# Core
 pip install clang PyYAML mcp
 
-# 文档融合（可选）
+# Doc fusion (optional)
 pip install sentence-transformers
 ```
 
-或使用 requirements.txt：
+Or with requirements files:
 
 ```bash
-pip install -r requirements.txt        # 核心
-pip install -r requirements-docs.txt   # 文档融合（可选）
+pip install -r requirements.txt        # core
+pip install -r requirements-docs.txt   # doc fusion (optional)
 ```
 
 ---
 
-## 🗂️ 项目结构
+## 🗂️ Project structure
 
 ```
 cpp_semantic_graph/
-├── __init__.py                  # 包声明
-├── __main__.py                  # python -m 入口
-├── cli.py                       # CLI 工具（search/inheritance/incremental/...）
-├── pipeline.py                  # 全量解析流水线
-├── incremental_updater.py       # 增量更新编排器
+├── __init__.py                  # package declaration
+├── __main__.py                  # python -m entry point
+├── cli.py                       # CLI tools (search/inheritance/incremental/...)
+├── pipeline.py                  # full-parse pipeline
+├── incremental_updater.py       # incremental-update orchestrator
 │
-├── parser/                      # 解析层
-│   ├── ast_visitor.py           #   AST 提取器（libclang）
-│   ├── config.py                #   项目配置加载
-│   ├── compile_db.py            #   compile_commands.json 解析
-│   ├── change_detector.py       #   文件变更检测（git diff）
-│   ├── impact_analyzer.py       #   影响范围分析
-│   ├── doc_parser.py            #   文档解析器
-│   ├── doc_association.py       #   文档-代码关联
-│   ├── association_ingester.py  #   关联边入库
-│   └── models.py                #   数据模型
+├── parser/                      # parser layer
+│   ├── ast_visitor.py           #   AST extractor (libclang)
+│   ├── config.py                #   project config loading
+│   ├── compile_db.py            #   compile_commands.json parsing
+│   ├── change_detector.py       #   file-change detection (git diff)
+│   ├── impact_analyzer.py       #   blast-radius analysis
+│   ├── doc_parser.py            #   doc parser
+│   ├── doc_association.py       #   doc-code association
+│   ├── association_ingester.py  #   association-edge ingestion
+│   └── models.py                #   data models
 │
-├── query/                       # 查询层
-│   ├── graph_query.py           #   类/函数/文件符号查询
-│   ├── call_query.py            #   调用关系查询
-│   ├── polymorphism_query.py    #   多态体系查询
-│   ├── traverse.py              #   多跳遍历查询
-│   ├── doc_query.py             #   文档融合查询
-│   ├── include_query.py         #   include 依赖查询
-│   ├── architecture_query.py    #   架构概览查询
-│   └── fusion_query.py          #   融合查询
+├── query/                       # query layer
+│   ├── graph_query.py           #   class/function/file-symbol queries
+│   ├── call_query.py            #   call-relation queries
+│   ├── polymorphism_query.py    #   polymorphism queries
+│   ├── traverse.py              #   multi-hop traversal
+│   ├── doc_query.py             #   doc-fusion queries
+│   ├── include_query.py         #   include-dependency queries
+│   ├── architecture_query.py    #   architecture-overview queries
+│   └── fusion_query.py          #   fusion queries
 │
-├── db/                          # 数据层
-│   ├── graph_db.py              #   SQLite 操作
-│   ├── importer.py              #   JSON→SQLite 导入
-│   ├── schema.sql               #   建表+索引
-│   └── relation_types.py        #   关系类型枚举
+├── db/                          # data layer
+│   ├── graph_db.py              #   SQLite operations
+│   ├── importer.py              #   JSON->SQLite import
+│   ├── schema.sql               #   schema + indexes
+│   └── relation_types.py        #   relation-type enum
 │
-├── mcp_server/                  # MCP Server
-│   ├── server.py                #   FastMCP Server + 9 工具
-│   └── run_server.py            #   启动脚本
+├── mcp_server/                  # MCP server
+│   ├── server.py                #   FastMCP server + 9 tools
+│   └── run_server.py            #   launch script
 │
-├── validation/                  # 正确性验证
-│   ├── accuracy_validator.py    #   精度验证器
-│   └── clangd_baseline.py       #   clangd 基线
+├── validation/                  # correctness validation
+│   ├── accuracy_validator.py    #   accuracy validator
+│   └── clangd_baseline.py       #   clangd baseline
 │
-├── config/                      # 配置模板
-│   ├── doc_config.yaml          #   文档配置示例
-│   └── template_whitelist.yaml  #   模板白名单
+├── config/                      # config templates
+│   ├── doc_config.yaml          #   doc-config example
+│   └── template_whitelist.yaml  #   template whitelist
 │
-└── cpp_semantic_graph.yaml      # 项目配置（用户编写）
+└── cpp_semantic_graph.yaml      # project config (user-authored)
 ```
 
 ---
 
 ## ❓ FAQ
 
-### Q: 需要什么版本的 LLVM/libclang？
+### Q: Which LLVM/libclang version do I need?
 
-需要与编译项目时使用的 LLVM 版本匹配。检查方法：
+One matching the LLVM used to compile your project. How to check:
 
 ```bash
-# 查看 clang 版本
+# clang version
 clang --version
 
-# 对应的 libclang 路径
+# corresponding libclang path
 ls /usr/lib/llvm-*/lib/libclang.so*
 ```
 
-在配置文件中指定 `libclang_path`。
+Specify it via `libclang_path` in the config.
 
-### Q: compile_commands.json 怎么生成？
+### Q: How do I generate compile_commands.json?
 
-- **CMake 项目**：`cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ...`
-- **Make 项目**：`bear -- make`
-- **Ninja 项目**：`bear -- ninja`
-- **Bazel 项目**：使用 [bazel-compile-commands](https://github.com/kiron1/bazel-compile-commands)
+- **CMake project**: `cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ...`
+- **Make project**: `bear -- make`
+- **Ninja project**: `bear -- ninja`
+- **Bazel project**: use [bazel-compile-commands](https://github.com/kiron1/bazel-compile-commands)
 
-### Q: 增量更新安全吗？
+### Q: Are incremental updates safe?
 
-是的。删除策略只删出边（from_id 在该文件的边），不删节点。共享头文件中的类/函数节点用 upsert 更新，不会被误删。极端情况（如重命名类）建议全量重建。
+Yes. The deletion strategy only removes out-edges (edges whose from_id is in that file), not nodes. Classes/functions shared in headers are updated via upsert and never mistakenly deleted. For extreme cases (e.g. renaming a class), a full rebuild is recommended.
 
-### Q: 支持哪些 AI 工具？
+### Q: Which AI tools are supported?
 
-所有支持 MCP 协议的 AI 工具：Claude Code、Cursor、Windsurf、Continue 等。MCP Server 使用 stdio 传输，这是最广泛支持的传输方式。
+Any AI tool that supports the MCP protocol: Claude Code, Cursor, Windsurf, Continue, etc. The MCP server uses stdio transport, the most broadly supported transport.
 
-### Q: 数据库有多大？
+### Q: How big is the database?
 
-典型 C++ 项目（~100 个翻译单元）：约 1500 节点 / 5000 边 / 20000 include 关系，SQLite 文件约 5-10 MB。含文档融合时节点数和边数翻倍，DB 约 5-15 MB。
+A typical C++ project (~100 translation units): about 1500 nodes / 5000 edges / 20000 include relations, SQLite file ~5-10 MB. With doc fusion, node and edge counts roughly double, DB ~5-15 MB.
 
-### Q: 和 clangd 有什么区别？
+### Q: How does this differ from clangd?
 
 | | cpp-semantic-graph | clangd |
 |---|---|---|
-| 数据存储 | 离线 SQLite 图谱 | 实时 AST |
-| 查询范围 | 跨文件、跨模块 | 单文件 + 索引 |
-| 调用链 | 完整调用图 + 多跳遍历 | 单跳引用 |
-| 文档关联 | 支持 | 不支持 |
-| 增量更新 | 基于 include 依赖图 | 实时 |
-| 适合场景 | 架构理解、影响面分析 | 实时编辑、签名查看 |
+| Data storage | offline SQLite graph | real-time AST |
+| Query scope | cross-file, cross-module | single file + index |
+| Call chains | full call graph + multi-hop traversal | single-hop references |
+| Doc association | supported | not supported |
+| Incremental update | based on include-dependency graph | real-time |
+| Best for | architecture understanding, blast-radius analysis | real-time editing, signature lookup |
 
-**两者互补**：日常编辑用 clangd，架构理解和影响面分析用 cpp-semantic-graph。
+**They complement each other**: use clangd for day-to-day editing, cpp-semantic-graph for architecture understanding and impact analysis.
 
 ---
 
@@ -647,12 +714,12 @@ MIT License
 
 ---
 
-## 📋 测试报告
+## 📋 Test reports
 
-| 报告 | 说明 |
-|------|------|
-| [TEST_REPORT.md](tests/TEST_REPORT.md) | 综合测试报告（功能/准确性/效率/Bug修复） |
-| [TEST_CASES.md](tests/TEST_CASES.md) | 具体测试用例表（62 条，98.4% 通过） |
-| [TEST_THREE_LAYERS.md](tests/TEST_THREE_LAYERS.md) | 三层测试（问题→工具调用→代码验证，25 条真实问题） |
-| [TEST_DOC_FUSION.md](tests/TEST_DOC_FUSION.md) | 文档融合专项测试（27 条，89% 通过） |
-| [PROJECT_EVALUATION.md](tests/PROJECT_EVALUATION.md) | 项目整体评估（六维评分+对比+结论） |
+| Report | Description |
+|--------|-------------|
+| [TEST_REPORT.md](tests/TEST_REPORT.md) | Comprehensive test report (functionality/accuracy/efficiency/bug-fix) |
+| [TEST_CASES.md](tests/TEST_CASES.md) | Test-case table (62 cases, 98.4% pass) |
+| [TEST_THREE_LAYERS.md](tests/TEST_THREE_LAYERS.md) | Three-layer tests (question→tool call→code verification, 25 real questions) |
+| [TEST_DOC_FUSION.md](tests/TEST_DOC_FUSION.md) | Doc-fusion tests (27 cases, 89% pass) |
+| [PROJECT_EVALUATION.md](tests/PROJECT_EVALUATION.md) | Overall project evaluation (six-dimension scoring + comparison + conclusion) |

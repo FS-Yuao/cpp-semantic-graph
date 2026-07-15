@@ -42,3 +42,6 @@ rebuild.log
 semantic_graph_full.db
 semantic_graph_full.db-wal
 semantic_graph_full.db-shm
+
+# 打包/分发产物(18GB,勿提交)
+du_package/
