@@ -1,4 +1,5 @@
 # cpp-semantic-graph 核心依赖
-clang>=18
+# clang 版本须匹配系统 libclang(本机为 libclang-18;换 LLVM 版本时同步调整此约束)
+clang>=18,<19
 PyYAML>=6.0
 mcp>=1.0

@@ -100,16 +100,23 @@ Common pain points when an AI assistant tries to understand C++ code:
 ### 1. Install
 
 ```bash
-git clone https://github.com/your-org/cpp-semantic-graph.git
+git clone https://github.com/FS-Yuao/cpp-semantic-graph.git
 cd cpp-semantic-graph
 
-# Create a virtual environment
+# 一键创建 venv 并安装核心依赖 (推荐)
+./setup_env.sh
+#   默认在项目内创建 .venv;可选:
+#   ./setup_env.sh /path/to/venv   指定 venv 路径
+#   ./setup_env.sh --with-docs     同时装 doc embedding 依赖 (含 torch,体积大)
+
+# 或手动创建:
 python3 -m venv .venv
 source .venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
 ```
+
+> **前置**: 系统 libclang (匹配 LLVM 版本;Ubuntu: `apt install libclang-18-dev`)。
+> clang bindings 版本须与系统 libclang 一致 (本机 libclang-18 对应 `clang>=18,<19`,换 LLVM 版本时同步改 `requirements.txt`)。
 
 ### 2. Prepare compile_commands.json
 
