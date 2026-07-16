@@ -73,19 +73,37 @@ class DocQuery:
         conn = self.db.conn
         # 搜结构化字段而非整个 JSON 字符串，避免命中 JSON key/无关字段（主题A-6）
         # 如 'ota' 不再因 'data'/'content_hash' 等字段名误匹配
-        sql = """SELECT * FROM node
+        # 按空白拆分关键词：单词保持原行为；多词按 OR 逐词匹配，按命中词数降序排序
+        # 空关键词直接返回空，避免 "%%" 全表扫描
+        words = [w for w in keyword.split() if w]
+        if not words:
+            return []
+
+        # 每个词在 name/doc_title/content_preview 任一命中即算该词命中
+        # 用 ? 占位防 SQL 注入（LIKE 模式单独构造）
+        field_clause = "(name LIKE ? OR doc_title LIKE ? OR content_preview LIKE ?)"
+        where_words = " OR ".join(field_clause for _ in words)
+        sql = f"""SELECT * FROM node
                  WHERE type='doc_section'
-                 AND (name LIKE ?
-                      OR doc_title LIKE ?
-                      OR content_preview LIKE ?)"""
-        params = [f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"]
+                 AND ({where_words})"""
+        params = []
+        for w in words:
+            pat = f"%{w}%"
+            params += [pat, pat, pat]
 
         if tag:
             # tag 是 JSON 数组，用 json_each 精确匹配元素，避免子串误匹配
             sql += " AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)"
             params.append(tag)
 
-        sql += " ORDER BY start_line LIMIT ?"
+        # 按命中词数降序（多词同时命中排前），同级按 start_line 稳定排序
+        hit_expr = " + ".join(
+            f"(CASE WHEN {field_clause} THEN 1 ELSE 0 END)" for _ in words
+        )
+        for w in words:
+            pat = f"%{w}%"
+            params += [pat, pat, pat]
+        sql += f" ORDER BY ({hit_expr}) DESC, start_line LIMIT ?"
         params.append(max_results)
 
         rows = conn.execute(sql, params).fetchall()

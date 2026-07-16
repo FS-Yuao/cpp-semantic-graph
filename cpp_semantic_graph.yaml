@@ -2,15 +2,34 @@
 # 换项目只改这个文件，不改代码
 
 project:
-  name: "hq_ota_service"
+  name: "ap-aa 业务模块"
   # compile_commands.json 路径（相对于项目根目录或绝对路径）
   compile_commands: "/mnt/code1/adc4.0/drive-vendor/ap/ap-aa/compile_commands.json"
 
 # 源码范围定义 — 决定哪些代码算"项目代码"
 # 节点提取和调用关系过滤都基于此
 source_paths:
+  # OTA 升级服务
   - "hq_ota_service/src"
   - "hq_ota_service/include"
+  # 诊断
+  - "hq_diag_app/src"
+  - "hq_diag_did_rid_app/src"
+  # DoIP
+  - "hq_doip_service/src"
+  # 日志
+  - "hq_eth_log_app/src"
+  - "hq_log_app/src"
+  # 状态管理 / 车辆服务
+  - "hq_state_manager/src"
+  - "hq_vehicle_service/src"
+  # util 公共库（did_access/service_base 为 header-only，随业务 TU #include 入库）
+  # 注1：用子目录枚举而非裸 "util"，避免子串匹配误中 peri_utils/src/utils 等
+  # 注2：锚定到 "app/util/<name>" 而非裸 "util/<name>"——裸 "util/log" 会子串命中
+  #      SDK 头 amsr/log/util/log.h，既误提取 8 个 amsr::log SDK 节点，又把路径截成 ".h"
+  - "app/util/did_access"
+  - "app/util/log"
+  - "app/util/service_base"
 
 # 生成代码路径 — 头文件入库接口声明，源文件不入库
 # 调用关系中，callee 在此范围内也保留
