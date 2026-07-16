@@ -678,6 +678,29 @@ ls /usr/lib/llvm-*/lib/libclang.so*
 
 **两者互补**：日常编辑用 clangd，架构理解和影响面分析用 cpp-semantic-graph。
 
+### Q: 为什么有些调用边缺失？（条件编译盲区）
+
+cpp-semantic-graph 的 AST 来自**单一编译配置的预处理翻译单元**——即 `compile_commands.json` 记录的那个配置。C 预处理器在 libclang 见到代码**之前**，就会把当前 `-D` 宏未选中的 `#if` / `#ifdef` / `#else` 分支整段删除，因此落在未选中分支里的函数调用对图谱不可见。`get_callers` / `get_callees` 对这类调用会返回空，哪怕它在源码里明明存在。
+
+这是 libclang 单配置方法的**固有局限，不是 bug**——clangd 同样有此盲区，因为它也只解析一个配置。
+
+**典型形态。** 若函数*签名*位于 `#if` 之外，节点仍然会生成，但落在未选中 `#else` 函数体内的调用会缺失。于是节点存在，却对这些调用没有入边/出边：
+
+```c
+bool Foo::CompareVersion(const char* path) {   // 签名 -> 节点存在
+#if SKIP_CHECK              // 当前配置: SKIP_CHECK == 1, 此分支保留
+  LogWarning("skipped");    // -> 调用边被提取 (Logger::Warning)
+#else                        // 死分支, 预处理器删除
+  ExtractVersion(path);     // -> 无调用边 (libclang 看不到)
+  CompareVersions(...);     // -> 无调用边
+#endif
+}
+```
+
+**如何区分盲区与真实遗漏。** 当 `get_callers` 对某个源码中可见被调用的函数返回空时，先看调用点是否落在 `#if`/`#else` 块内、以及控制宏的当前取值是否选中了该分支。图谱只反映被编译的那个配置，对当前配置而言它是正确的。
+
+**缓解。** 要分析另一个配置，用对应的 `-D` 标志重新生成 `compile_commands.json` 并重建图谱。单一预处理 AST 无法同时呈现所有配置，无法靠一次解析取并集。
+
 ---
 
 ## 📄 License

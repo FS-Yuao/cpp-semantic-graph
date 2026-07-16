@@ -713,6 +713,29 @@ A typical C++ project (~100 translation units): about 1500 nodes / 5000 edges / 
 
 **They complement each other**: use clangd for day-to-day editing, cpp-semantic-graph for architecture understanding and impact analysis.
 
+### Q: Why are some call edges missing? (conditional compilation)
+
+cpp-semantic-graph builds its AST from the **preprocessed** translation unit of a single compile configuration — the one recorded in `compile_commands.json`. The C preprocessor drops every `#if` / `#ifdef` / `#else` branch not selected by the current `-D` flags **before** libclang sees the code, so any function call inside a non-selected branch is invisible to the graph. `get_callers` / `get_callees` return empty for such a call even though it clearly exists in the source.
+
+This is an inherent limitation of the libclang single-config method, **not a bug** — clangd has the same blind spot, since it also parses one configuration.
+
+**Typical shape.** A function whose *signature* sits outside the `#if` still gets a node, but calls inside the non-selected `#else` body are missing. The node therefore exists yet appears to have no callers / no callees for those calls:
+
+```c
+bool Foo::CompareVersion(const char* path) {   // signature -> node exists
+#if SKIP_CHECK              // current config: SKIP_CHECK == 1, this branch kept
+  LogWarning("skipped");    // -> call edge extracted (Logger::Warning)
+#else                        // dead branch, removed by preprocessor
+  ExtractVersion(path);     // -> NO call edge (invisible to libclang)
+  CompareVersions(...);     // -> NO call edge
+#endif
+}
+```
+
+**How to tell a blind spot from a real omission.** If `get_callers` is empty for a function you can see called in source, first check whether the call site is inside a `#if`/`#else` block, and whether the controlling macro's current value selects that branch. The graph only reflects the configuration that was compiled; it is correct for that configuration.
+
+**Mitigation.** To analyze another configuration, regenerate `compile_commands.json` with the corresponding `-D` flags and rebuild the graph. A single preprocessed AST cannot show all configurations at once; there is no way to union them from one parse.
+
 ---
 
 ## 📄 License
