@@ -446,22 +446,25 @@ class AssociationIngester:
             for matched_name in matches:
                 code_id, code_type = all_names[matched_name]
 
-                # 检查是否已有关联边（去重）
-                existing = conn.execute(
-                    """SELECT 1 FROM edge
-                       WHERE from_id=? AND to_id=? AND relation_type=?""",
-                    (doc_id, code_id, RelationType.DOC_DESCRIBES_CODE.value)
-                ).fetchone()
-                if existing:
-                    continue
-
                 confidence = 0.7 if code_type == "class" else 0.6
 
-                # 创建双向边
+                # 创建双向边，各方向独立去重（修复增量后 code_refers_to_doc 不对称丢失）
+                # 背景：增量"只删出边(保留入边)"策略下，code_refers_to_doc(from_id=代码)
+                # 是出边会被 delete_edges_from_file 删，doc_describes_code(from_id=文档/
+                # to_id=代码)是入边保留。若共用一次去重检查(只查 doc_describes_code)，
+                # 入边还在就 continue 跳过整对 -> 被删的 code_refers_to_doc 永不补回，
+                # 双向不对称且每次增量持续衰减。改为分别查每个方向：缺失才插入，
+                # 保证双向对称（见 task_4_1 验收标准：无残留无遗漏）。
                 for rel_type, from_id, to_id in [
                     (RelationType.DOC_DESCRIBES_CODE.value, doc_id, code_id),
                     (RelationType.CODE_REFERS_TO_DOC.value, code_id, doc_id),
                 ]:
+                    existing = conn.execute(
+                        "SELECT 1 FROM edge WHERE from_id=? AND to_id=? AND relation_type=?",
+                        (from_id, to_id, rel_type)
+                    ).fetchone()
+                    if existing:
+                        continue
                     edge_id = self.db.insert_edge(
                         from_id, to_id, rel_type,
                         {

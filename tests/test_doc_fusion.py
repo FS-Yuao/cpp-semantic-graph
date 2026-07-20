@@ -47,16 +47,17 @@ def test_doc_search():
 
     for kw, desc in cases:
         rows = conn.execute(
-            "SELECT id, name, extra_info FROM node WHERE type='doc_section' "
-            "AND (name LIKE ? OR extra_info LIKE ?) LIMIT 10",
-            (f"%{kw}%", f"%{kw}%")
+            "SELECT id, name, tags FROM node WHERE type='doc_section' "
+            "AND (name LIKE ? OR content_preview LIKE ? OR tags LIKE ?) LIMIT 10",
+            (f"%{kw}%", f"%{kw}%", f"%{kw}%")
         ).fetchall()
 
         has_code = False
         tags_set = set()
         for r in rows:
-            extra = json.loads(r[2]) if r[2] else {}
-            for t in extra.get('tags', []):
+            # v4 拆列后 tags 是独立列（JSON 数组字符串），不再是 extra_info JSON 字段
+            tags_list = json.loads(r[2]) if r[2] else []
+            for t in tags_list:
                 tags_set.add(t)
             # check if has code association
             code_cnt = conn.execute(
@@ -191,8 +192,8 @@ def test_efficiency():
             t = time.perf_counter()
             conn.execute(
                 "SELECT id FROM node WHERE type='doc_section' "
-                "AND (name LIKE ? OR extra_info LIKE ?)",
-                (f"%{kw}%", f"%{kw}%")).fetchall()
+                "AND (name LIKE ? OR content_preview LIKE ? OR tags LIKE ?)",
+                (f"%{kw}%", f"%{kw}%", f"%{kw}%")).fetchall()
             ts.append(time.perf_counter() - t)
         graph_ms = min(ts) * 1000
 
