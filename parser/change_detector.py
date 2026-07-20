@@ -190,23 +190,30 @@ class ChangeDetector:
     def _ensure_repo_root(self) -> Path | None:
         """确定 git 仓库根目录
 
-        优先用构造时传入的 repo_root；否则从 source_paths 向上查找 .git。
+        优先用构造时传入的 repo_root；否则从 compile_commands 所在目录
+        向上查找有效的 .git 仓库根。
+
+        有效性校验：.git 须含 HEAD（标准仓库/bare 仓库/repo 工具的符号链接
+        均含 HEAD），以此排除损坏的空 .git 目录（如顶层 adc4.0/.git），
+        避免误判为仓库根导致 git diff 失败、增量检测返回空。
+
+        注：compile_commands 通常位于仓库根（ap-aa/compile_commands.json），
+        故从其所在目录开始查；此前用 parent.parent 会跳过仓库根本身。
         """
         if self.repo_root and self.repo_root.exists():
             return self.repo_root
 
-        # 从 source_paths 的实际路径向上找 .git
-        for sp in self.config.source_paths:
-            # source_paths 形如 "hq_ota_service/src"，需结合 compile_commands 所在路径
-            # compile_commands 是绝对路径，其父目录通常是项目根
-            cc_dir = Path(self.config.compile_commands).parent.parent
-            candidate = cc_dir
-            for _ in range(6):
-                if (candidate / ".git").exists():
+        candidate = Path(self.config.compile_commands).parent
+        for _ in range(8):
+            git_dir = candidate / ".git"
+            if git_dir.exists():
+                # .git 可能是目录(标准/bare 仓库)、符号链接(repo 工具子模块)、
+                # 或 file(gitdir 指针)。三者都含 HEAD；空 .git 目录无 HEAD，跳过。
+                if (git_dir / "HEAD").exists() or git_dir.is_file():
                     return candidate
-                if candidate.parent == candidate:
-                    break
-                candidate = candidate.parent
+            if candidate.parent == candidate:
+                break
+            candidate = candidate.parent
         return None
 
     def _run_git_diff(self, repo_root: str, base_ref: str) -> list[tuple[str, str]]:
