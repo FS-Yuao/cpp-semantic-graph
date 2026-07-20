@@ -391,6 +391,29 @@ python3 -m cpp_semantic_graph incremental --files soc_update.cpp --dry-run
 python3 -m cpp_semantic_graph incremental --files soc_update.cpp --skip-associations
 ```
 
+### 惰性增量（MCP 自动）
+
+MCP 工具调用时自动检测新合入 commit，有才增量一次，同一 commit no-op
+（[task_4_5](docs/task/cpp_semantic_graph/task_4_5_mcp_lazy_incremental.md)）。
+无需手动跑 `incremental`，代码合入后图谱自动跟上。
+
+- **基准是 commit**（合入），不碰工作区未提交改动
+- **rev-parse 节流**：查询时 `git rev-parse HEAD`（<1ms）比较 `last_incremented_ref`，
+  相同 no-op，不同才增量
+- **阈值降级**：变更文件数超 `lazy_increment.threshold`（默认 20）跳过同步增量 + warning，
+  查询先用旧图谱，提示手动跑
+- **连接刷新**：增量后查询连接自动重建
+
+配置（`cpp_semantic_graph.yaml`）：
+
+```yaml
+lazy_increment:
+  enabled: true     # false=仅手动 CLI incremental
+  threshold: 20     # 变更文件数超此跳过同步增量
+```
+
+关闭后回退到手动 CLI（见上节）。
+
 ---
 
 ## 📐 架构

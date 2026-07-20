@@ -73,3 +73,10 @@ docs_config: "config/doc_config.yaml"
 # 文档根目录（相对于此配置文件所在目录，或绝对路径）
 # 迁移到 /mnt/code1/cpp_semantic_graph 后用绝对路径，避免 ../../docs 解析到 /mnt/docs
 docs_dir: "/mnt/code1/adc4.0/drive-vendor/ap/ap-aa/app/hq_ota_service/docs"
+
+# 惰性增量（task_4_5: MCP 查询时检测新 commit 才增量，同一 commit no-op）
+# enabled: true=开启（MCP 查询时 rev-parse 节流）；false=仅手动 CLI incremental
+# threshold: 变更文件数超此值跳过同步增量（降级提示手动跑），避免阻塞查询过久
+lazy_increment:
+  enabled: true
+  threshold: 20
