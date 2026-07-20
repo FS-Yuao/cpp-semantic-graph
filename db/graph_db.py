@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 #        3 = extra_info JSON 拆入独立列（docs/extra_info_columnar_design.md）
 #        4 = 清 needs_resolution 陈旧标记 + DROP extra_info 列（列成为唯一数据源，
 #            docs/task/p1_needs_resolution_drop_extrainfo_design.md）
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 # ── v3: extra_info → 列 映射 ──
@@ -265,11 +265,26 @@ class GraphDB:
         """P2-6：记录/校验 schema 版本（PRAGMA user_version）。
 
         - 新库（user_version=0）：写入当前 SCHEMA_VERSION。
-        - 旧库版本 < 当前：仅告警（不自动迁移，避免静默破坏数据），提示重建。
+        - v4->v5：仅加 incremental_state 表（_init_schema IF NOT EXISTS 已建），
+          结构兼容，自动升版本不告警。
+        - 更低旧库版本（<4，涉及列变更）：仅告警，提示重建。
         """
         cur_ver = self.conn.execute("PRAGMA user_version").fetchone()[0]
         if cur_ver == 0:
             self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        elif cur_ver == 4 and SCHEMA_VERSION >= 5:
+            # v4->v5 仅加 incremental_state 表，_init_schema 已 IF NOT EXISTS 建。
+            # 确认表存在再升（防 _init_schema 异常未建表的极端情况）。
+            tbl = self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='incremental_state'"
+            ).fetchone()
+            if tbl:
+                self.conn.execute("PRAGMA user_version=5")
+                logger.info("DB schema v4->v5：incremental_state 表已就绪，自动升版本")
+            else:
+                logger.warning(
+                    "DB schema v4 但 incremental_state 表缺失，建议 full-parse 重建: %s",
+                    self.db_path)
         elif cur_ver < SCHEMA_VERSION:
             logger.warning(
                 "DB schema 版本 %d < 当前 %d，可能与新代码不兼容（如 unique_key 格式），"
@@ -414,6 +429,26 @@ class GraphDB:
     def close(self):
         """关闭数据库连接"""
         self.conn.close()
+
+    # ── 增量状态（task_4_5: MCP 惰性增量节流）──
+    def get_last_incremented_ref(self) -> str:
+        """读取上次增量到的 commit hash（惰性增量 rev-parse 节流用）
+
+        返回空串表示首次/未记录（调用方应记录当前 HEAD 不增量）。
+        """
+        row = self.conn.execute(
+            "SELECT value FROM incremental_state WHERE key='last_incremented_ref'"
+        ).fetchone()
+        return row[0] if row else ""
+
+    def set_last_incremented_ref(self, ref: str) -> None:
+        """记录上次增量到的 commit hash（增量成功后调用）"""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO incremental_state(key, value, updated_at) "
+            "VALUES('last_incremented_ref', ?, datetime('now'))",
+            (ref,)
+        )
+        self._commit()
 
     def _commit(self):
         """提交事务（当 _autocommit=True 时生效，否则由外部事务控制）"""

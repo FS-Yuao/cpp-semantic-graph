@@ -216,6 +216,31 @@ class ChangeDetector:
             candidate = candidate.parent
         return None
 
+    def get_current_ref(self) -> str | None:
+        """获取当前 HEAD commit hash（task_4_5 惰性增量节流用）
+
+        MCP 查询时 rev-parse 比较 last_incremented_ref，判断是否有新合入 commit。
+
+        Returns:
+            commit hash；repo_root 推断失败或 git 命令失败时返回 None。
+        """
+        repo_root = self._ensure_repo_root()
+        if not repo_root:
+            return None
+        env = {**os.environ, "GIT_DISCOVERY_ACROSS_FILESYSTEM": "1"}
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+                capture_output=True, text=True, env=env, timeout=5,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            logger.warning("git rev-parse HEAD 失败: %s", e)
+            return None
+        if result.returncode != 0:
+            logger.warning("git rev-parse HEAD 返回非零: %s", result.stderr.strip())
+            return None
+        return result.stdout.strip() or None
+
     def _run_git_diff(self, repo_root: str, base_ref: str) -> list[tuple[str, str]]:
         """执行 git diff，返回 (status, path) 列表
 

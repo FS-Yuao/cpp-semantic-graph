@@ -91,11 +91,109 @@ _pq: PolymorphismQuery | None = None
 _tq: TraverseQuery | None = None
 _dq: DocQuery | None = None
 
+# task_4_5: 惰性增量状态（进程内缓存，避免每次查询都读 DB/git）
+_lazy_config = None            # ProjectConfig 缓存（首次 from_yaml 后复用）
+_lazy_config_loaded = False    # config 是否已尝试加载（None 也算加载过，避免重试）
+_last_checked_head = ""        # 上次查询时的 HEAD（同 commit 不重复读 DB）
+
+
+def _load_config_for_lazy():
+    """从 DB 同目录读 cpp_semantic_graph.yaml（复用 _infer_project_name 策略2）
+
+    惰性增量需要 config（compile_commands/source_paths/repo_root 推断）。
+    缓存首次加载结果，避免每次查询都 from_yaml。
+    """
+    global _lazy_config, _lazy_config_loaded
+    if _lazy_config_loaded:
+        return _lazy_config
+    _lazy_config_loaded = True
+    try:
+        yaml_path = Path(_db_path).parent / "cpp_semantic_graph.yaml"
+        if yaml_path.exists():
+            from cpp_semantic_graph.parser.config import ProjectConfig
+            _lazy_config = ProjectConfig.from_yaml(str(yaml_path))
+    except Exception as e:
+        logger.warning("加载 config 失败（惰性增量禁用）: %s", e)
+    return _lazy_config
+
+
+def _ensure_fresh() -> None:
+    """task_4_5: 惰性增量--查询前检测新合入 commit，有才增量一次，同一 commit no-op
+
+    流程：
+    1. lazy_increment_enabled=False / config 缺失 -> return（功能关闭）
+    2. git rev-parse HEAD（<1ms）；失败 -> return（降级用旧图谱）
+    3. head == _last_checked_head -> return（同 commit 不重复读 DB）
+    4. 读 last_incremented_ref；为空（首次）-> 记录 HEAD 不增量，return
+    5. head == last_ref -> no-op return
+    6. 变更文件数 > threshold -> warning + return（降级提示手动跑）
+    7. 跑增量 base_ref=last_ref（record_state=True 更新 last_ref=HEAD）
+    8. 刷新查询连接（_gq 等置 None，下次 _get_queries 重建）
+    任何异常 -> warning + return（查询用旧图谱，不阻塞）
+    """
+    global _gq, _cq, _pq, _tq, _dq, _last_checked_head
+    try:
+        config = _load_config_for_lazy()
+        if config is None or not config.lazy_increment_enabled:
+            return
+        from cpp_semantic_graph.parser.change_detector import ChangeDetector
+        detector = ChangeDetector(None, config)
+        head = detector.get_current_ref()
+        if not head:
+            return  # 非 git 仓库 / repo_root 推断失败，降级用旧图谱
+        # 同 commit 不重复读 DB（rev-parse 节流核心）
+        if head == _last_checked_head:
+            return
+        _last_checked_head = head
+
+        from cpp_semantic_graph.db.graph_db import GraphDB
+        db = GraphDB(_db_path)
+        try:
+            last_ref = db.get_last_incremented_ref()
+            if not last_ref:
+                # 首次：记录当前 HEAD，不增量（full-parse 已是最新）
+                db.set_last_incremented_ref(head)
+                logger.info("惰性增量首次：记录 last_incremented_ref=%s", head[:12])
+                return
+            if head == last_ref:
+                return  # no-op，同一 commit
+        finally:
+            db.close()
+
+        # 有新合入 commit：算变更文件数（阈值降级判断）
+        changes = detector.detect_from_git(last_ref)
+        n = len(changes.all_changed)
+        if n == 0:
+            # hash 不同但无 diff（空 commit / last_ref 被 reset）：直接记录 HEAD
+            db2 = GraphDB(_db_path)
+            try:
+                db2.set_last_incremented_ref(head)
+            finally:
+                db2.close()
+            return
+        if n > config.lazy_increment_threshold:
+            logger.warning(
+                "检测到 %d 个变更文件（超阈值 %d），跳过同步增量，请手动跑 "
+                "`python -m cpp_semantic_graph incremental`。查询使用旧图谱。",
+                n, config.lazy_increment_threshold)
+            return
+        # 变更量可接受：跑增量（record_state=True 会更新 last_ref=HEAD）
+        from cpp_semantic_graph.incremental_updater import IncrementalUpdater
+        updater = IncrementalUpdater(config.config_path, _db_path)
+        report = updater.run(base_ref=last_ref, record_state=True)
+        logger.info("惰性增量：%d 文件变更，%d TU 重解析（%d 失败）",
+                    report.files_changed, report.tus_reparsed, report.tus_failed)
+        # 刷新查询连接（增量后 DB 已变，旧连接指向旧数据）
+        _gq = _cq = _pq = _tq = _dq = None
+    except Exception as e:
+        logger.warning("惰性增量失败，查询用旧图谱: %s", e)
+
 
 def _get_queries() -> tuple[GraphQuery, CallQuery, PolymorphismQuery,
                              TraverseQuery, DocQuery]:
     """Lazy init：首次调用时建立 DB 连接"""
     global _gq, _cq, _pq, _tq, _dq
+    _ensure_fresh()  # task_4_5: 惰性增量（有新 commit 才增量，同一 commit no-op）
     if _gq is None:
         if not _db_path or not Path(_db_path).exists():
             raise FileNotFoundError(f"图谱数据库不存在: {_db_path}")

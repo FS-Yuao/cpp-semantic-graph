@@ -86,7 +86,8 @@ class IncrementalUpdater:
             rebuild_associations: bool = True,
             rebuild_embeddings: bool = False,
             doc_only: bool = False,
-            dry_run: bool = False) -> IncrementalReport:
+            dry_run: bool = False,
+            record_state: bool = True) -> IncrementalReport:
         """执行增量更新
 
         Args:
@@ -96,6 +97,8 @@ class IncrementalUpdater:
             rebuild_embeddings: 是否重建 embedding 关联（慢）
             doc_only: 仅增量入库文档变更（不解析 C++ 代码）
             dry_run: 只检测+分析，不执行删除/解析
+            record_state: 成功后写 last_incremented_ref=HEAD（task_4_5 惰性增量
+                          节流；CLI/MCP 共享状态，下次 MCP 查询 no-op）
 
         Returns:
             IncrementalReport
@@ -221,6 +224,9 @@ class IncrementalUpdater:
                 if rebuild_associations:
                     self._rebuild_associations(rebuild_embeddings)
                     report.associations_rebuilt = True
+                # --- 7.5. 记录增量进度（task_4_5 惰性增量节流）---
+                if record_state:
+                    self._record_incremental_state(detector, db)
             else:
                 logger.warning("主事务回滚，跳过文档入库与关联重建以保持一致")
 
@@ -235,6 +241,21 @@ class IncrementalUpdater:
 
         report.elapsed_seconds = time.time() - t0
         return report
+
+    def _record_incremental_state(self, detector: "ChangeDetector",
+                                  db: GraphDB) -> None:
+        """记录增量进度到 incremental_state（task_4_5 惰性增量节流）
+
+        增量成功后写 last_incremented_ref = 当前 HEAD，使 MCP 惰性增量
+        下次查询 no-op（同一 commit 不重复增量）。失败不影响增量结果（只 warning）。
+        """
+        try:
+            head = detector.get_current_ref()
+            if head:
+                db.set_last_incremented_ref(head)
+                logger.info("记录 last_incremented_ref=%s", head[:12])
+        except Exception as e:
+            logger.warning("记录增量进度失败（不影响增量结果）: %s", e)
 
     # ------------------------------------------------------------------
     # 删除旧数据

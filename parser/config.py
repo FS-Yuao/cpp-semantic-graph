@@ -30,6 +30,9 @@ class ProjectConfig:
     docs_dir: str = ""
     docs_config: str = ""
     config_path: str = ""
+    # task_4_5: MCP 惰性增量
+    lazy_increment_enabled: bool = True   # 查询时检测新 commit 才增量
+    lazy_increment_threshold: int = 20    # 变更文件数超此跳过同步增量（降级手动）
 
     @classmethod
     def from_yaml(cls, yaml_path: str) -> "ProjectConfig":
@@ -80,6 +83,8 @@ class ProjectConfig:
             docs_dir=docs_dir_abs,
             docs_config=docs_config_abs,
             config_path=str(path.resolve()),
+            lazy_increment_enabled=data.get("lazy_increment", {}).get("enabled", True),
+            lazy_increment_threshold=data.get("lazy_increment", {}).get("threshold", 20),
         )
 
     @property

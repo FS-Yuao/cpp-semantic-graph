@@ -111,6 +111,14 @@ CREATE TABLE IF NOT EXISTS parse_status (
   file_hash TEXT                -- 文件内容 hash，用于增量更新检测
 );
 
+-- 增量状态表：记录惰性增量进度（last_incremented_ref = 上次增量到的 commit）
+-- task_4_5: MCP 惰性增量，rev-parse HEAD 比较 last_ref，有新 commit 才增量
+CREATE TABLE IF NOT EXISTS incremental_state (
+  key TEXT PRIMARY KEY,          -- 状态键（如 'last_incremented_ref'）
+  value TEXT,                     -- 状态值（commit hash 等）
+  updated_at TEXT DEFAULT (datetime('now'))
+);
+
 -- 索引
 -- 原有索引
 --   idx_node_unique_key    ← node.unique_key UNIQUE 自动建索引
