@@ -42,6 +42,7 @@ from cpp_semantic_graph.query.call_query import CallQuery
 from cpp_semantic_graph.query.polymorphism_query import PolymorphismQuery
 from cpp_semantic_graph.query.traverse import TraverseQuery
 from cpp_semantic_graph.query.doc_query import DocQuery
+from cpp_semantic_graph.query.blast_radius_query import BlastRadiusQuery
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,7 @@ _cq: CallQuery | None = None
 _pq: PolymorphismQuery | None = None
 _tq: TraverseQuery | None = None
 _dq: DocQuery | None = None
+_bq: BlastRadiusQuery | None = None
 
 # task_4_5: 惰性增量状态（进程内缓存，避免每次查询都读 DB/git）
 _lazy_config = None            # ProjectConfig 缓存（首次 from_yaml 后复用）
@@ -131,7 +133,7 @@ def _ensure_fresh() -> None:
     8. 刷新查询连接（_gq 等置 None，下次 _get_queries 重建）
     任何异常 -> warning + return（查询用旧图谱，不阻塞）
     """
-    global _gq, _cq, _pq, _tq, _dq, _last_checked_head
+    global _gq, _cq, _pq, _tq, _dq, _bq, _last_checked_head
     try:
         config = _load_config_for_lazy()
         if config is None or not config.lazy_increment_enabled:
@@ -184,7 +186,7 @@ def _ensure_fresh() -> None:
         logger.info("惰性增量：%d 文件变更，%d TU 重解析（%d 失败）",
                     report.files_changed, report.tus_reparsed, report.tus_failed)
         # 刷新查询连接（增量后 DB 已变，旧连接指向旧数据）
-        _gq = _cq = _pq = _tq = _dq = None
+        _gq = _cq = _pq = _tq = _dq = _bq = None
     except Exception as e:
         logger.warning("惰性增量失败，查询用旧图谱: %s", e)
 
@@ -203,6 +205,17 @@ def _get_queries() -> tuple[GraphQuery, CallQuery, PolymorphismQuery,
         _tq = TraverseQuery(_db_path)
         _dq = DocQuery(_db_path)
     return _gq, _cq, _pq, _tq, _dq
+
+
+def _get_blast() -> BlastRadiusQuery:
+    """Lazy init：首次调用时建立 BlastRadiusQuery"""
+    global _bq
+    _ensure_fresh()
+    if _bq is None:
+        if not _db_path or not Path(_db_path).exists():
+            raise FileNotFoundError(f"图谱数据库不存在: {_db_path}")
+        _bq = BlastRadiusQuery(_db_path)
+    return _bq
 
 
 def _query_error(e: Exception) -> str:
@@ -314,6 +327,82 @@ def _fmt_traverse_node(node: dict) -> str:
     ntype = node.get("type", "")
     ns_prefix = f"{ns}::" if ns else ""
     return f"  - [{ntype}] {ns_prefix}{name} ({fp})\n"
+
+
+def _fmt_blast_radius(result, direction: str) -> str:
+    """格式化爆炸半径结果
+
+    输出：起点 → 展开的 override/子类 → 按跳数分层的受影响文件清单
+    """
+    if not result.affected_nodes and not result.expanded_overrides \
+            and not result.expanded_subclasses:
+        return "## 爆炸半径\n\n未找到受影响代码（起点可能无调用方或为叶子节点）。\n"
+
+    dir_text = "受影响（被谁调用）" if direction == "up" else "依赖（调用了谁）"
+    n_files = len(result.affected_files)
+    n_nodes = len(result.affected_nodes)
+
+    lines = [f"## 爆炸半径（{dir_text}）\n\n"]
+    lines.append(f"共 **{n_files} 个文件**需 review，{n_nodes} 个受影响符号，"
+                 f"最大跳数 {result.max_depth_reached}\n\n")
+
+    # 起点符号
+    if result.origin_functions:
+        lines.append("### 起点函数\n\n")
+        for fo in result.origin_functions:
+            vflag = " [虚函数]" if fo.get("is_virtual") else ""
+            cls = f"{fo['class_name']}::" if fo.get("class_name") else ""
+            lines.append(f"- {cls}{fo['name']}{vflag} ({fo['file_path']})\n")
+    if result.origin_classes:
+        lines.append("\n### 起点类\n\n")
+        for co in result.origin_classes:
+            lines.append(f"- {co['name']} ({co['file_path']})\n")
+
+    # 展开的 override / 子类
+    if result.expanded_overrides:
+        lines.append(f"\n### 展开的虚函数 override（{len(result.expanded_overrides)} 个，需同步修改）\n\n")
+        for o in result.expanded_overrides:
+            lines.append(f"- {o['class_name']}::{o['function_name']} ({o['file_path']})\n")
+    if result.expanded_subclasses:
+        lines.append(f"\n### 展开的直接子类（{len(result.expanded_subclasses)} 个）\n\n")
+        for s in result.expanded_subclasses:
+            lines.append(f"- {s['name']} ({s['file_path']})\n")
+
+    # 按跳数分层的受影响文件
+    lines.append("\n### 受影响文件（按跳数分层）\n\n")
+    # 按 depth 分组文件
+    depth_files: dict[int, list[tuple[str, BlastNode]]] = {}
+    # 重新按 depth 组织（同一文件可能多跳都有，取该文件最小跳数归层）
+    file_min_depth: dict[str, int] = {}
+    for fp, nodes in result.affected_files.items():
+        file_min_depth[fp] = min(n.depth for n in nodes)
+
+    for fp in sorted(file_min_depth, key=lambda f: (file_min_depth[f], f)):
+        d = file_min_depth[fp]
+        depth_files.setdefault(d, []).append((fp, result.affected_files[fp]))
+
+    hop_label = {1: "直接受影响", 2: "2 跳", 3: "3 跳", 4: "4 跳", 5: "5 跳"}
+    for d in sorted(depth_files):
+        label = hop_label.get(d, f"{d} 跳")
+        lines.append(f"#### {label}（{len(depth_files[d])} 个文件）\n\n")
+        for fp, nodes in depth_files[d]:
+            # 该文件受影响的符号明细
+            sym_strs = []
+            for n in nodes:
+                if n.depth == d:
+                    cls = f"{n.class_name}::" if n.class_name else ""
+                    ct = f" [{n.call_type}]" if n.call_type else ""
+                    sym_strs.append(f"{cls}{n.function_name}{ct}")
+            lines.append(f"- {fp} ← {', '.join(sym_strs[:5])}")
+            if len(sym_strs) > 5:
+                lines.append(f" ... 共 {len(sym_strs)} 个符号")
+            lines.append("\n")
+
+    if result.truncated:
+        lines.append(f"\n> ⚠ 结果已截断至 {BlastRadiusQuery.MAX_NODES} 个节点，"
+                     "可能未列全。可缩小 depth 或细化起点。\n")
+
+    return "".join(lines)
 
 
 # ── MCP 工具定义 ──
@@ -562,6 +651,48 @@ def cpp_traverse_graph(start: str, relation_types: list[str] | None = None,
             lines.append(f"  ... 共 {len(result.edges)} 条\n")
 
     return "".join(lines)
+
+
+@mcp.tool()
+def cpp_blast_radius(symbols: list[str] | None = None,
+                     files: list[str] | None = None,
+                     depth: int = 3,
+                     include_overrides: bool = True,
+                     include_subclasses: bool = True,
+                     direction: str = "up") -> str:
+    """计算改动爆炸半径：输入改动的符号/文件，返回受影响文件清单 + 分层调用链。用于：改动前评估影响面、确定 review 范围、定位多态调度受影响方。比 cpp_get_callers（一跳）更全：递归追多层 + 虚函数 override 展开 + 文件维度去重 + 按跳数分层。
+
+    方向语义：direction="up"（默认）= 谁受影响（被谁调用，改动向后传播）;
+             "down" = 依赖什么（调用了谁，前置依赖）。
+
+    Args:
+        symbols: 改动符号名列表（函数名/类名，支持 "Class::func" 形式）
+        files: 改动文件路径列表（部分匹配，自动展开为文件内符号）
+        depth: 最大递归跳数 [1,5]（1=只看直接受影响，3=默认）
+        include_overrides: 是否展开虚函数 override（多态调度方受影响，默认开）
+        include_subclasses: 是否展开类的直接子类（默认开）
+        direction: "up"=谁受影响（默认）/"down"=依赖什么
+    """
+    # 输入边界校验（主题D）
+    if direction not in ("up", "down"):
+        return 'direction 必须是 "up" 或 "down"'
+    if depth < 1 or depth > 5:
+        return "depth 范围 [1, 5]（1=直接受影响，5=最深，过大易膨胀）"
+    if not symbols and not files:
+        return "至少提供 symbols 或 files 之一"
+
+    try:
+        bq = _get_blast()
+        result = bq.compute(
+            symbols=symbols, files=files, depth=depth,
+            include_overrides=include_overrides,
+            include_subclasses=include_subclasses,
+            direction=direction,
+        )
+    except Exception as e:
+        return _query_error(e)
+
+    return _fmt_blast_radius(result, direction)
 
 
 @mcp.tool()
