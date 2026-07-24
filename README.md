@@ -249,7 +249,7 @@ Configuration is similar; refer to each tool's MCP docs. The core parameters:
 
 ---
 
-## 🛠️ 9 MCP tools
+## 🛠️ 10 MCP tools
 
 | # | Tool | Purpose | Typical scenario |
 |---|------|---------|------------------|
@@ -262,6 +262,7 @@ Configuration is similar; refer to each tool's MCP docs. The core parameters:
 | 7 | `cpp_get_file_symbols` | All symbols in a file | "What's in soc_update.cpp?" |
 | 8 | `cpp_traverse_graph` | Multi-hop graph traversal | "What does changing SocUpdate affect?" |
 | 9 | `cpp_search_docs` | Search project docs | "The OTA upgrade-flow design doc" |
+| 10 | `cpp_blast_radius` | Blast radius of a change (recursive callers + override expansion + file aggregation) | "I'm changing PerformUpgrade — which files must I review?" |
 
 ### Tool details
 

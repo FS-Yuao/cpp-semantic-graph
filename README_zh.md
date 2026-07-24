@@ -4,7 +4,7 @@
 
 [English](README.md)
 
-为 AI 编程助手（Claude Code、Cursor、Windsurf 等）构建 C++ 代码的语义知识图谱，通过 [MCP 协议](https://modelcontextprotocol.io/) 暴露 9 个查询工具，让 AI 能直接搜索类定义、查继承关系、追踪调用链、分析影响面——无需翻文件、无需 grep。
+为 AI 编程助手（Claude Code、Cursor、Windsurf 等）构建 C++ 代码的语义知识图谱，通过 [MCP 协议](https://modelcontextprotocol.io/) 暴露 10 个查询工具，让 AI 能直接搜索类定义、查继承关系、追踪调用链、分析影响面——无需翻文件、无需 grep。
 
 ## 本项目为何存在：用 clang，而非 tree-sitter
 
@@ -57,7 +57,7 @@ AI 编程助手理解 C++ 代码的常见痛点：
 
 ## ✨ 核心特性
 
-- **9 个 MCP 工具**：类搜索、函数搜索、继承关系、调用链（caller/callee）、override、文件符号、多跳遍历、文档搜索
+- **10 个 MCP 工具**：类搜索、函数搜索、继承关系、调用链（caller/callee）、override、文件符号、多跳遍历、文档搜索、改动爆炸半径
 - **增量更新**：基于 include 依赖图，改一个 `.cpp` 秒级刷新（16× 快于全量重建）
 - **文档融合**：项目文档与代码双向关联，搜索文档时自动定位相关代码
 - **开箱即用**：一个 YAML 配置 + `compile_commands.json` 即可启动，MCP Server 自动注册到 AI 工具
@@ -214,7 +214,7 @@ python3 -m cpp_semantic_graph.mcp_server.server
 
 ---
 
-## 🛠️ 9 个 MCP 工具
+## 🛠️ 10 个 MCP 工具
 
 | # | 工具名 | 用途 | 典型场景 |
 |---|--------|------|---------|
@@ -227,6 +227,7 @@ python3 -m cpp_semantic_graph.mcp_server.server
 | 7 | `cpp_get_file_symbols` | 查询文件内的所有符号 | "soc_update.cpp 里有什么？" |
 | 8 | `cpp_traverse_graph` | 多跳遍历图谱 | "修改 SocUpdate 会影响什么？" |
 | 9 | `cpp_search_docs` | 搜索项目文档 | "OTA 升级流程的设计文档" |
+| 10 | `cpp_blast_radius` | 改动爆炸半径（递归调用方 + 虚函数 override 展开 + 文件聚合 + 按跳数分层） | "我要改 PerformUpgrade，哪些文件必须 review？" |
 
 ### 工具详情
 
