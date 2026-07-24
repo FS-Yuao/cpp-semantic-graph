@@ -1,6 +1,6 @@
 """C++ 语义图谱 MCP Server
 
-按 MCP 协议封装查询能力，暴露 9 个工具，让 AI 直接查图谱。
+按 MCP 协议封装查询能力，暴露 11 个工具，让 AI 直接查图谱。
 
 用法:
   # 环境变量指定 DB 路径
@@ -317,6 +317,23 @@ def _fmt_doc_result(dw) -> str:
             lines.append(f"  - [{rc['type']}] {rc.get('namespace', '')}::{rc['name']}"
                          f" ({rc.get('file_path', '')})"
                          f" confidence={rc.get('confidence', 0):.2f}\n")
+    return "".join(lines)
+
+
+def _fmt_doc_section(d) -> str:
+    """格式化单个文档切片（用于 cpp_get_code_docs 反向查询，不含关联代码）"""
+    lines = [f"### {d.title}\n"]
+    if d.doc_title:
+        lines.append(f"- 文档: {d.doc_title}\n")
+    lines.append(f"- 文件: {d.file_path}:{d.start_line}-{d.end_line}\n")
+    lines.append(f"- 字数: {d.word_count}\n")
+    if d.tags:
+        lines.append(f"- 标签: {', '.join(d.tags)}\n")
+    if d.content_preview:
+        preview = d.content_preview[:300]
+        if len(d.content_preview) > 300:
+            preview += "..."
+        lines.append(f"\n> {preview}\n")
     return "".join(lines)
 
 
@@ -697,14 +714,18 @@ def cpp_blast_radius(symbols: list[str] | None = None,
 
 @mcp.tool()
 def cpp_search_docs(keyword: str, tag: str = "", max_results: int = 10,
-                     min_confidence: float = 0.0) -> str:
+                     min_confidence: float = 0.7) -> str:
     """搜索项目文档，返回文档切片+关联代码。用于：查设计说明、找任务文档、理解架构决策。搜索文档标题和内容，同时定位到相关代码实现。
+
+    注意：min_confidence 默认 0.7，过滤低质量共现关联（confidence=0.6 的占 63%，
+    多为关键词共现的泛类，如文档讲"刷写"却关联到 Data/Response 等泛化结构）。
+    如需查看全部关联（含低质量），显式传 min_confidence=0.0。
 
     Args:
         keyword: 搜索关键词（如 "升级"、"OTA"、"刷写"）
         tag: 按标签过滤（可选，如 "架构设计"）
         max_results: 最大返回数（默认 10）
-        min_confidence: 关联代码最低置信度（0=不过滤，0.6=过滤低质量关联）
+        min_confidence: 关联代码最低置信度（默认 0.7 过滤噪声；0.0=不过滤；1.0=仅高质量）
     """
     try:
         _, _, _, _, dq = _get_queries()
@@ -721,6 +742,51 @@ def cpp_search_docs(keyword: str, tag: str = "", max_results: int = 10,
     lines = [f'## 文档搜索："{keyword}"（{len(results)} 个结果）\n\n']
     for i, dw in enumerate(results, 1):
         lines.append(f"{i}. {_fmt_doc_result(dw)}\n")
+    return "".join(lines)
+
+
+@mcp.tool()
+def cpp_get_code_docs(symbol: str, min_confidence: float = 0.0,
+                      max_results: int = 10) -> str:
+    """查询描述指定代码符号的文档切片（反向：代码 -> 文档）。用于：改代码前查设计说明、理解某函数/类的设计意图、找架构文档依据。比 cpp_search_docs 反向：给定代码符号，直接返回讲它的文档。
+
+    底层走 code_refers_to_doc + doc_describes_code 双向边，命中讲该符号的设计文档/
+    HLD/架构文档。
+
+    min_confidence 默认 0.0（不过滤）：反向关联多为 content_scan（confidence=0.6），
+    与正向不同--代码符号名出现在文档里通常就是讲它，0.6 多数有效，故默认全返回，
+    靠 max_results 限量。如需只要高质量，传 1.0。
+
+    Args:
+        symbol: 代码符号名（函数名或类名，如 "PerformUpgrade" / "SocUpdate"）
+        min_confidence: 最低置信度（默认 0.0 不过滤；1.0=仅高质量精确匹配）
+        max_results: 最大返回数（默认 10）
+    """
+    try:
+        _, _, _, _, dq = _get_queries()
+        # 函数 + 类都查，合并去重（符号可能是函数或类）
+        docs = dq.get_docs_for_function(symbol, min_confidence=min_confidence)
+        docs += dq.get_docs_for_class(symbol, min_confidence=min_confidence)
+    except Exception as e:
+        return _query_error(e)
+
+    if not docs:
+        return f'未找到描述 "{symbol}" 的文档（可能无关联设计文档，或置信度低于 {min_confidence}）。'
+
+    # 去重（同一文档切片可能被函数和类两条路径命中）
+    seen: set[tuple] = set()
+    unique: list = []
+    for d in docs:
+        key = (d.file_path, d.start_line)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(d)
+    unique = unique[:max_results]
+
+    lines = [f'## 描述 "{symbol}" 的文档（{len(unique)} 个切片）\n\n']
+    for i, d in enumerate(unique, 1):
+        lines.append(f"{i}. {_fmt_doc_section(d)}\n")
     return "".join(lines)
 
 

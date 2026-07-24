@@ -249,7 +249,7 @@ Configuration is similar; refer to each tool's MCP docs. The core parameters:
 
 ---
 
-## 🛠️ 10 MCP tools
+## 🛠️ 11 MCP tools
 
 | # | Tool | Purpose | Typical scenario |
 |---|------|---------|------------------|
@@ -261,8 +261,9 @@ Configuration is similar; refer to each tool's MCP docs. The core parameters:
 | 6 | `cpp_get_overrides` | All overrides of a virtual function | "Which overrides exist for PerformUpgrade?" |
 | 7 | `cpp_get_file_symbols` | All symbols in a file | "What's in soc_update.cpp?" |
 | 8 | `cpp_traverse_graph` | Multi-hop graph traversal | "What does changing SocUpdate affect?" |
-| 9 | `cpp_search_docs` | Search project docs | "The OTA upgrade-flow design doc" |
+| 9 | `cpp_search_docs` | Search project docs (-> related code) | "The OTA upgrade-flow design doc" |
 | 10 | `cpp_blast_radius` | Blast radius of a change (recursive callers + override expansion + file aggregation) | "I'm changing PerformUpgrade — which files must I review?" |
+| 11 | `cpp_get_code_docs` | Reverse: code symbol -> docs describing it | "What design docs describe PerformUpgrade?" |
 
 ### Tool details
 
@@ -366,7 +367,7 @@ cpp_traverse_graph("SocUpdate", depth=2, max_results=30)
     ...
 ```
 
-#### `cpp_search_docs(keyword, tag="", max_results=10, min_confidence=0.0)`
+#### `cpp_search_docs(keyword, tag="", max_results=10, min_confidence=0.7)`
 
 Search project docs, returns doc sections + associated code.
 
@@ -382,6 +383,34 @@ cpp_search_docs("升级", tag="架构设计")
     - [class] BasePeriUpdate confidence=0.92
     - [class] SocUpdate confidence=0.88
 ```
+
+Note: default `min_confidence=0.7` filters low-quality co-occurrence associations
+(confidence=0.6 makes up 63%, mostly noise like "刷写" matching Data/Response).
+Pass 0.0 to see all associations.
+
+#### `cpp_get_code_docs(symbol, min_confidence=0.0, max_results=10)`
+
+Reverse lookup: given a code symbol, returns doc sections describing it (design
+docs / HLD / architecture docs). Complement of `cpp_search_docs` — pass a code
+symbol directly without thinking of keywords.
+
+```
+cpp_get_code_docs("PerformUpgrade")
+-> ## Docs describing "PerformUpgrade" (6 sections)
+
+  ### 3. Current flow
+  - Doc: SOC A/B partition switch design
+  - File: AB_Switch/AB_PARTITION_SWITCH_DESIGN.md:62-81
+  - Tags: 架构设计, A/B分区
+
+  ### 4.3 Components
+  - File: ADC4.0_System_architecture/ADC4.0_OTA_SW_HLD.md:342-578
+  - Tags: 系统架构
+```
+
+Note: reverse associations are mostly content_scan (confidence=0.6). Unlike
+forward, code symbols appearing in docs are usually genuinely about them, so
+0.6 is typically valid. Default returns all, rely on `max_results` to bound.
 
 ---
 

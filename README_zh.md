@@ -4,7 +4,7 @@
 
 [English](README.md)
 
-为 AI 编程助手（Claude Code、Cursor、Windsurf 等）构建 C++ 代码的语义知识图谱，通过 [MCP 协议](https://modelcontextprotocol.io/) 暴露 10 个查询工具，让 AI 能直接搜索类定义、查继承关系、追踪调用链、分析影响面——无需翻文件、无需 grep。
+为 AI 编程助手（Claude Code、Cursor、Windsurf 等）构建 C++ 代码的语义知识图谱，通过 [MCP 协议](https://modelcontextprotocol.io/) 暴露 11 个查询工具，让 AI 能直接搜索类定义、查继承关系、追踪调用链、分析影响面——无需翻文件、无需 grep。
 
 ## 本项目为何存在：用 clang，而非 tree-sitter
 
@@ -57,7 +57,7 @@ AI 编程助手理解 C++ 代码的常见痛点：
 
 ## ✨ 核心特性
 
-- **10 个 MCP 工具**：类搜索、函数搜索、继承关系、调用链（caller/callee）、override、文件符号、多跳遍历、文档搜索、改动爆炸半径
+- **11 个 MCP 工具**：类搜索、函数搜索、继承关系、调用链（caller/callee）、override、文件符号、多跳遍历、文档搜索、改动爆炸半径、代码→文档反向
 - **增量更新**：基于 include 依赖图，改一个 `.cpp` 秒级刷新（16× 快于全量重建）
 - **文档融合**：项目文档与代码双向关联，搜索文档时自动定位相关代码
 - **开箱即用**：一个 YAML 配置 + `compile_commands.json` 即可启动，MCP Server 自动注册到 AI 工具
@@ -214,7 +214,7 @@ python3 -m cpp_semantic_graph.mcp_server.server
 
 ---
 
-## 🛠️ 10 个 MCP 工具
+## 🛠️ 11 个 MCP 工具
 
 | # | 工具名 | 用途 | 典型场景 |
 |---|--------|------|---------|
@@ -226,8 +226,9 @@ python3 -m cpp_semantic_graph.mcp_server.server
 | 6 | `cpp_get_overrides` | 查询虚函数的所有重写 | "PerformUpgrade 有哪些 override？" |
 | 7 | `cpp_get_file_symbols` | 查询文件内的所有符号 | "soc_update.cpp 里有什么？" |
 | 8 | `cpp_traverse_graph` | 多跳遍历图谱 | "修改 SocUpdate 会影响什么？" |
-| 9 | `cpp_search_docs` | 搜索项目文档 | "OTA 升级流程的设计文档" |
+| 9 | `cpp_search_docs` | 搜索项目文档（含关联代码） | "OTA 升级流程的设计文档" |
 | 10 | `cpp_blast_radius` | 改动爆炸半径（递归调用方 + 虚函数 override 展开 + 文件聚合 + 按跳数分层） | "我要改 PerformUpgrade，哪些文件必须 review？" |
+| 11 | `cpp_get_code_docs` | 反向：代码符号 -> 描述它的文档 | "哪些设计文档讲到了 PerformUpgrade？" |
 
 ### 工具详情
 
@@ -331,7 +332,7 @@ cpp_traverse_graph("SocUpdate", depth=2, max_results=30)
     ...
 ```
 
-#### `cpp_search_docs(keyword, tag="", max_results=10, min_confidence=0.0)`
+#### `cpp_search_docs(keyword, tag="", max_results=10, min_confidence=0.7)`
 
 搜索项目文档，返回文档切片 + 关联代码。
 
@@ -347,6 +348,31 @@ cpp_search_docs("升级", tag="架构设计")
     - [class] BasePeriUpdate confidence=0.92
     - [class] SocUpdate confidence=0.88
 ```
+
+注意：默认 `min_confidence=0.7` 过滤低质量共现关联（confidence=0.6 的占 63%，多为
+关键词共现的泛类，如文档讲"刷写"却关联到 Data/Response 等泛化结构）。要查全就传 0.0。
+
+#### `cpp_get_code_docs(symbol, min_confidence=0.0, max_results=10)`
+
+反向查询：给定代码符号，返回描述它的文档切片（设计文档 / HLD / 架构文档）。
+比 `cpp_search_docs` 反向：直接给代码符号即可，不用想关键词。
+
+```
+cpp_get_code_docs("PerformUpgrade")
+→ ## 描述 "PerformUpgrade" 的文档（6 个切片）
+
+  ### 3. 当前流程时序
+  - 文档: SOC A/B 分区切换方案
+  - 文件: AB_Switch/AB_PARTITION_SWITCH_DESIGN.md:62-81
+  - 标签: 架构设计, A/B分区
+
+  ### 4.3 组件 Component
+  - 文件: ADC4.0_System_architecture/ADC4.0_OTA_SW_HLD.md:342-578
+  - 标签: 系统架构
+```
+
+注意：反向关联多为 content_scan（confidence=0.6），与正向不同——代码符号名出现在
+文档里通常就是讲它，0.6 多数有效，故默认全返回，靠 max_results 限量。
 
 ---
 
