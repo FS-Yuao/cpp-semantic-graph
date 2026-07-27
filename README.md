@@ -580,9 +580,13 @@ manual_links:
       - "PerformUpgrade"
 ```
 
-### Embedding association (optional)
+### Embedding association (optional, experimental)
 
-After installing `sentence-transformers`, docs and code can be auto-associated by semantic similarity:
+> ⚠️ **Experimental — not validated.** The embedding pipeline has not been tested
+> end-to-end. It is retained from the design phase but excluded from the default
+> association strategy. Results and accuracy are unknown.
+
+After installing `sentence-transformers`, docs and code can be auto-associated by semantic similarity. This is **not enabled by default** — pass `--rebuild-embeddings` to `incremental` or call `ingest_embedding_associations()` explicitly:
 
 ```bash
 pip install sentence-transformers

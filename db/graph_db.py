@@ -5,8 +5,10 @@ SQLite 图谱库操作封装
 入库时从 ParseResult 数据模型写入，查询时返回结构化结果。
 """
 
+import fcntl
 import json
 import logging
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -220,6 +222,43 @@ def _hydrate_edge(row: sqlite3.Row) -> dict:
 
     d["extra_info"] = extra if extra else None
     return d
+
+
+class BuildLock:
+    """文件锁，防止并发增量/全量构建
+
+    用 fcntl.flock 在 DB 旁边创建 .build_lock 文件，排他锁防止
+    两个构建同时写 DB（如 MCP 惰性增量 + CLI 手动增量同时跑）。
+
+    用法:
+        with BuildLock(db_path):
+            # DB 写操作
+    """
+
+    def __init__(self, db_path: str):
+        self._lock_path = str(db_path) + ".build_lock"
+        self._fd: int | None = None
+
+    def __enter__(self):
+        self._fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            os.close(self._fd)
+            self._fd = None
+            raise RuntimeError(
+                "另一个增量/全量构建正在执行，请稍后重试"
+            )
+        return self
+
+    def __exit__(self, *args):
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            os.close(self._fd)
+            self._fd = None
 
 
 class GraphDB:
@@ -481,38 +520,30 @@ class GraphDB:
 
         - unique_key 不存在 → INSERT
         - unique_key 已存在 → UPDATE 可变字段（行号、命名空间、v3 新列等）
+
+        使用 SQLite UPSERT（ON CONFLICT）将 INSERT+UPDATE+SELECT 合并为 1 条 SQL。
         """
         type_val = node.type.value if isinstance(node.type, NodeType) else node.type
         flat = _flatten_node_extra(node.extra_info)
-        v3_cols = ", ".join(_NODE_V3_COLUMNS)
         v3_placeholders = ", ".join("?" * len(_NODE_V3_COLUMNS))
         v3_values = [flat[c] for c in _NODE_V3_COLUMNS]
+        v3_set_excluded = ", ".join(f"{c}=excluded.{c}" for c in _NODE_V3_COLUMNS)
 
-        # Try insert first（v4：extra_info 列已 DROP，仅写列）
-        try:
-            cursor = self.conn.execute(
-                f"""INSERT INTO node (type, name, namespace, file_path, start_line, end_line,
-                                       unique_key, {_NODE_V3_COLUMNS_JOIN})
-                   VALUES (?, ?, ?, ?, ?, ?, ?, {v3_placeholders})""",
-                (type_val, node.name, node.namespace, node.file_path,
-                 node.start_line, node.end_line, node.unique_key,
-                 *v3_values)
-            )
-            return cursor.lastrowid
-        except sqlite3.IntegrityError:
-            # unique_key conflict → update 可变字段 + v3 新列
-            v3_set = ", ".join(f"{c}=?" for c in _NODE_V3_COLUMNS)
-            self.conn.execute(
-                f"""UPDATE node SET namespace=?, file_path=?, start_line=?, end_line=?,
-                          {v3_set}, updated_at=datetime('now')
-                   WHERE unique_key=?""",
-                (node.namespace, node.file_path, node.start_line, node.end_line,
-                 *v3_values, node.unique_key)
-            )
-            row = self.conn.execute(
-                "SELECT id FROM node WHERE unique_key=?", (node.unique_key,)
-            ).fetchone()
-            return row["id"]
+        cursor = self.conn.execute(
+            f"""INSERT INTO node (type, name, namespace, file_path, start_line, end_line,
+                                   unique_key, {_NODE_V3_COLUMNS_JOIN})
+               VALUES (?, ?, ?, ?, ?, ?, ?, {v3_placeholders})
+               ON CONFLICT(unique_key) DO UPDATE SET
+                   namespace=excluded.namespace, file_path=excluded.file_path,
+                   start_line=excluded.start_line, end_line=excluded.end_line,
+                   {v3_set_excluded}, updated_at=datetime('now')
+               RETURNING id""",
+            (type_val, node.name, node.namespace, node.file_path,
+             node.start_line, node.end_line, node.unique_key,
+             *v3_values)
+        )
+        row = cursor.fetchone()
+        return row["id"]
 
     def get_node_by_key(self, unique_key: str) -> dict | None:
         """按 unique_key 查询节点"""
@@ -564,61 +595,71 @@ class GraphDB:
 
         Returns:
             edge id，或 None（不应发生）
+
+        使用 SQLite UPSERT（ON CONFLICT）将 INSERT+UPDATE+SELECT 合并为 1 条 SQL。
         """
         flat = _flatten_edge_extra(extra_info)
         v3_placeholders = ", ".join("?" * len(_EDGE_V3_COLUMNS))
         v3_values = [flat[c] for c in _EDGE_V3_COLUMNS]
+        v3_set_excluded = ", ".join(f"{c}=excluded.{c}" for c in _EDGE_V3_COLUMNS)
 
-        try:
-            cursor = self.conn.execute(
-                f"""INSERT INTO edge (from_id, to_id, relation_type, call_line,
-                                      {_EDGE_V3_COLUMNS_JOIN})
-                   VALUES (?, ?, ?, ?, {v3_placeholders})""",
-                (from_id, to_id, relation_type, call_line, *v3_values)
-            )
-            return cursor.lastrowid
-        except sqlite3.IntegrityError:
-            # (from_id, to_id, relation_type, call_line) conflict → update v3 新列
-            v3_set = ", ".join(f"{c}=?" for c in _EDGE_V3_COLUMNS)
-            self.conn.execute(
-                f"""UPDATE edge SET {v3_set}
-                   WHERE from_id=? AND to_id=? AND relation_type=? AND call_line=?""",
-                (*v3_values, from_id, to_id, relation_type, call_line)
-            )
-            row = self.conn.execute(
-                """SELECT id FROM edge
-                   WHERE from_id=? AND to_id=? AND relation_type=? AND call_line=?""",
-                (from_id, to_id, relation_type, call_line)
-            ).fetchone()
-            return row["id"] if row else None
+        cursor = self.conn.execute(
+            f"""INSERT INTO edge (from_id, to_id, relation_type, call_line,
+                                   {_EDGE_V3_COLUMNS_JOIN})
+               VALUES (?, ?, ?, ?, {v3_placeholders})
+               ON CONFLICT(from_id, to_id, relation_type, call_line) DO UPDATE SET
+                   {v3_set_excluded}
+               RETURNING id""",
+            (from_id, to_id, relation_type, call_line, *v3_values)
+        )
+        row = cursor.fetchone()
+        return row["id"] if row else None
 
     def get_edges_from(self, node_id: int, relation_type: str = None) -> list[dict]:
-        """查询从指定节点出发的边"""
+        """查询从指定节点出发的边（JOIN to 节点，含 name/type/namespace/file_path）"""
         if relation_type:
-            sql = """SELECT e.*, n.name as to_name, n.type as to_type, n.namespace as to_namespace
+            sql = """SELECT e.*, n.name as to_name, n.type as to_type,
+                            n.namespace as to_namespace, n.file_path as to_file_path
                      FROM edge e JOIN node n ON e.to_id=n.id
                      WHERE e.from_id=? AND e.relation_type=?"""
             params = [node_id, relation_type]
         else:
-            sql = """SELECT e.*, n.name as to_name, n.type as to_type, n.namespace as to_namespace
+            sql = """SELECT e.*, n.name as to_name, n.type as to_type,
+                            n.namespace as to_namespace, n.file_path as to_file_path
                      FROM edge e JOIN node n ON e.to_id=n.id
                      WHERE e.from_id=?"""
             params = [node_id]
         return [_hydrate_edge(row) for row in self.conn.execute(sql, params).fetchall()]
 
     def get_edges_to(self, node_id: int, relation_type: str = None) -> list[dict]:
-        """查询指向指定节点的边"""
+        """查询指向指定节点的边（JOIN from 节点，含 name/type/namespace/file_path）"""
         if relation_type:
-            sql = """SELECT e.*, n.name as from_name, n.type as from_type, n.namespace as from_namespace
+            sql = """SELECT e.*, n.name as from_name, n.type as from_type,
+                            n.namespace as from_namespace, n.file_path as from_file_path
                      FROM edge e JOIN node n ON e.from_id=n.id
                      WHERE e.to_id=? AND e.relation_type=?"""
             params = [node_id, relation_type]
         else:
-            sql = """SELECT e.*, n.name as from_name, n.type as from_type, n.namespace as from_namespace
+            sql = """SELECT e.*, n.name as from_name, n.type as from_type,
+                            n.namespace as from_namespace, n.file_path as from_file_path
                      FROM edge e JOIN node n ON e.from_id=n.id
                      WHERE e.to_id=?"""
             params = [node_id]
         return [_hydrate_edge(row) for row in self.conn.execute(sql, params).fetchall()]
+
+    def get_nodes_by_ids(self, node_ids: list[int]) -> dict[int, dict]:
+        """批量查询节点，返回 {id: node_dict}（消除 N+1 查询）
+
+        替代循环中逐个 get_node_by_id 的模式。
+        """
+        if not node_ids:
+            return {}
+        placeholders = ",".join("?" * len(node_ids))
+        rows = self.conn.execute(
+            f"SELECT * FROM node WHERE id IN ({placeholders})",
+            node_ids
+        ).fetchall()
+        return {row["id"]: _hydrate_node(row) for row in rows}
 
     # ------------------------------------------------------------------
     # Include dependency operations
@@ -773,38 +814,23 @@ class GraphDB:
             "includes_new": 0,
         }
 
-        # 1. Import nodes
+        # 1. Import nodes — UPSERT + 批量预查（消除逐行 SELECT）
+        # 批量查询已存在的 unique_key，用于区分 new vs updated
+        existing_keys: set[str] = set()
+        if result.nodes:
+            keys = [n.unique_key for n in result.nodes]
+            placeholders = ",".join("?" * len(keys))
+            rows = self.conn.execute(
+                f"SELECT unique_key FROM node WHERE unique_key IN ({placeholders})",
+                keys
+            ).fetchall()
+            existing_keys = {r["unique_key"] for r in rows}
+
         for node in result.nodes:
-            type_val = node.type.value if isinstance(node.type, NodeType) else node.type
-            flat = _flatten_node_extra(node.extra_info)
-            v3_values = [flat[c] for c in _NODE_V3_COLUMNS]
-
-            # Check if exists
-            existing = self.conn.execute(
-                "SELECT id FROM node WHERE unique_key=?", (node.unique_key,)
-            ).fetchone()
-
-            if existing:
-                # 刷新行号/命名空间/文件路径 + v3 新列（v4：不再写 extra_info）
-                v3_set = ", ".join(f"{c}=?" for c in _NODE_V3_COLUMNS)
-                self.conn.execute(
-                    f"""UPDATE node SET start_line=?, end_line=?,
-                                       namespace=?, file_path=?, {v3_set}, updated_at=datetime('now')
-                       WHERE unique_key=?""",
-                    (node.start_line, node.end_line,
-                     node.namespace, node.file_path, *v3_values, node.unique_key)
-                )
+            self.upsert_node(node)
+            if node.unique_key in existing_keys:
                 stats["nodes_updated"] += 1
             else:
-                v3_placeholders = ", ".join("?" * len(_NODE_V3_COLUMNS))
-                self.conn.execute(
-                    f"""INSERT INTO node (type, name, namespace, file_path, start_line, end_line,
-                                          unique_key, {_NODE_V3_COLUMNS_JOIN})
-                       VALUES (?, ?, ?, ?, ?, ?, ?, {v3_placeholders})""",
-                    (type_val, node.name, node.namespace, node.file_path,
-                     node.start_line, node.end_line, node.unique_key,
-                     *v3_values)
-                )
                 stats["nodes_new"] += 1
 
         # 2. Resolve and import edges
@@ -924,15 +950,19 @@ class GraphDB:
                     func_name = edge.extra_info.get("function_name", "")
                     base_class = edge.extra_info.get("base_class", "")
                     if func_name and base_class:
-                        to_row = self.conn.execute(
-                            """SELECT id FROM node
-                               WHERE name=? AND type='function'
-                               AND namespace LIKE ?
-                               LIMIT 1""",
-                            (func_name, f"%{base_class}%")
-                        ).fetchone()
-                        if to_row:
-                            to_id = to_row["id"]
+                        # 按 name 查候选，Python 中用 namespace 末段精确匹配 base_class
+                        # （与 override 解析一致，避免 Base 匹配 Database）
+                        cand_rows = self.conn.execute(
+                            """SELECT id, namespace FROM node
+                               WHERE name=? AND type='function'""",
+                            (func_name,)
+                        ).fetchall()
+                        for cr in cand_rows:
+                            ns = cr["namespace"] or ""
+                            ns_tail = ns.rsplit("::", 1)[-1] if ns else ""
+                            if ns_tail == base_class:
+                                to_id = cr["id"]
+                                break
 
                 else:
                     # ── 调用边解析 ──
@@ -971,16 +1001,22 @@ class GraphDB:
                             to_id = best
 
                     # 第 2 级：name + parent class 匹配（回退，参数对不齐时）
+                    # Python 中用 namespace 末段精确匹配（避免 Base 匹配 Database）
                     if to_id is None and callee_name and callee_parent:
-                        to_row = self.conn.execute(
-                            """SELECT id FROM node
-                               WHERE name=? AND type='function'
-                               AND (namespace LIKE ? OR namespace LIKE ?)
-                               LIMIT 1""",
-                            (callee_name, f"%{callee_parent}%", f"%{callee_ns}%")
-                        ).fetchone()
-                        if to_row:
-                            to_id = to_row["id"]
+                        cand_rows = self.conn.execute(
+                            """SELECT id, namespace FROM node
+                               WHERE name=? AND type='function'""",
+                            (callee_name,)
+                        ).fetchall()
+                        for cr in cand_rows:
+                            ns = cr["namespace"] or ""
+                            ns_tail = ns.rsplit("::", 1)[-1] if ns else ""
+                            if ns_tail == callee_parent:
+                                to_id = cr["id"]
+                                break
+                            if callee_ns and ns.startswith(callee_ns + "::"):
+                                to_id = cr["id"]
+                                break
 
                     # 第 3 级：仅按 name 匹配（最后回退，least precise）
                     if to_id is None and callee_name:
@@ -1008,16 +1044,17 @@ class GraphDB:
                     stats["edges_skipped"] += 1
             # else: unresolved edge — store as pending for later resolution
 
-        # 3. Import includes
-        for inc in result.includes:
-            try:
-                self.conn.execute(
-                    "INSERT INTO include_dep (source_file, included_file, is_system) VALUES (?, ?, ?)",
-                    (inc.source_file, inc.included_file, 1 if inc.is_system else 0)
-                )
-                stats["includes_new"] += 1
-            except sqlite3.IntegrityError:
-                pass
+        # 3. Import includes — executemany 批量写入（INSERT OR IGNORE 跳过重复）
+        if result.includes:
+            include_data = [
+                (inc.source_file, inc.included_file, 1 if inc.is_system else 0)
+                for inc in result.includes
+            ]
+            cursor = self.conn.executemany(
+                "INSERT OR IGNORE INTO include_dep (source_file, included_file, is_system) VALUES (?, ?, ?)",
+                include_data
+            )
+            stats["includes_new"] += cursor.rowcount
 
         # 4. Update parse status
         self.update_parse_status(
@@ -1085,9 +1122,9 @@ class GraphDB:
         Returns:
             删除的节点数量
         """
-        # Find nodes belonging to this file
+        # Find nodes belonging to this file（精确匹配，避免子串误匹配）
         rows = self.conn.execute(
-            "SELECT id FROM node WHERE file_path LIKE ?", (f"%{file_path}%",)
+            "SELECT id FROM node WHERE file_path = ?", (file_path,)
         ).fetchall()
         node_ids = [row["id"] for row in rows]
 
@@ -1106,14 +1143,14 @@ class GraphDB:
             f"DELETE FROM node WHERE id IN ({placeholders})", node_ids
         )
 
-        # Delete includes
+        # Delete includes（精确匹配）
         self.conn.execute(
-            "DELETE FROM include_dep WHERE source_file LIKE ?", (f"%{file_path}%",)
+            "DELETE FROM include_dep WHERE source_file = ?", (file_path,)
         )
 
-        # Delete parse status
+        # Delete parse status（精确匹配）
         self.conn.execute(
-            "DELETE FROM parse_status WHERE source_file LIKE ?", (f"%{file_path}%",)
+            "DELETE FROM parse_status WHERE source_file = ?", (file_path,)
         )
 
         self._commit()
@@ -1162,11 +1199,11 @@ class GraphDB:
             "DELETE FROM parse_status WHERE source_file = ?",
             (source_file_abs,)
         )
-        # 兜底：parse_status 可能存的是相对路径（历史数据）
+        # 兜底：parse_status 可能存的是相对路径（历史数据），用精确匹配
         if ps_cur.rowcount == 0:
             ps_cur = self.conn.execute(
-                "DELETE FROM parse_status WHERE source_file LIKE ?",
-                (f"%{source_file_rel}%",)
+                "DELETE FROM parse_status WHERE source_file = ?",
+                (source_file_rel,)
             )
         self._commit()
         return {
@@ -1250,11 +1287,17 @@ class GraphDB:
             "DELETE FROM include_dep WHERE source_file = ? OR included_file = ?",
             (file_path, file_path)
         )
-        # 删 parse_status
+        # 删 parse_status（精确匹配；兜底用 /path 后缀匹配防子串误删）
         ps_cur = self.conn.execute(
-            "DELETE FROM parse_status WHERE source_file LIKE ?",
-            (f"%{file_path}%",)
+            "DELETE FROM parse_status WHERE source_file = ?",
+            (file_path,)
         )
+        if ps_cur.rowcount == 0:
+            # parse_status 可能存的是绝对路径，用 /file_path 后缀匹配（安全：/ 前缀防子串）
+            ps_cur = self.conn.execute(
+                "DELETE FROM parse_status WHERE source_file LIKE ?",
+                (f"%/{file_path}",)
+            )
         self._commit()
         return {
             "nodes_deleted": node_count,

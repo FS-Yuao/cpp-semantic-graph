@@ -94,38 +94,48 @@ class CallQuery:
 
         results: list[CallInfo] = []
         seen: set[str] = set()
+        # N+1 消除：owning_class 查询缓存
+        _class_cache: dict[int, str | None] = {}
+
+        call_types = self._resolve_call_types(call_type)
 
         for target_id in target_ids:
-            # 查指向此函数的调用边
-            call_types = self._resolve_call_types(call_type)
+            # 每个目标节点只查一次（原为每条边查一次）
+            callee_node = self.db.get_node_by_id(target_id)
+            if not callee_node:
+                continue
+            callee_class = self._get_owning_class_cached(target_id, _class_cache)
+
             for ct in call_types:
                 edges = self.db.get_edges_to(target_id, ct)
                 for edge in edges:
-                    caller_node = self.db.get_node_by_id(edge["from_id"])
-                    if not caller_node:
+                    # N+1 消除：用 JOINed 边数据（from_name/from_namespace/from_file_path）
+                    caller_name = edge.get("from_name", "")
+                    caller_namespace = edge.get("from_namespace", "")
+                    caller_file = edge.get("from_file_path", "")
+                    if not caller_name:
                         continue
 
-                    callee_node = self.db.get_node_by_id(target_id)
                     call_line = edge.get("call_line", 0)
 
-                    dedup = f"{caller_node['name']}@{caller_node.get('file_path', '')}@{call_line}"
+                    dedup = f"{caller_name}@{caller_file}@{call_line}"
                     if dedup in seen:
                         continue
                     seen.add(dedup)
 
-                    caller_class = self._get_owning_class(edge["from_id"])
-                    callee_class = self._get_owning_class(target_id)
+                    caller_class = self._get_owning_class_cached(
+                        edge["from_id"], _class_cache)
 
                     results.append(CallInfo(
-                        caller_name=caller_node["name"],
+                        caller_name=caller_name,
                         caller_class=caller_class,
-                        caller_namespace=caller_node.get("namespace", ""),
-                        caller_file=caller_node.get("file_path", ""),
+                        caller_namespace=caller_namespace,
+                        caller_file=caller_file,
                         caller_line=call_line,
                         callee_name=func_name,
                         callee_class=callee_class,
-                        callee_namespace=callee_node.get("namespace", "") if callee_node else "",
-                        callee_file=callee_node.get("file_path", "") if callee_node else "",
+                        callee_namespace=callee_node.get("namespace", ""),
+                        callee_file=callee_node.get("file_path", ""),
                         call_type=edge["relation_type"],
                         is_virtual_dispatch=edge["relation_type"] == "calls_virtual",
                     ))
@@ -163,37 +173,48 @@ class CallQuery:
 
         results: list[CallInfo] = []
         seen: set[str] = set()
+        # N+1 消除：owning_class 查询缓存
+        _class_cache: dict[int, str | None] = {}
+
+        call_types = self._resolve_call_types(call_type)
 
         for source_id in source_ids:
-            call_types = self._resolve_call_types(call_type)
+            # 每个源节点只查一次（原为每条边查一次）
+            caller_node = self.db.get_node_by_id(source_id)
+            if not caller_node:
+                continue
+            caller_class = self._get_owning_class_cached(source_id, _class_cache)
+
             for ct in call_types:
                 edges = self.db.get_edges_from(source_id, ct)
                 for edge in edges:
-                    callee_node = self.db.get_node_by_id(edge["to_id"])
-                    if not callee_node:
+                    # N+1 消除：用 JOINed 边数据（to_name/to_namespace/to_file_path）
+                    callee_name = edge.get("to_name", "")
+                    callee_namespace = edge.get("to_namespace", "")
+                    callee_file = edge.get("to_file_path", "")
+                    if not callee_name:
                         continue
 
-                    caller_node = self.db.get_node_by_id(source_id)
                     call_line = edge.get("call_line", 0)
 
-                    dedup = f"{callee_node['name']}@{callee_node.get('file_path', '')}@{call_line}"
+                    dedup = f"{callee_name}@{callee_file}@{call_line}"
                     if dedup in seen:
                         continue
                     seen.add(dedup)
 
-                    caller_class = self._get_owning_class(source_id)
-                    callee_class = self._get_owning_class(edge["to_id"])
+                    callee_class = self._get_owning_class_cached(
+                        edge["to_id"], _class_cache)
 
                     results.append(CallInfo(
                         caller_name=func_name,
                         caller_class=caller_class,
-                        caller_namespace=caller_node.get("namespace", "") if caller_node else "",
-                        caller_file=caller_node.get("file_path", "") if caller_node else "",
+                        caller_namespace=caller_node.get("namespace", ""),
+                        caller_file=caller_node.get("file_path", ""),
                         caller_line=call_line,
-                        callee_name=callee_node["name"],
+                        callee_name=callee_name,
                         callee_class=callee_class,
-                        callee_namespace=callee_node.get("namespace", ""),
-                        callee_file=callee_node.get("file_path", ""),
+                        callee_namespace=callee_namespace,
+                        callee_file=callee_file,
                         call_type=edge["relation_type"],
                         is_virtual_dispatch=edge["relation_type"] == "calls_virtual",
                     ))
@@ -354,6 +375,9 @@ class CallQuery:
         except Exception:
             return
 
+        # N+1 消除：owning_class 缓存
+        _class_cache: dict[int, str | None] = {}
+
         for o in overrides:
             if o.class_name == class_name:
                 continue  # 跳过自身
@@ -362,20 +386,24 @@ class CallQuery:
                 for ct in [RelationType.CALLS_DIRECT.value, RelationType.CALLS_VIRTUAL.value]:
                     edges = self.db.get_edges_to(oid, ct)
                     for edge in edges:
-                        caller_node = self.db.get_node_by_id(edge["from_id"])
-                        if not caller_node:
+                        # N+1 消除：用 JOINed 边数据
+                        caller_name = edge.get("from_name", "")
+                        caller_namespace = edge.get("from_namespace", "")
+                        caller_file = edge.get("from_file_path", "")
+                        if not caller_name:
                             continue
                         call_line = edge.get("call_line", 0)
-                        dedup = f"{caller_node['name']}@{caller_node.get('file_path', '')}@{call_line}"
+                        dedup = f"{caller_name}@{caller_file}@{call_line}"
                         if dedup in seen:
                             continue
                         seen.add(dedup)
 
                         results.append(CallInfo(
-                            caller_name=caller_node["name"],
-                            caller_class=self._get_owning_class(edge["from_id"]),
-                            caller_namespace=caller_node.get("namespace", ""),
-                            caller_file=caller_node.get("file_path", ""),
+                            caller_name=caller_name,
+                            caller_class=self._get_owning_class_cached(
+                                edge["from_id"], _class_cache),
+                            caller_namespace=caller_namespace,
+                            caller_file=caller_file,
                             caller_line=call_line,
                             callee_name=o.function_name,
                             callee_class=o.class_name,
@@ -438,13 +466,23 @@ class CallQuery:
         return definition_ids + declaration_ids
 
     def _get_owning_class(self, func_id: int) -> str | None:
-        """通过 belongs_to 边查找函数所属的类"""
+        """通过 belongs_to 边查找函数所属的类
+
+        N+1 消除：get_edges_from 已 JOIN to 节点，直接取 to_name，
+        无需二次 get_node_by_id 查询。
+        """
         edges = self.db.get_edges_from(func_id, "belongs_to")
         if edges:
-            class_node = self.db.get_node_by_id(edges[0]["to_id"])
-            if class_node:
-                return class_node["name"]
+            return edges[0].get("to_name")
         return None
+
+    def _get_owning_class_cached(
+        self, func_id: int, cache: dict[int, str | None],
+    ) -> str | None:
+        """带缓存的 _get_owning_class（同一 func_id 只查一次）"""
+        if func_id not in cache:
+            cache[func_id] = self._get_owning_class(func_id)
+        return cache[func_id]
 
     @staticmethod
     def _resolve_call_types(call_type: str | None) -> list[str]:

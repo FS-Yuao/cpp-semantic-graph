@@ -565,9 +565,11 @@ manual_links:
       - "PerformUpgrade"
 ```
 
-### Embedding 关联（可选）
+### Embedding 关联（可选，实验性）
 
-安装 `sentence-transformers` 后，可基于语义相似度自动关联文档与代码：
+> ⚠️ **实验性功能 — 未经验证。** embedding 流水线尚未端到端测试，默认关联策略不包含此层。效果和准确性未知。
+
+安装 `sentence-transformers` 后，可基于语义相似度自动关联文档与代码。**默认不启用**，需在 `incremental` 时传 `--rebuild-embeddings` 或手动调用 `ingest_embedding_associations()`：
 
 ```bash
 pip install sentence-transformers

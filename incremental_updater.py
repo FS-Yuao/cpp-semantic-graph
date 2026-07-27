@@ -29,7 +29,7 @@ from .parser.ast_visitor import SemanticExtractor
 from .parser.change_detector import ChangeDetector, FileChangeSet, FileChange
 from .parser.impact_analyzer import ImpactAnalyzer, ImpactEntry, ImpactReport
 from .parser.models import ParseResult
-from .db.graph_db import GraphDB
+from .db.graph_db import GraphDB, BuildLock
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,24 @@ class IncrementalUpdater:
         Returns:
             IncrementalReport
         """
+        # 并发构建保护：文件锁防止两个增量/full-parse 同时跑
+        with BuildLock(self.db_path):
+            return self._run_impl(
+                base_ref=base_ref, files=files,
+                rebuild_associations=rebuild_associations,
+                rebuild_embeddings=rebuild_embeddings,
+                doc_only=doc_only, dry_run=dry_run,
+                record_state=record_state)
+
+    def _run_impl(self, *,
+            base_ref: str | None = "HEAD~1",
+            files: list[str] | None = None,
+            rebuild_associations: bool = True,
+            rebuild_embeddings: bool = False,
+            doc_only: bool = False,
+            dry_run: bool = False,
+            record_state: bool = True) -> IncrementalReport:
+        """执行增量更新（内部实现，由 run() 加锁后调用）"""
         t0 = time.time()
         report = IncrementalReport()
 
@@ -162,7 +180,16 @@ class IncrementalUpdater:
             report.elapsed_seconds = time.time() - t0
             return report
 
-        # --- 3~6: 删旧+重解析+导入+清理，包进单事务确保原子性 ---
+        # --- 4. 重新解析（事务外：libclang 解析慢，不持 DB 写锁）---
+        results = self._reparse_tus(impact.affected_tus)
+        for r in results:
+            if r.status == "failed":
+                report.tus_failed += 1
+                report.failed_files.append(r.source_path)
+            else:
+                report.tus_reparsed += 1
+
+        # --- 3+5+6: 删旧+导入+清理，包进单事务确保原子性 ---
         db = GraphDB(self.db_path)
         success = False
         try:
@@ -173,15 +200,6 @@ class IncrementalUpdater:
             del_stats = self._delete_stale_data(changes, impact, db)
             report.edges_deleted = del_stats["edges_deleted"]
             report.includes_deleted = del_stats["includes_deleted"]
-
-            # --- 4. 重新解析 ---
-            results = self._reparse_tus(impact.affected_tus)
-            for r in results:
-                if r.status == "failed":
-                    report.tus_failed += 1
-                    report.failed_files.append(r.source_path)
-                else:
-                    report.tus_reparsed += 1
 
             # --- 5. 导入结果（upsert）---
             import_stats = self._import_results(results, db)
@@ -416,6 +434,13 @@ class IncrementalUpdater:
 
         ingester = AssociationIngester(self.db_path, self.config)
         stats = ingester.ingest_content_scan_associations()
+
+        # 接入 [[ClassName]] 手动标记关联（设计文档第 1 层策略，原为死代码）
+        manual_stats = ingester.ingest_manual_associations()
+        stats.update(manual_stats)
+        # 接入标题/标签规则匹配关联（设计文档第 3 层策略，原为死代码）
+        rule_stats = ingester.ingest_rule_associations()
+        stats.update(rule_stats)
 
         # P0-4 修复：接入 manual_links 配置关联（原为死代码，配置了却不生效）
         config_stats = ingester.ingest_config_associations(self.config.docs_config)

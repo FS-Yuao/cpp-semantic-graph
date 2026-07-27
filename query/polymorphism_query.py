@@ -108,12 +108,17 @@ class PolymorphismQuery:
 
         class_id = class_nodes[0]["id"]
 
-        # 找属于此类的函数
+        # N+1 消除：get_edges_to 已 JOIN from 节点，用 from_type 过滤非 function
         edges = self.db.get_edges_to(class_id, "belongs_to")
-        for edge in edges:
-            func_id = edge["from_id"]
-            func_node = self.db.get_node_by_id(func_id)
-            if not func_node or func_node["type"] != "function":
+        func_ids = [e["from_id"] for e in edges if e.get("from_type") == "function"]
+        if not func_ids:
+            return
+
+        # N+1 消除：批量获取所有函数节点（1 条 SQL 替代 N 条）
+        nodes_map = self.db.get_nodes_by_ids(func_ids)
+        for func_id in func_ids:
+            func_node = nodes_map.get(func_id)
+            if not func_node:
                 continue
 
             extra = _parse_extra(func_node.get("extra_info", {}))
@@ -195,35 +200,53 @@ class PolymorphismQuery:
         if depth > 20:
             logger.warning("override 递归达深度上限 20，可能截断: %s::%s", base_class, func_name)
             return
+
+        # N+1 消除：base_func_node 只查一次（原为每条边查 2 次）
+        base_func_node = self.db.get_node_by_id(base_func_id)
+        base_extra = _parse_extra(
+            base_func_node.get("extra_info", {}) if base_func_node else {}
+        )
+
+        # N+1 消除：owning_class 缓存
+        _class_cache: dict[int, str | None] = {}
+
         # 查 overrides 边: to_id = base_func_id
+        # get_edges_to 已 JOIN from 节点（from_name/from_namespace/from_file_path）
         override_edges = self.db.get_edges_to(base_func_id, "overrides")
 
         for edge in override_edges:
             derived_func_id = edge["from_id"]
-            derived_func = self.db.get_node_by_id(derived_func_id)
-            if not derived_func:
+            # N+1 消除：用 JOINed 数据做快速过滤
+            derived_name = edge.get("from_name", "")
+            derived_namespace = edge.get("from_namespace", "")
+            derived_file = edge.get("from_file_path", "")
+            if not derived_name:
                 continue
 
-            dedup_key = f"{derived_func['name']}@{derived_func.get('namespace', '')}"
+            dedup_key = f"{derived_name}@{derived_namespace}"
             if dedup_key in seen:
                 continue
             seen.add(dedup_key)
 
-            # 找到所属类
-            derived_class = self._get_owning_class(derived_func_id)
+            # 仍需 start_line / extra_info，查一次完整节点
+            derived_func = self.db.get_node_by_id(derived_func_id)
+            if not derived_func:
+                continue
+
+            # 找到所属类（带缓存）
+            if derived_func_id not in _class_cache:
+                _class_cache[derived_func_id] = self._get_owning_class(derived_func_id)
+            derived_class = _class_cache[derived_func_id]
+
             extra = _parse_extra(derived_func.get("extra_info", {}))
-            base_extra = _parse_extra(
-                self.db.get_node_by_id(base_func_id).get("extra_info", {})
-                if self.db.get_node_by_id(base_func_id) else {}
-            )
 
             results.append(OverrideInfo(
-                function_name=derived_func["name"],
+                function_name=derived_name,
                 class_name=derived_class or "",
-                namespace=derived_func.get("namespace", ""),
-                file_path=derived_func.get("file_path", ""),
+                namespace=derived_namespace,
+                file_path=derived_file,
                 line_number=derived_func.get("start_line", 0),
-                signature=extra.get("signature", derived_func["name"]),
+                signature=extra.get("signature", derived_name),
                 base_class=base_class,
                 base_function_signature=base_extra.get("signature", func_name),
             ))
@@ -269,7 +292,11 @@ class PolymorphismQuery:
     def _find_function_node(
         self, func_name: str, class_name: str,
     ) -> int | None:
-        """查找函数节点 ID"""
+        """查找函数节点 ID
+
+        N+1 消除：get_edges_to 已 JOIN from 节点（from_name），
+        直接用 from_name 匹配，无需 get_node_by_id。
+        """
         # 先找类节点
         class_nodes = self.db.find_node_by_name(class_name, "class")
         if not class_nodes:
@@ -279,12 +306,11 @@ class PolymorphismQuery:
 
         class_id = class_nodes[0]["id"]
 
-        # 找属于此类的同名函数
+        # 找属于此类的同名函数（用 JOINed from_name 匹配）
         edges = self.db.get_edges_to(class_id, "belongs_to")
         for edge in edges:
-            func_node = self.db.get_node_by_id(edge["from_id"])
-            if func_node and func_node["name"] == func_name:
-                return func_node["id"]
+            if edge.get("from_name") == func_name:
+                return edge["from_id"]
 
         return None
 
@@ -293,17 +319,24 @@ class PolymorphismQuery:
     ) -> list[OverrideInfo]:
         """查找函数的所有直接 override"""
         results: list[OverrideInfo] = []
+        # N+1 消除：get_edges_to 已 JOIN from 节点
         override_edges = self.db.get_edges_to(func_id, "overrides")
         for edge in override_edges:
+            derived_name = edge.get("from_name", "")
+            derived_namespace = edge.get("from_namespace", "")
+            derived_file = edge.get("from_file_path", "")
+            if not derived_name:
+                continue
+            # 需 start_line，查一次完整节点
             derived_func = self.db.get_node_by_id(edge["from_id"])
             if not derived_func:
                 continue
             derived_class = self._get_owning_class(edge["from_id"])
             results.append(OverrideInfo(
-                function_name=derived_func["name"],
+                function_name=derived_name,
                 class_name=derived_class or "",
-                namespace=derived_func.get("namespace", ""),
-                file_path=derived_func.get("file_path", ""),
+                namespace=derived_namespace,
+                file_path=derived_file,
                 line_number=derived_func.get("start_line", 0),
                 signature="",
                 base_class="",
@@ -312,14 +345,15 @@ class PolymorphismQuery:
         return results
 
     def _get_owning_class(self, func_id: int) -> str | None:
-        """通过 belongs_to 边查找函数所属的类"""
+        """通过 belongs_to 边查找函数所属的类
+
+        N+1 消除：get_edges_from 已 JOIN to 节点，直接取 to_name，
+        无需二次 get_node_by_id 查询。
+        """
         edges = self.db.get_edges_from(func_id, "belongs_to")
         if edges:
-            class_node = self.db.get_node_by_id(edges[0]["to_id"])
-            if class_node:
-                return class_node["name"]
-        # fallback：belongs_to 边缺失（如类在其他文件、边未解析）时，从函数
-        # namespace 末段推断类名（E-3 后 function 节点 namespace 末段=所属类名，稳定契约）
+            return edges[0].get("to_name")
+        # fallback：belongs_to 边缺失时，从函数 namespace 末段推断类名
         node = self.db.get_node_by_id(func_id)
         if node:
             ns = node.get("namespace", "") or ""
@@ -328,7 +362,11 @@ class PolymorphismQuery:
         return None
 
     def _get_ancestor_classes(self, class_name: str) -> list[str]:
-        """获取所有祖先类名（递归 up）"""
+        """获取所有祖先类名（递归 up）
+
+        N+1 消除：get_edges_from 已 JOIN to 节点（to_name），
+        直接用 to_name，无需 get_node_by_id。
+        """
         ancestors: list[str] = []
         visited: set[str] = {class_name}
         queue = [class_name]
@@ -348,16 +386,20 @@ class PolymorphismQuery:
             for edge in edges:
                 if edge["relation_type"] not in rel_types:
                     continue
-                parent = self.db.get_node_by_id(edge["to_id"])
-                if parent and parent["name"] not in visited:
-                    visited.add(parent["name"])
-                    ancestors.append(parent["name"])
-                    queue.append(parent["name"])
+                parent_name = edge.get("to_name", "")
+                if parent_name and parent_name not in visited:
+                    visited.add(parent_name)
+                    ancestors.append(parent_name)
+                    queue.append(parent_name)
 
         return ancestors
 
     def _get_all_descendants(self, class_name: str) -> list[dict]:
-        """获取所有派生类（递归 down）"""
+        """获取所有派生类（递归 down）
+
+        N+1 消除：get_edges_to 已 JOIN from 节点（from_name/from_namespace/from_file_path），
+        直接用 JOINed 数据，无需 get_node_by_id。
+        """
         descendants: list[dict] = []
         visited: set[str] = {class_name}
         queue = [class_name]
@@ -377,20 +419,23 @@ class PolymorphismQuery:
             for edge in edges:
                 if edge["relation_type"] not in rel_types:
                     continue
-                child = self.db.get_node_by_id(edge["from_id"])
-                if child and child["name"] not in visited:
-                    visited.add(child["name"])
+                child_name = edge.get("from_name", "")
+                if child_name and child_name not in visited:
+                    visited.add(child_name)
                     descendants.append({
-                        "name": child["name"],
-                        "namespace": child.get("namespace", ""),
-                        "file_path": child.get("file_path", ""),
+                        "name": child_name,
+                        "namespace": edge.get("from_namespace", ""),
+                        "file_path": edge.get("from_file_path", ""),
                     })
-                    queue.append(child["name"])
+                    queue.append(child_name)
 
         return descendants
 
     def _is_abstract_class(self, class_name: str) -> bool:
-        """判断类是否为抽象类（含纯虚函数）"""
+        """判断类是否为抽象类（含纯虚函数）
+
+        N+1 消除：用单条 JOIN SQL 替代 N 次 get_node_by_id。
+        """
         nodes = self.db.find_node_by_name(class_name, "class")
         if not nodes:
             nodes = self.db.find_node_by_name(class_name, "struct")
@@ -398,14 +443,13 @@ class PolymorphismQuery:
             return False
 
         class_id = nodes[0]["id"]
-        # 检查所属函数中是否有纯虚函数
-        edges = self.db.get_edges_to(class_id, "belongs_to")
-        for edge in edges:
-            func_node = self.db.get_node_by_id(edge["from_id"])
-            if not func_node:
-                continue
-            extra = _parse_extra(func_node.get("extra_info", {}))
-            if extra.get("is_pure_virtual", False):
-                return True
-
-        return False
+        # 单条 SQL：查找此类是否有纯虚函数
+        row = self.db.conn.execute(
+            """SELECT 1 FROM edge e
+               JOIN node n ON e.from_id = n.id
+               WHERE e.to_id = ? AND e.relation_type = 'belongs_to'
+               AND n.is_pure_virtual = 1
+               LIMIT 1""",
+            (class_id,)
+        ).fetchone()
+        return row is not None
