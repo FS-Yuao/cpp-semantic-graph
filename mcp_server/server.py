@@ -186,6 +186,13 @@ def _ensure_fresh() -> None:
         logger.info("惰性增量：%d 文件变更，%d TU 重解析（%d 失败）",
                     report.files_changed, report.tus_reparsed, report.tus_failed)
         # 刷新查询连接（增量后 DB 已变，旧连接指向旧数据）
+        # 先 close 旧连接再置 None，避免 SQLite 连接泄漏
+        for _q in (_gq, _cq, _pq, _tq, _dq, _bq):
+            if _q:
+                try:
+                    _q.close()
+                except Exception:
+                    pass
         _gq = _cq = _pq = _tq = _dq = _bq = None
     except Exception as e:
         logger.warning("惰性增量失败，查询用旧图谱: %s", e)

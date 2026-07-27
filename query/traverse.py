@@ -121,6 +121,14 @@ class TraverseQuery:
     ):
         """BFS 遍历"""
         visited: set[int] = set()
+        # N+1 消除：节点缓存，避免同一节点被 get_node_by_id 多次查询
+        node_cache: dict[int, dict | None] = {}
+
+        def _get_node_cached(nid: int) -> dict | None:
+            if nid not in node_cache:
+                node_cache[nid] = self.db.get_node_by_id(nid)
+            return node_cache[nid]
+
         # 队列: (node_id, unique_key, depth, path_edges, start_key)（主题F：start_key 记录本路径起始节点）
         queue: deque[tuple[int, str, int, list[dict], str]] = deque()
 
@@ -135,8 +143,8 @@ class TraverseQuery:
             if current_depth > max_depth:
                 continue
 
-            # 获取节点信息
-            node = self.db.get_node_by_id(node_id)
+            # 获取节点信息（带缓存）
+            node = _get_node_cached(node_id)
             if not node:
                 continue
 
@@ -179,7 +187,7 @@ class TraverseQuery:
                     result.edges.append(edge_info)
                     result.stats.total_edges_traversed += 1
 
-                    neighbor_node = self.db.get_node_by_id(neighbor_id)
+                    neighbor_node = _get_node_cached(neighbor_id)
                     nkey = neighbor_node["unique_key"] if neighbor_node else ""
 
                     queue.append((neighbor_id, nkey, current_depth + 1,
@@ -197,6 +205,13 @@ class TraverseQuery:
     ):
         """DFS 遍历"""
         visited: set[int] = set()
+        # N+1 消除：节点缓存
+        node_cache: dict[int, dict | None] = {}
+
+        def _get_node_cached(nid: int) -> dict | None:
+            if nid not in node_cache:
+                node_cache[nid] = self.db.get_node_by_id(nid)
+            return node_cache[nid]
 
         def dfs(node_id: int, node_key: str, current_depth: int,
                 path_edges: list[dict], start_key: str):
@@ -210,7 +225,7 @@ class TraverseQuery:
 
             visited.add(node_id)
 
-            node = self.db.get_node_by_id(node_id)
+            node = _get_node_cached(node_id)
             if not node:
                 return
 

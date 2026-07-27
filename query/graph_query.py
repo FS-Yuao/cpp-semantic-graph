@@ -210,11 +210,18 @@ class GraphQuery:
         results: list[InheritanceInfo] = []
         visited_edges: set[int] = set()
 
+        # N+1 消除：节点缓存，避免同一节点被 get_node_by_id 多次查询
+        node_cache: dict[int, dict | None] = {nid: row for nid, row in node_pairs}
+
+        def _get_node_cached(nid: int) -> dict | None:
+            """从缓存取节点，缓存未命中时查 DB 并缓存"""
+            if nid not in node_cache:
+                node_cache[nid] = self.db.get_node_by_id(nid)
+            return node_cache[nid]
+
         # BFS 遍历
         # 当前层：要查询的节点 id 列表
         current_ids = [nid for nid, _ in node_pairs]
-        # 起始节点 id → 起始行（用于构造 InheritanceInfo 的 child/parent）
-        id_to_row: dict[int, dict] = {nid: row for nid, row in node_pairs}
 
         remaining = depth if depth > 0 else 999  # -1 → 足够深
 
@@ -232,8 +239,8 @@ class GraphQuery:
                             continue
                         visited_edges.add(e["id"])
 
-                        child_row = self.db.get_node_by_id(e["from_id"])
-                        parent_row = self.db.get_node_by_id(e["to_id"])
+                        child_row = _get_node_cached(e["from_id"])
+                        parent_row = _get_node_cached(e["to_id"])
                         if child_row and parent_row:
                             results.append(InheritanceInfo(
                                 parent=_row_to_class_info(parent_row),
@@ -253,8 +260,8 @@ class GraphQuery:
                             continue
                         visited_edges.add(e["id"])
 
-                        parent_row = self.db.get_node_by_id(e["to_id"])
-                        child_row = self.db.get_node_by_id(e["from_id"])
+                        parent_row = _get_node_cached(e["to_id"])
+                        child_row = _get_node_cached(e["from_id"])
                         if parent_row and child_row:
                             results.append(InheritanceInfo(
                                 parent=_row_to_class_info(parent_row),

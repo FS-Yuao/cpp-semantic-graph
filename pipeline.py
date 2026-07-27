@@ -26,6 +26,7 @@ from .parser.compile_db import CompileDB
 from .parser.ast_visitor import SemanticExtractor
 from .parser.models import ParseResult
 from .db.importer import Importer
+from .db.graph_db import BuildLock
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,22 @@ class FullParsePipeline:
             baseline_path: ground truth 路径（run_validation=True 时需要）
             reset_db: 是否清空已有数据库重建
         """
+        # 并发构建保护：文件锁防止两个增量/full-parse 同时跑
+        with BuildLock(db_path):
+            return self._run_impl(
+                db_path, filter_path=filter_path,
+                include_generated=include_generated,
+                run_validation=run_validation,
+                baseline_path=baseline_path,
+                reset_db=reset_db)
+
+    def _run_impl(self, db_path: str, *,
+            filter_path: str | None = None,
+            include_generated: bool = False,
+            run_validation: bool = False,
+            baseline_path: str | None = None,
+            reset_db: bool = True) -> ParseReport:
+        """执行全量解析流程（内部实现，由 run() 加锁后调用）"""
         t0 = time.time()
         report = ParseReport()
 
@@ -197,6 +214,12 @@ class FullParsePipeline:
 
             aschip_ingester = AssociationIngester(db_path, self.config)
             aschip_stats = aschip_ingester.ingest_content_scan_associations()
+            # 接入 [[ClassName]] 手动标记关联（设计文档第 1 层策略，原为死代码）
+            manual_stats = aschip_ingester.ingest_manual_associations()
+            aschip_stats.update(manual_stats)
+            # 接入标题/标签规则匹配关联（设计文档第 3 层策略，原为死代码）
+            rule_stats = aschip_ingester.ingest_rule_associations()
+            aschip_stats.update(rule_stats)
             # P0-4 修复：接入 manual_links 配置关联（原为死代码，配置了却不生效）
             config_stats = aschip_ingester.ingest_config_associations(self.config.docs_config)
             aschip_stats.update(config_stats)
