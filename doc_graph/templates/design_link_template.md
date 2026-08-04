@@ -3,6 +3,7 @@ doc_id: <kebab-case-文档名>                     # 如 partition-switch-design
 type: design                                    # design | link
 status: 定稿                                     # 定稿 / 草稿 / 已归档
 date: YYYY-MM-DD
+summary: <一句话说清这个文档的核心内容>           # 必填！精炼总结，10-100字
 tags: [架构设计, <主题>]                        # 如 [架构设计, A/B分区]
 relates_to:                                     # 关联文档（补充 > 引用块里没有的）
   - <关联文档-doc_id>

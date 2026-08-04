@@ -165,6 +165,51 @@ def test_frontmatter(conn):
     test("doc_type 分布 > 3 种", len([k for k in dt_dist if k]) > 3,
          f"distribution={dt_dist}")
 
+    # ── summary 覆盖率（关键质量指标）──
+    doc_with_summary = conn.execute("""
+        SELECT COUNT(*) FROM node
+        WHERE type='document' AND summary IS NOT NULL AND summary != ''
+    """).fetchone()[0]
+    test("文档摘要覆盖率 > 85%", doc_with_summary / total_docs > 0.85,
+         f"with_summary={doc_with_summary}/{total_docs}")
+
+    # 文档摘要长度合理（10-300 字）
+    short_doc_summaries = conn.execute("""
+        SELECT COUNT(*) FROM node
+        WHERE type='document' AND summary IS NOT NULL
+          AND (length(summary) < 10 OR length(summary) > 500)
+    """).fetchone()[0]
+    test("文档摘要长度合理 (10-500字)", short_doc_summaries < total_docs * 0.15,
+         f"bad_length={short_doc_summaries}/{total_docs}")
+
+    # 知识点摘要覆盖率
+    total_know = conn.execute(
+        "SELECT COUNT(*) FROM node WHERE type='knowledge'").fetchone()[0]
+    know_with_summary = conn.execute("""
+        SELECT COUNT(*) FROM node
+        WHERE type='knowledge' AND summary IS NOT NULL AND summary != ''
+    """).fetchone()[0]
+    test("知识点摘要覆盖率 > 70%", know_with_summary / total_know > 0.7,
+         f"with_summary={know_with_summary}/{total_know}")
+
+    # 高频标题必须有摘要（"概述"、"目标"等无信息量标题必须有摘要区分）
+    generic_titles = ['概述', '目标', '风险点', '验收标准', '现状问题', '设计方案', '总结']
+    generic_without_summary = conn.execute("""
+        SELECT COUNT(*) FROM node
+        WHERE type='knowledge' AND title IN ({})
+          AND (summary IS NULL OR summary = '')
+    """.format(",".join(f"'{t}'" for t in generic_titles))).fetchone()[0]
+    generic_total = conn.execute("""
+        SELECT COUNT(*) FROM node
+        WHERE type='knowledge' AND title IN ({})
+    """.format(",".join(f"'{t}'" for t in generic_titles))).fetchone()[0]
+    if generic_total > 0:
+        test(f"高频标题({generic_total}个)有摘要率 > 90%",
+             (generic_total - generic_without_summary) / generic_total > 0.9,
+             f"without_summary={generic_without_summary}/{generic_total}")
+    else:
+        test("无高频标题（跳过）", True, "no generic titles")
+
 
 # ─── T3: FTS5 全文搜索 ────────────────────────────────────────
 

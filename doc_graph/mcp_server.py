@@ -91,14 +91,14 @@ def list_documents(doc_type: str = "", status: str = "") -> str:
         status: 状态过滤，如: 已完成, 待评审, 通过
 
     Returns:
-        JSON 格式的文档列表，含 doc_id, title, doc_type, status, date, path
+        JSON 格式的文档列表，含 doc_id, title, summary, doc_type, status, date, path
     """
     import sqlite3
     db_path = os.environ.get("DOC_GRAPH_DB", DEFAULT_DB)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
 
-    query = "SELECT id, title, doc_type, status, date, path FROM node WHERE type = 'document'"
+    query = "SELECT id, title, summary, doc_type, status, date, path FROM node WHERE type = 'document'"
     params = []
     if doc_type:
         query += " AND doc_type = ?"
@@ -164,12 +164,27 @@ def get_doc_stats() -> str:
         "SELECT COUNT(*) FROM node WHERE type='document' AND manual=1"
     ).fetchone()[0]
 
+    # summary 覆盖率
+    doc_with_summary = conn.execute(
+        "SELECT COUNT(*) FROM node WHERE type='document' AND summary IS NOT NULL AND summary != ''"
+    ).fetchone()[0]
+    know_with_summary = conn.execute(
+        "SELECT COUNT(*) FROM node WHERE type='knowledge' AND summary IS NOT NULL AND summary != ''"
+    ).fetchone()[0]
+    know_total = conn.execute(
+        "SELECT COUNT(*) FROM node WHERE type='knowledge'"
+    ).fetchone()[0]
+
     conn.close()
 
     return json.dumps({
         "nodes": node_total,
         "edges": edge_total,
         "documents_with_frontmatter": has_fm,
+        "document_summary_coverage": f"{doc_with_summary}/{node_total - edge_total + len(doc_types)}",
+        "document_summary_pct": round(100.0 * doc_with_summary / max(1, has_fm), 1),
+        "knowledge_summary_coverage": f"{know_with_summary}/{know_total}",
+        "knowledge_summary_pct": round(100.0 * know_with_summary / max(1, know_total), 1),
         "legacy_documents": legacy,
         "isolated_documents": isolated,
         "doc_type_distribution": [dict(r) for r in doc_types],
