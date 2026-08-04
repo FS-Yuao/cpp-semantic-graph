@@ -2,6 +2,7 @@
 doc_id: diary-YYYY-MM-DD
 type: diary
 date: YYYY-MM-DD
+summary: <一句话概括当天主要发现/决策>             # 必填！精炼总结，10-100字
 tags: [主题1, 主题2]                         # 当天主要主题
 ---
 

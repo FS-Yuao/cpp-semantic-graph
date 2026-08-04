@@ -278,6 +278,8 @@ def print_result(result: dict):
         hop = d.get("hop", 0)
         indent = "  " * (hop + 1)
         print(f"  {indent}hop{hop}: [{d.get('doc_type',''):6s}] {d.get('title','')[:50]}")
+        if d.get("summary"):
+            print(f"  {indent}       摘要: {d['summary'][:80]}")
         if d.get("status"):
             print(f"  {indent}       状态: {d['status']}")
 
@@ -286,6 +288,8 @@ def print_result(result: dict):
         hop = k.get("hop", 0)
         indent = "  " * (hop + 1)
         print(f"  {indent}{k.get('title','')[:60]}")
+        if k.get("summary"):
+            print(f"  {indent}    摘要: {k['summary'][:70]}")
         if k.get("ktype"):
             print(f"  {indent}    类型: {k['ktype']}")
         if k.get("conclusion"):

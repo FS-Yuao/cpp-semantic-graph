@@ -3,6 +3,7 @@ doc_id: <kebab-case-任务名>                    # 全局唯一，如 sensor-ve
 type: task
 status: 待评审                                   # 待评审 / 进行中 / 已完成 / 已归档
 date: YYYY-MM-DD
+summary: <一句话说清这个任务做了什么>             # 必填！精炼总结，10-100字
 tags: [<主题标签>]                              # 如 [GNSS, 版本校验]
 relates_to:                                     # 关联文档 doc_id（可选）
   - <前置任务-doc_id>

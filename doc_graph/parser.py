@@ -128,6 +128,7 @@ class Node:
     type: str             # document | knowledge | symbol
     doc_type: str = ""    # task | diary | review | design | link | requirement | report | doc
     title: str = ""
+    summary: str = ""     # 一句话摘要（document: frontmatter 或首段；knowledge: 首段或 conclusion）
     path: str = ""
     line: int = 0
     ktype: str = ""
@@ -283,6 +284,103 @@ def extract_symbols_from_diary_assoc(text: str) -> list[str]:
     return syms
 
 
+def extract_first_paragraph(lines: list[str], skip_blockquote: bool = True,
+                             start_idx: int = 0, max_chars: int = 200) -> str:
+    """提取第一个实质段落作为摘要
+
+    跳过：空行、标题(#)、代码块(```)、表格(|)、分隔线(---)
+    可选保留引用块(>) —— 文档级摘要时可读 blockquote 定位描述
+
+    如果没有段落，降级收集前 3 个列表项作为摘要。
+    返回截断到 max_chars 的纯文本。
+    """
+    in_code_block = False
+    collecting = False
+    para_lines = []
+    list_fallback = []  # 列表降级
+
+    for i in range(start_idx, len(lines)):
+        line = lines[i]
+        stripped = line.strip()
+
+        # 代码块状态跟踪
+        if stripped.startswith('```'):
+            if collecting:
+                break
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            continue
+
+        # 跳过空行（收集阶段遇到空行=段落结束）
+        if not stripped:
+            if collecting:
+                break
+            continue
+
+        # 跳过标题
+        if stripped.startswith('#'):
+            if collecting:
+                break
+            continue
+
+        # 跳过分隔线
+        if stripped in ('---', '***', '___'):
+            if collecting:
+                break
+            continue
+
+        # 引用块
+        if stripped.startswith('>'):
+            if skip_blockquote:
+                if collecting:
+                    break
+                continue
+            else:
+                # 文档级：提取 blockquote 内容作为摘要
+                text = stripped.lstrip('>').strip()
+                if text:
+                    para_lines.append(text)
+                    collecting = True
+                continue
+
+        # 跳过表格行
+        if '|' in stripped and stripped.count('|') >= 2:
+            if collecting:
+                break
+            continue
+
+        # 列表项（- * 1.）
+        is_list = bool(re.match(r'^[-*]\s', stripped) or re.match(r'^\d+\.\s', stripped))
+        if is_list:
+            if collecting:
+                break
+            # 列表降级：收集前 3 个列表项
+            if len(list_fallback) < 3:
+                # 清理 markdown 标记
+                item = re.sub(r'^[-*]\s+', '', stripped)
+                item = re.sub(r'^\d+\.\s+', '', item)
+                item = re.sub(r'^- \[[ xX]\]\s+', '', item)  # checkbox
+                list_fallback.append(item)
+            continue
+
+        # 实质段落
+        collecting = True
+        para_lines.append(stripped)
+
+    # 优先用段落，降级用列表
+    if para_lines:
+        summary = ' '.join(para_lines).strip()
+    elif list_fallback:
+        summary = ' | '.join(list_fallback).strip()
+    else:
+        summary = ''
+
+    if len(summary) > max_chars:
+        summary = summary[:max_chars - 3] + '...'
+    return summary
+
+
 # ─── 文档类型检测 ──────────────────────────────────────────────
 
 def detect_doc_type(rel_path: str, content: str, frontmatter: dict) -> str:
@@ -379,6 +477,7 @@ def parse_doc(full_path: str, rel_path: str,
         type='document',
         doc_type=doc_type,
         title=title,
+        summary=frontmatter.get('summary', ''),
         path=rel_path,
         status=frontmatter.get('status', ''),
         date=frontmatter.get('date', ''),
@@ -386,6 +485,10 @@ def parse_doc(full_path: str, rel_path: str,
         manual=has_fm,
         legacy=not has_fm,
     )
+
+    # 文档摘要兜底：frontmatter 没写 summary 时，从正文提取
+    if not doc_node.summary:
+        doc_node.summary = extract_first_paragraph(body_lines, skip_blockquote=False)
 
     # diary 日期兜底
     if not doc_node.date:
@@ -423,12 +526,17 @@ def parse_doc(full_path: str, rel_path: str,
             sec_idx += 1
             sec_title = line[3:].strip()
             # 知识点 ID
-            safe_title = re.sub(r'[^A-Za-z0-9_-]', '', sec_title)[:30].lower() or f"sec{sec_idx}"
+            # 保留中文(CJK)、英文字母、数字、下划线、横线；去掉标点和空白
+            safe_title = re.sub(r'[^\w\u4e00-\u9fff-]', '', sec_title, flags=re.UNICODE)[:40].lower() or f"sec{sec_idx}"
             kid = f"know:{doc_id.split(':', 1)[-1]}-s{sec_idx:02d}-{safe_title}"
             current_knode = Node(
                 id=kid, type='knowledge', doc_type=doc_type,
                 title=sec_title, path=rel_path, line=content_start + i + 1,
             )
+            # 知识点摘要：提取 ## 标题后的第一个实质段落
+            current_knode.summary = extract_first_paragraph(
+                body_lines, skip_blockquote=True, start_idx=i + 1, max_chars=200)
+
             nodes_out.append(current_knode)
             edge_set.add(Edge(src=doc_id, dst=kid, rel='has_knowledge', manual=False))
 
@@ -444,7 +552,10 @@ def parse_doc(full_path: str, rel_path: str,
                         if m: current_knode.ktype = m.group(1).strip()
                     elif stripped.startswith('- **结论**'):
                         m = re.search(r'\*\*结论\*\*[:：]\s*(.+)', stripped)
-                        if m: current_knode.conclusion = m.group(1).strip()
+                        if m:
+                            current_knode.conclusion = m.group(1).strip()
+                            # diary 的 conclusion 比首段摘要更有信息量
+                            current_knode.summary = m.group(1).strip()
                     elif stripped.startswith('- **影响**'):
                         m = re.search(r'\*\*影响\*\*[:：]\s*(.+)', stripped)
                         if m and not current_knode.conclusion:
@@ -528,6 +639,7 @@ def write_sqlite(nodes: list[Node], edges: list[Edge], db_path: str):
             type        TEXT NOT NULL,
             doc_type    TEXT,
             title       TEXT,
+            summary     TEXT,
             path        TEXT,
             line        INTEGER DEFAULT 0,
             ktype       TEXT,
@@ -559,11 +671,11 @@ def write_sqlite(nodes: list[Node], edges: list[Edge], db_path: str):
         date = n.date if isinstance(n.date, str) else str(n.date)
         c.execute("""
             INSERT OR REPLACE INTO node
-            (id, type, doc_type, title, path, line, ktype, conclusion, session,
+            (id, type, doc_type, title, summary, path, line, ktype, conclusion, session,
              status, date, tags, manual, legacy)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
-            n.id, n.type, n.doc_type, n.title, n.path, n.line,
+            n.id, n.type, n.doc_type, n.title, n.summary, n.path, n.line,
             n.ktype, n.conclusion, n.session, status, date,
             json.dumps(n.tags, ensure_ascii=False) if isinstance(n.tags, (list, dict)) else (n.tags or "[]"),
             int(n.manual), int(n.legacy),
@@ -579,16 +691,16 @@ def write_sqlite(nodes: list[Node], edges: list[Edge], db_path: str):
     try:
         c.execute("""
             CREATE VIRTUAL TABLE doc_fts USING fts5(
-                doc_id, title, path, tags,
+                doc_id, title, summary, path, tags,
                 tokenize='unicode61'
             )
         """)
         for n in nodes:
             if n.type == 'document':
                 c.execute("""
-                    INSERT INTO doc_fts (doc_id, title, path, tags)
-                    VALUES (?,?,?,?)
-                """, (n.id, n.title, n.path,
+                    INSERT INTO doc_fts (doc_id, title, summary, path, tags)
+                    VALUES (?,?,?,?,?)
+                """, (n.id, n.title, n.summary, n.path,
                       json.dumps(n.tags, ensure_ascii=False)))
     except Exception as ex:
         print(f"⚠️ FTS5 创建跳过: {ex}")
