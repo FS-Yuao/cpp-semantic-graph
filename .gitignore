@@ -46,5 +46,11 @@ semantic_graph_full.db-shm
 # 测试临时结果
 accuracy_graph_results.json
 
+# 文档图谱生成产物（由 parser.py 生成，勿提交）
+doc_graph/doc_graph.db
+doc_graph/doc_graph_data.json
+doc_graph/doc_graph_viz.html
+*.build_lock
+
 # 打包/分发产物(18GB,勿提交)
 du_package/

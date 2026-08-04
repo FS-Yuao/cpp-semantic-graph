@@ -1,14 +1,33 @@
 # 文档解析配置
+# 被 cpp_semantic_graph/doc_graph/parser.py 和 cpp_semantic_graph/parser/ 共同使用
 
 doc_dirs:
   - "docs/"
 
+# 统一排除规则 — gitignore 风格 glob 模式
+# 所有文档解析器（doc_graph parser + cppsg doc parser）都读这个
 exclude_patterns:
+  # --- 通用排除 ---
   - "*.html"
+  - "*.css"
+  - "*.js"
   - "*/build/*"
   - "*/__pycache__/*"
-  - "*/cpp_semantic_graph_env/*"
+  - "*/.git/*"
   - "*/.claude/*"
+  - "*/cpp_semantic_graph_env/*"
+  # --- 模板文件排除 ---
+  # 文档模板不是真实文档，解析会产出 bogus 节点和边
+  - "*/templates/*"
+  - "_*.md"
+  - "*_template.md"
+  - "*_template_*.md"
+  # --- 自动生成文件排除 ---
+  - "*/doc_graph/doc_graph_data.json"
+  - "*/doc_graph/doc_graph_viz.html"
+  # --- 临时/草稿文件 ---
+  - "*/tmp/*"
+  - "*/draft/*"
 
 # 按目录自动打标签（路径相对于 docs/ 根目录）
 tag_rules:
