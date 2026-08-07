@@ -4,6 +4,12 @@
 doc_dirs:
   - "docs/"
 
+# 额外文档目录（绝对路径或相对于本配置文件所在目录）
+# 这些目录的 .md 文件也会被 doc_graph parser 和 DocIngester 扫描入库
+# 用途：将 CodeBuddy 自动生成的 .workbuddy/memory/ 纳入知识图谱
+extra_doc_dirs:
+  - "/mnt/code1/adc4.0/.workbuddy/memory"
+
 # 统一排除规则 — gitignore 风格 glob 模式
 # 所有文档解析器（doc_graph parser + cppsg doc parser）都读这个
 exclude_patterns:
