@@ -121,15 +121,18 @@ def test_db_integrity(conn):
         "SELECT COUNT(*) FROM doc_fts").fetchone()[0]
     test("FTS5 表有数据", fts_count > 0, f"fts_rows={fts_count}")
 
-    # 孤立文档（没有任何出边/入边）
+    # 孤立文档（没有任何出边/入边）-- 分母用文档数，非全节点（避免断言形同虚设）
+    doc_count = conn.execute(
+        "SELECT COUNT(*) FROM node WHERE type='document'").fetchone()[0]
     isolated = conn.execute("""
         SELECT COUNT(*) FROM node n
         WHERE n.type = 'document'
           AND n.id NOT IN (SELECT src FROM edge WHERE src LIKE 'doc:%')
           AND n.id NOT IN (SELECT dst FROM edge WHERE dst LIKE 'doc:%')
     """).fetchone()[0]
-    test(f"孤立文档 < 20%", isolated < node_count * 0.2,
-         f"isolated={isolated}/{node_count}")
+    test(f"孤立文档 < 20% (isolated={isolated}/{doc_count})",
+         isolated < doc_count * 0.2,
+         f"rate={isolated/max(1,doc_count):.1%}")
 
     return {"nodes": node_count, "edges": edge_count,
             "types": types, "rels": rels, "isolated": isolated}

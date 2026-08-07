@@ -114,7 +114,7 @@ class DocIngester:
             if extra_path and Path(extra_path).exists():
                 logger.info("额外文档目录: %s", extra_path)
                 extra_stats = self.ingest_dir(extra_path, verbose=verbose)
-                for k in stats:
+                for k in set(stats) | set(extra_stats):
                     stats[k] = stats.get(k, 0) + extra_stats.get(k, 0)
 
         return stats

@@ -106,7 +106,7 @@ def bfs_traverse(conn: sqlite3.Connection, start_id: str,
         tags = node.get("tags", "[]")
         try:
             node["tags"] = json.loads(tags) if isinstance(tags, str) else tags
-        except:
+        except (json.JSONDecodeError, TypeError):
             node["tags"] = []
 
         if node["type"] == "document":
@@ -151,7 +151,7 @@ def bridge_symbol_to_cppsg(symbol_name: str, cppsg_db_path: str = CPPSG_DB) -> l
     try:
         conn = sqlite3.connect(cppsg_db_path)
         conn.row_factory = sqlite3.Row
-    except:
+    except Exception:
         return [{"error": "无法连接 cppsg 数据库"}]
 
     try:
