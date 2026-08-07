@@ -97,25 +97,25 @@ def list_documents(doc_type: str = "", status: str = "") -> str:
     db_path = os.environ.get("DOC_GRAPH_DB", DEFAULT_DB)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    try:
+        query = "SELECT id, title, summary, doc_type, status, date, path FROM node WHERE type = 'document'"
+        params = []
+        if doc_type:
+            query += " AND doc_type = ?"
+            params.append(doc_type)
+        if status:
+            query += " AND status LIKE ?"
+            params.append(f"%{status}%")
+        query += " ORDER BY date DESC"
 
-    query = "SELECT id, title, summary, doc_type, status, date, path FROM node WHERE type = 'document'"
-    params = []
-    if doc_type:
-        query += " AND doc_type = ?"
-        params.append(doc_type)
-    if status:
-        query += " AND status LIKE ?"
-        params.append(f"%{status}%")
-    query += " ORDER BY date DESC"
-
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
-
-    docs = [dict(r) for r in rows]
-    return json.dumps({
-        "total": len(docs),
-        "documents": docs,
-    }, ensure_ascii=False, indent=2)
+        rows = conn.execute(query, params).fetchall()
+        docs = [dict(r) for r in rows]
+        return json.dumps({
+            "total": len(docs),
+            "documents": docs,
+        }, ensure_ascii=False, indent=2)
+    finally:
+        conn.close()
 
 
 @mcp.tool()
@@ -129,68 +129,72 @@ def get_doc_stats() -> str:
     db_path = os.environ.get("DOC_GRAPH_DB", DEFAULT_DB)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    try:
+        node_total = conn.execute("SELECT COUNT(*) FROM node").fetchone()[0]
+        edge_total = conn.execute("SELECT COUNT(*) FROM edge").fetchone()[0]
 
-    node_total = conn.execute("SELECT COUNT(*) FROM node").fetchone()[0]
-    edge_total = conn.execute("SELECT COUNT(*) FROM edge").fetchone()[0]
+        doc_types = conn.execute("""
+            SELECT doc_type, COUNT(*) as cnt
+            FROM node WHERE type = 'document' GROUP BY doc_type ORDER BY cnt DESC
+        """).fetchall()
 
-    doc_types = conn.execute("""
-        SELECT doc_type, COUNT(*) as cnt
-        FROM node WHERE type = 'document' GROUP BY doc_type ORDER BY cnt DESC
-    """).fetchall()
+        edge_types = conn.execute("""
+            SELECT rel, COUNT(*) as cnt, SUM(manual) as manual_cnt
+            FROM edge GROUP BY rel ORDER BY cnt DESC
+        """).fetchall()
 
-    edge_types = conn.execute("""
-        SELECT rel, COUNT(*) as cnt, SUM(manual) as manual_cnt
-        FROM edge GROUP BY rel ORDER BY cnt DESC
-    """).fetchall()
+        legacy = conn.execute("""
+            SELECT COUNT(*) FROM node WHERE type = 'document' AND legacy = 1
+        """).fetchone()[0]
 
-    legacy = conn.execute("""
-        SELECT COUNT(*) FROM node WHERE type = 'document' AND legacy = 1
-    """).fetchone()[0]
+        isolated = conn.execute("""
+            SELECT COUNT(*) FROM node n
+            WHERE n.type = 'document'
+              AND n.id NOT IN (SELECT src FROM edge WHERE src LIKE 'doc:%')
+              AND n.id NOT IN (SELECT dst FROM edge WHERE dst LIKE 'doc:%')
+        """).fetchone()[0]
 
-    isolated = conn.execute("""
-        SELECT COUNT(*) FROM node n
-        WHERE n.type = 'document'
-          AND n.id NOT IN (SELECT src FROM edge WHERE src LIKE 'doc:%')
-          AND n.id NOT IN (SELECT dst FROM edge WHERE dst LIKE 'doc:%')
-    """).fetchone()[0]
+        top_symbols = conn.execute("""
+            SELECT dst, COUNT(*) as cnt
+            FROM edge WHERE rel = 'mentions_symbol'
+            GROUP BY dst ORDER BY cnt DESC LIMIT 10
+        """).fetchall()
 
-    top_symbols = conn.execute("""
-        SELECT dst, COUNT(*) as cnt
-        FROM edge WHERE rel = 'mentions_symbol'
-        GROUP BY dst ORDER BY cnt DESC LIMIT 10
-    """).fetchall()
+        has_fm = conn.execute(
+            "SELECT COUNT(*) FROM node WHERE type='document' AND manual=1"
+        ).fetchone()[0]
 
-    has_fm = conn.execute(
-        "SELECT COUNT(*) FROM node WHERE type='document' AND manual=1"
-    ).fetchone()[0]
+        doc_total = conn.execute(
+            "SELECT COUNT(*) FROM node WHERE type='document'"
+        ).fetchone()[0]
 
-    # summary 覆盖率
-    doc_with_summary = conn.execute(
-        "SELECT COUNT(*) FROM node WHERE type='document' AND summary IS NOT NULL AND summary != ''"
-    ).fetchone()[0]
-    know_with_summary = conn.execute(
-        "SELECT COUNT(*) FROM node WHERE type='knowledge' AND summary IS NOT NULL AND summary != ''"
-    ).fetchone()[0]
-    know_total = conn.execute(
-        "SELECT COUNT(*) FROM node WHERE type='knowledge'"
-    ).fetchone()[0]
+        # summary 覆盖率
+        doc_with_summary = conn.execute(
+            "SELECT COUNT(*) FROM node WHERE type='document' AND summary IS NOT NULL AND summary != ''"
+        ).fetchone()[0]
+        know_with_summary = conn.execute(
+            "SELECT COUNT(*) FROM node WHERE type='knowledge' AND summary IS NOT NULL AND summary != ''"
+        ).fetchone()[0]
+        know_total = conn.execute(
+            "SELECT COUNT(*) FROM node WHERE type='knowledge'"
+        ).fetchone()[0]
 
-    conn.close()
-
-    return json.dumps({
-        "nodes": node_total,
-        "edges": edge_total,
-        "documents_with_frontmatter": has_fm,
-        "document_summary_coverage": f"{doc_with_summary}/{node_total - edge_total + len(doc_types)}",
-        "document_summary_pct": round(100.0 * doc_with_summary / max(1, has_fm), 1),
-        "knowledge_summary_coverage": f"{know_with_summary}/{know_total}",
-        "knowledge_summary_pct": round(100.0 * know_with_summary / max(1, know_total), 1),
-        "legacy_documents": legacy,
-        "isolated_documents": isolated,
-        "doc_type_distribution": [dict(r) for r in doc_types],
-        "edge_type_distribution": [dict(r) for r in edge_types],
-        "top_symbols": [dict(r) for r in top_symbols],
-    }, ensure_ascii=False, indent=2)
+        return json.dumps({
+            "nodes": node_total,
+            "edges": edge_total,
+            "documents_with_frontmatter": has_fm,
+            "document_summary_coverage": f"{doc_with_summary}/{doc_total}",
+            "document_summary_pct": round(100.0 * doc_with_summary / max(1, doc_total), 1),
+            "knowledge_summary_coverage": f"{know_with_summary}/{know_total}",
+            "knowledge_summary_pct": round(100.0 * know_with_summary / max(1, know_total), 1),
+            "legacy_documents": legacy,
+            "isolated_documents": isolated,
+            "doc_type_distribution": [dict(r) for r in doc_types],
+            "edge_type_distribution": [dict(r) for r in edge_types],
+            "top_symbols": [dict(r) for r in top_symbols],
+        }, ensure_ascii=False, indent=2)
+    finally:
+        conn.close()
 
 
 # ─── 主函数 ───────────────────────────────────────────────────
