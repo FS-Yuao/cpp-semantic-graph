@@ -86,7 +86,7 @@ def test_db_integrity(conn):
     test("has_knowledge 边 dst 全部存在", orphan_hk == 0,
          f"orphan={orphan_hk}")
 
-    # relates_to 边的 src 和 dst 都存在于 node 表（允许少量路径不一致的孤儿）
+    # relates_to 边的 src 和 dst 都必须是 document 节点（后处理已丢弃无法匹配的悬挂边）
     orphan_rt = conn.execute("""
         SELECT COUNT(*) FROM edge e
         WHERE e.rel = 'relates_to'
@@ -96,9 +96,18 @@ def test_db_integrity(conn):
     rt_total = conn.execute(
         "SELECT COUNT(*) FROM edge WHERE rel='relates_to'").fetchone()[0]
     orphan_rate = orphan_rt / rt_total if rt_total > 0 else 1.0
-    test(f"relates_to 孤儿率 < 20% (orphan={orphan_rt}/{rt_total})",
-         orphan_rate < 0.2,
+    test(f"relates_to 悬挂边为 0 (orphan={orphan_rt}/{rt_total})",
+         orphan_rt == 0,
          f"orphan_rate={orphan_rate:.1%}")
+
+    # mentions_symbol 边的 dst 必须有对应 symbol 节点（后处理已建节点，应为 0）
+    orphan_ms = conn.execute("""
+        SELECT COUNT(*) FROM edge e
+        WHERE e.rel = 'mentions_symbol'
+          AND e.dst NOT IN (SELECT id FROM node)
+    """).fetchone()[0]
+    test("mentions_symbol 边 dst 全部存在", orphan_ms == 0,
+         f"orphan={orphan_ms}")
 
     # 无重复边
     dup_edges = conn.execute("""
