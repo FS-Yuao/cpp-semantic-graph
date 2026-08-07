@@ -457,7 +457,8 @@ def parse_doc(full_path: str, rel_path: str,
               warnings: list[str]) -> Node | None:
     """解析单个 markdown 文档，输出节点和边"""
     try:
-        content = open(full_path, encoding='utf-8').read()
+        with open(full_path, encoding='utf-8') as f:
+            content = f.read()
     except Exception as e:
         warnings.append(f"{rel_path}: 读取失败: {e}")
         return None
@@ -614,7 +615,7 @@ def parse_doc(full_path: str, rel_path: str,
             continue
         if in_code_block:
             continue
-        for m in re.finditer(r'\[([^\]]+)\]\(([^)]+\.md)\)', line):
+        for m in re.finditer(r'\[([^\]]+)\]\(([^)]+\.md[^)]*)\)', line):
             link_path = m.group(2)
             if link_path.startswith('http'):
                 continue
@@ -892,7 +893,8 @@ def main():
     doc_id_aliases = {}  # path_based_id → custom_doc_id
     for full, rel in md_files:
         try:
-            content = open(full, encoding='utf-8').read()
+            with open(full, encoding='utf-8') as f:
+                content = f.read()
             lines = content.split('\n')
             fm, has_fm = parse_frontmatter(lines)
             if has_fm and 'doc_id' in fm:
