@@ -65,10 +65,10 @@ def test_db_integrity(conn):
     edge_count = conn.execute("SELECT COUNT(*) FROM edge").fetchone()[0]
     test("边总数 > 0", edge_count > 0, f"actual={edge_count}")
 
-    # 节点类型只有 document/knowledge
+    # 节点类型: document/knowledge/symbol（symbol 为被引用代码符号的实体节点）
     types = dict(conn.execute(
         "SELECT type, COUNT(*) FROM node GROUP BY type").fetchall())
-    test("节点类型合法", set(types.keys()) <= {"document", "knowledge"},
+    test("节点类型合法", set(types.keys()) <= {"document", "knowledge", "symbol"},
          f"types={set(types.keys())}")
 
     # 边类型只有三种

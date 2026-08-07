@@ -45,6 +45,18 @@ DEFAULT_EXCLUDE_PATTERNS = [
 
 def load_exclude_patterns(config_path: str | None = None) -> list[str]:
     """从 doc_config.yaml 读取 exclude_patterns，降级到内置默认"""
+    cfg = load_doc_config(config_path)
+    return cfg.get("exclude_patterns", []) or DEFAULT_EXCLUDE_PATTERNS
+
+
+def load_extra_doc_dirs(config_path: str | None = None) -> list[str]:
+    """从 doc_config.yaml 读取 extra_doc_dirs（额外文档扫描目录）"""
+    cfg = load_doc_config(config_path)
+    return cfg.get("extra_doc_dirs", []) or []
+
+
+def load_doc_config(config_path: str | None = None) -> dict:
+    """加载完整的 doc_config.yaml 配置"""
     import yaml
 
     if config_path is None:
@@ -63,14 +75,11 @@ def load_exclude_patterns(config_path: str | None = None) -> list[str]:
         if path and os.path.isfile(path):
             try:
                 with open(path, encoding='utf-8') as f:
-                    cfg = yaml.safe_load(f) or {}
-                patterns = cfg.get("exclude_patterns", [])
-                if patterns:
-                    return patterns
+                    return yaml.safe_load(f) or {}
             except Exception:
                 pass
 
-    return DEFAULT_EXCLUDE_PATTERNS
+    return {}
 
 
 def should_exclude(rel_path: str, patterns: list[str]) -> bool:
@@ -249,7 +258,11 @@ def is_likely_symbol(s: str) -> bool:
         return False
     if '.' in s or '/' in s:
         return False
-    if s.isupper() and len(s) <= 6:
+    # 全大写标识符（含下划线）通常是宏/枚举值/常量（如 STD_RTYPE_E, HTTP_ERROR）
+    if s.isupper() and len(s) >= 3:
+        return False
+    # 缩写前缀+下划线 = 枚举/常量（如 MCU_BootChain_A, NV_BootChain_CurrentSide）
+    if '_' in s and re.match(r'^[A-Z]{2,}_', s):
         return False
     if s in SYMBOL_BLACKLIST:
         return False
@@ -379,6 +392,18 @@ def extract_first_paragraph(lines: list[str], skip_blockquote: bool = True,
     if len(summary) > max_chars:
         summary = summary[:max_chars - 3] + '...'
     return summary
+
+
+def _preprocess_cjk_for_fts(text: str) -> str:
+    """在 CJK 字符间插入空格，让 unicode61 逐字分词
+
+    unicode61 分词器把连续 CJK 字符当成一个整体 token（如"分区切换"是一个 token），
+    导致中文搜索 MATCH '分' 或 MATCH '分区' 都无法命中。
+    预处理后每个汉字成为独立 token，搜索时可逐字 OR 匹配。
+    """
+    if not text:
+        return text
+    return re.sub(r'([\u4e00-\u9fff])', r'\1 ', text).strip()
 
 
 # ─── 文档类型检测 ──────────────────────────────────────────────
@@ -700,8 +725,13 @@ def write_sqlite(nodes: list[Node], edges: list[Edge], db_path: str):
                 c.execute("""
                     INSERT INTO doc_fts (doc_id, title, summary, path, tags)
                     VALUES (?,?,?,?,?)
-                """, (n.id, n.title, n.summary, n.path,
-                      json.dumps(n.tags, ensure_ascii=False)))
+                """, (
+                    n.id,
+                    _preprocess_cjk_for_fts(n.title),
+                    _preprocess_cjk_for_fts(n.summary),
+                    n.path,
+                    _preprocess_cjk_for_fts(json.dumps(n.tags, ensure_ascii=False)),
+                ))
     except Exception as ex:
         print(f"⚠️ FTS5 创建跳过: {ex}")
 
@@ -812,13 +842,18 @@ def main():
         print(f"❌ 目录不存在: {docs_root}")
         sys.exit(1)
 
-    # 加载排除规则
+    # 加载排除规则和额外目录
     exclude_patterns = load_exclude_patterns(args.config)
+    extra_doc_dirs = load_extra_doc_dirs(args.config)
     print(f"📂 扫描目录: {docs_root}")
+    if extra_doc_dirs:
+        for d in extra_doc_dirs:
+            print(f"📂 额外目录: {d}")
     print(f"🚫 排除规则: {len(exclude_patterns)} 条 (from {'--config' if args.config else 'auto'})")
 
     # 收集所有 .md 文件（配置驱动过滤）
     md_files = []
+    # 主目录
     for root, dirs, files in os.walk(docs_root):
         # 跳过隐藏目录
         dirs[:] = [d for d in dirs if not d.startswith('.')]
@@ -831,6 +866,24 @@ def main():
             if should_exclude(rel, exclude_patterns):
                 continue
             md_files.append((full, rel))
+
+    # 额外目录（如 .workbuddy/memory/）
+    for extra_dir in extra_doc_dirs:
+        extra_abs = os.path.abspath(extra_dir)
+        if not os.path.isdir(extra_abs):
+            print(f"⚠️ 额外目录不存在，跳过: {extra_abs}")
+            continue
+        dir_prefix = os.path.basename(extra_abs.rstrip('/'))
+        for root, dirs, files in os.walk(extra_abs):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            for f in files:
+                if not f.endswith('.md'):
+                    continue
+                full = os.path.join(root, f)
+                rel = os.path.join(dir_prefix, os.path.relpath(full, extra_abs))
+                if should_exclude(rel, exclude_patterns):
+                    continue
+                md_files.append((full, rel))
 
     md_files.sort(key=lambda x: x[1])
     print(f"📄 发现 {len(md_files)} 个 markdown 文件")
@@ -871,17 +924,40 @@ def main():
     # 构建 doc_id → doc_id 的映射（基于文件名模糊匹配）
     doc_ids = {n.id for n in nodes if n.type == 'document'}
     fixed_edges = 0
-    for i, e in enumerate(edges):
+    dropped_edges = 0
+    kept_edges = []
+    for e in edges:
         if e.rel == 'relates_to' and e.dst not in doc_ids:
             # 尝试：用 dst 的最后一段去匹配实际 doc_id
             dst_suffix = e.dst.split('-')[-1] if '-' in e.dst else e.dst
             candidates = [did for did in doc_ids if did.endswith(dst_suffix) or dst_suffix in did]
             if len(candidates) == 1:
-                edges[i] = Edge(src=e.src, dst=candidates[0], rel=e.rel, manual=e.manual)
+                kept_edges.append(Edge(src=e.src, dst=candidates[0], rel=e.rel, manual=e.manual))
                 fixed_edges += 1
+            else:
+                # 仍无法匹配：丢弃，避免悬挂边污染 BFS 遍历
+                dropped_edges += 1
+                warnings.append(f"丢弃悬挂 relates_to 边: {e.src} -> {e.dst} (目标文档不存在)")
+        else:
+            kept_edges.append(e)
+    edges = kept_edges
 
     if fixed_edges:
         print(f"🔧 模糊匹配修复 {fixed_edges} 条 relates_to 边")
+    if dropped_edges:
+        print(f"🧹 丢弃 {dropped_edges} 条无法匹配的悬挂 relates_to 边")
+
+    # ── 为所有被引用的 symbol 建节点实体（消除 mentions_symbol 悬挂边）──
+    # 架构设计节点 type 含 symbol，但解析时只建了边没建节点，导致 mentions_symbol 边悬挂
+    existing_ids = {n.id for n in nodes}
+    symbol_ids = {e.dst for e in edges if e.rel == 'mentions_symbol'}
+    added_syms = 0
+    for sym_id in sorted(symbol_ids):
+        if sym_id not in existing_ids:
+            nodes.append(Node(id=sym_id, type='symbol', title=sym_id.split(':', 1)[-1]))
+            added_syms += 1
+    if added_syms:
+        print(f"🔗 新增 {added_syms} 个 symbol 节点（消除悬挂边）")
 
     print(f"✅ 解析完成: {len(nodes)} 节点, {len(edges)} 边")
     if errors:

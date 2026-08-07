@@ -37,8 +37,9 @@ def fts5_search(conn: sqlite3.Connection, keyword: str, limit: int = 5) -> list[
     """FTS5 全文搜索 → 起始文档列表。未命中时降级为 LIKE 搜索。"""
     try:
         tokens = re.findall(r'[A-Za-z]+|\d+|[\u4e00-\u9fff]+', keyword)
+        # 空串或纯标点（提取不到有效 token）直接返回空，避免 FTS5 语法错 + LIKE %% 全匹配
         if not tokens:
-            tokens = [keyword]
+            return []
         match_parts = []
         for t in tokens:
             if re.match(r'^[\u4e00-\u9fff]+$', t):
@@ -55,16 +56,17 @@ def fts5_search(conn: sqlite3.Connection, keyword: str, limit: int = 5) -> list[
 
         if rows:
             return [{"doc_id": r["doc_id"], "score": r["score"], "source": "fts5"} for r in rows]
-    except Exception:
-        pass
+    except Exception as e:
+        # 记录错误但不中断，降级到 LIKE 搜索
+        print(f"[doc_graph] FTS5 搜索降级到 LIKE: {e}", file=sys.stderr)
 
-    # 降级：LIKE 搜索标题/路径/标签
+    # 降级：LIKE 搜索标题/路径/标签/摘要
     rows = conn.execute("""
         SELECT id AS doc_id, 0 AS score
         FROM node WHERE type = 'document'
-          AND (title LIKE ? OR path LIKE ? OR tags LIKE ?)
+          AND (title LIKE ? OR path LIKE ? OR tags LIKE ? OR summary LIKE ?)
         LIMIT ?
-    """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit)).fetchall()
+    """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit)).fetchall()
 
     if rows:
         return [{"doc_id": r["doc_id"], "score": 0, "source": "like"} for r in rows]
@@ -212,50 +214,60 @@ def doc_graph_search(keyword: str, depth: int = 2,
                      db_path: str = DEFAULT_DB) -> dict:
     """搜索文档图谱，返回结构化关联结果"""
     conn = get_conn(db_path)
+    try:
+        # Step 1: FTS5 定位
+        start_docs = fts5_search(conn, keyword, limit=3)
 
-    # Step 1: FTS5 定位
-    start_docs = fts5_search(conn, keyword, limit=3)
+        if not start_docs:
+            return {"query": keyword, "start_docs": [], "docs": [], "knowledge": [],
+                    "symbols": [], "code_nodes": [],
+                    "message": f"未找到匹配 '{keyword}' 的文档"}
 
-    if not start_docs:
+        # Step 2: BFS 遍历
+        all_results = {"docs": [], "knowledge": [], "symbols": []}
+        for start in start_docs:
+            result = bfs_traverse(conn, start["doc_id"], depth, edge_filter)
+            for key in all_results:
+                all_results[key].extend(result[key])
+
+        # 去重（docs 和 knowledge 先去重，顺序无关）
+        for key, id_field in [("docs", "id"), ("knowledge", "id")]:
+            seen = set()
+            deduped = []
+            for item in all_results[key]:
+                k = item[id_field]
+                if k not in seen:
+                    seen.add(k)
+                    deduped.append(item)
+            all_results[key] = deduped
+
+        # 排序：manual 优先（必须在去重前排序，保证 manual 条目优先保留）
+        all_results["symbols"].sort(
+            key=lambda x: (0 if x["confidence"] == "manual" else 1, x["hop"]))
+
+        # 去重（排序后，manual 条目排在前面，优先保留）
+        seen_syms = set()
+        deduped_syms = []
+        for item in all_results["symbols"]:
+            k = item["name"]
+            if k not in seen_syms:
+                seen_syms.add(k)
+                deduped_syms.append(item)
+        all_results["symbols"] = deduped_syms
+
+        # Step 3: 符号桥接
+        code_nodes = []
+        if bridge_to_code:
+            for sym in all_results["symbols"][:10]:
+                cppsg_nodes = bridge_symbol_to_cppsg(sym["name"])
+                if cppsg_nodes:
+                    code_nodes.append({"symbol": sym["name"],
+                                       "confidence": sym["confidence"], "cppsg": cppsg_nodes})
+
+        return {"query": keyword, "start_docs": start_docs,
+                **all_results, "code_nodes": code_nodes}
+    finally:
         conn.close()
-        return {"query": keyword, "start_docs": [], "docs": [], "knowledge": [],
-                "symbols": [], "code_nodes": [],
-                "message": f"未找到匹配 '{keyword}' 的文档"}
-
-    # Step 2: BFS 遍历
-    all_results = {"docs": [], "knowledge": [], "symbols": []}
-    for start in start_docs:
-        result = bfs_traverse(conn, start["doc_id"], depth, edge_filter)
-        for key in all_results:
-            all_results[key].extend(result[key])
-
-    # 去重
-    for key, id_field in [("docs", "id"), ("knowledge", "id"), ("symbols", "name")]:
-        seen = set()
-        deduped = []
-        for item in all_results[key]:
-            k = item[id_field]
-            if k not in seen:
-                seen.add(k)
-                deduped.append(item)
-        all_results[key] = deduped
-
-    # 排序：manual 优先
-    all_results["symbols"].sort(
-        key=lambda x: (0 if x["confidence"] == "manual" else 1, x["hop"]))
-
-    # Step 3: 符号桥接
-    code_nodes = []
-    if bridge_to_code:
-        for sym in all_results["symbols"][:10]:
-            cppsg_nodes = bridge_symbol_to_cppsg(sym["name"])
-            if cppsg_nodes:
-                code_nodes.append({"symbol": sym["name"],
-                                   "confidence": sym["confidence"], "cppsg": cppsg_nodes})
-
-    conn.close()
-    return {"query": keyword, "start_docs": start_docs,
-            **all_results, "code_nodes": code_nodes}
 
 
 # ─── CLI ──────────────────────────────────────────────────────
