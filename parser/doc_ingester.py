@@ -95,6 +95,8 @@ class DocIngester:
     def ingest_from_config(self, *, verbose: bool = False) -> dict:
         """从项目配置读取 docs_dir 并入库（无需手动传路径）
 
+        同时扫描 doc_config.yaml 中的 extra_doc_dirs（如 .workbuddy/memory/）。
+
         Returns:
             统计信息
         """
@@ -103,7 +105,32 @@ class DocIngester:
             logger.error("项目配置中未设置 docs_dir")
             return {"files_processed": 0, "sections_created": 0}
         logger.info("文档目录: %s", docs_dir)
-        return self.ingest_dir(docs_dir, verbose=verbose)
+        stats = self.ingest_dir(docs_dir, verbose=verbose)
+
+        # 扫描额外文档目录（如 CodeBuddy 自动记忆 .workbuddy/memory/）
+        extra_dirs = self.config.get("extra_doc_dirs", [])
+        for extra_dir in extra_dirs:
+            extra_path = self._resolve_extra_dir(extra_dir)
+            if extra_path and Path(extra_path).exists():
+                logger.info("额外文档目录: %s", extra_path)
+                extra_stats = self.ingest_dir(extra_path, verbose=verbose)
+                for k in stats:
+                    stats[k] = stats.get(k, 0) + extra_stats.get(k, 0)
+
+        return stats
+
+    def _resolve_extra_dir(self, extra_dir: str) -> str | None:
+        """解析 extra_doc_dirs 中的路径（绝对路径直接用，相对路径基于配置文件目录）"""
+        if not extra_dir:
+            return None
+        p = Path(extra_dir)
+        if p.is_absolute():
+            return str(p)
+        # 相对于项目配置文件所在目录解析
+        if self.project_config_path:
+            base = Path(self.project_config_path).parent
+            return str((base / extra_dir).resolve())
+        return str(p.resolve())
 
     def ingest_dir(self, doc_root: str, *, verbose: bool = False) -> dict:
         """扫描文档目录，切片入库
