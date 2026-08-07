@@ -76,7 +76,7 @@ def infer_date(filepath: Path, rel_path: str, content: str) -> str:
     try:
         ts = os.path.getmtime(filepath)
         return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
-    except:
+    except Exception:
         return "2026-07-01"
 
 
@@ -171,7 +171,7 @@ def needs_migration(filepath: Path) -> bool:
         with open(filepath, "r", encoding="utf-8") as f:
             head = f.read(10)
         return not head.startswith("---")
-    except:
+    except Exception:
         return False
 
 

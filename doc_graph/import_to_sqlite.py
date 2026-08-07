@@ -170,7 +170,7 @@ def main():
             LIMIT 5
         """):
             print(f"   {row[0]:40s}  score={row[1]:.2f}")
-    except:
+    except Exception:
         print("   (FTS5 不可用，跳过)")
 
     conn.close()

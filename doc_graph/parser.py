@@ -900,7 +900,7 @@ def main():
                 custom = f"doc:{fm['doc_id']}"
                 if path_based != custom:
                     doc_id_aliases[path_based] = custom
-        except:
+        except Exception:
             pass
 
     if doc_id_aliases:
