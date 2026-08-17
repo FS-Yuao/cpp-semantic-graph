@@ -41,6 +41,8 @@ class IncrementalReport:
     tus_affected: int = 0
     tus_reparsed: int = 0
     tus_failed: int = 0
+    # retry_failed 重试的历史失败 TU 数（含成功与仍失败）
+    tus_retried: int = 0
     failed_files: list[str] = field(default_factory=list)
     nodes_new: int = 0
     nodes_updated: int = 0
@@ -87,7 +89,8 @@ class IncrementalUpdater:
             rebuild_embeddings: bool = False,
             doc_only: bool = False,
             dry_run: bool = False,
-            record_state: bool = True) -> IncrementalReport:
+            record_state: bool = True,
+            retry_failed: bool = False) -> IncrementalReport:
         """执行增量更新
 
         Args:
@@ -99,6 +102,9 @@ class IncrementalUpdater:
             dry_run: 只检测+分析，不执行删除/解析
             record_state: 成功后写 last_incremented_ref=HEAD（task_4_5 惰性增量
                           节流；CLI/MCP 共享状态，下次 MCP 查询 no-op）
+            retry_failed: 顺带重试 parse_status 中历史失败的 TU。
+                          背景：失败状态若残留（如修复交叉编译 target 前的失败），
+                          无文件变更时增量更新不会触碰，形成假盲区。
 
         Returns:
             IncrementalReport
@@ -110,7 +116,7 @@ class IncrementalUpdater:
                 rebuild_associations=rebuild_associations,
                 rebuild_embeddings=rebuild_embeddings,
                 doc_only=doc_only, dry_run=dry_run,
-                record_state=record_state)
+                record_state=record_state, retry_failed=retry_failed)
 
     def _run_impl(self, *,
             base_ref: str | None = "HEAD~1",
@@ -119,7 +125,8 @@ class IncrementalUpdater:
             rebuild_embeddings: bool = False,
             doc_only: bool = False,
             dry_run: bool = False,
-            record_state: bool = True) -> IncrementalReport:
+            record_state: bool = True,
+            retry_failed: bool = False) -> IncrementalReport:
         """执行增量更新（内部实现，由 run() 加锁后调用）"""
         t0 = time.time()
         report = IncrementalReport()
@@ -140,10 +147,24 @@ class IncrementalUpdater:
 
         # --- 1. 检测变更 ---
         detector = ChangeDetector(self.repo_root, self.config)
+
+        # retry_failed：历史失败 TU 并入变更集（标记 M 走常规重解析流程）
+        retry_files: list[str] = []
+        if retry_failed:
+            retry_files = self._get_failed_tus()
+            if retry_files:
+                logger.info("重试历史失败 TU: %d 个", len(retry_files))
+                report.tus_retried = len(retry_files)
+
         if files:
-            changes = detector.detect_from_files(files)
+            changes = detector.detect_from_files(files + retry_files)
         else:
             changes = detector.detect_from_git(base_ref or "HEAD~1")
+            if retry_files:
+                # git 变更与重试文件合并（detect_from_files 全部标记 M，
+                # 与 git 检测的 deleted 语义不冲突——追加 modified 即可）
+                extra = detector.detect_from_files(retry_files)
+                changes.modified.extend(extra.modified)
         report.files_changed = len(changes.all_changed)
 
         if changes.is_empty:
@@ -239,7 +260,16 @@ class IncrementalUpdater:
                 report.doc_sections_updated = doc_result.get("sections_updated", 0)
 
                 # --- 7. 重建文档关联（事务外，独立操作）---
-                if rebuild_associations:
+                # 防御（2026-08-17 教训）：重解析 TU 时"删旧"会连带删掉这些 TU 的
+                # 文档关联边，rebuild_associations=False 不重建即丢。TU>0 时强制重建。
+                aschip_effective = rebuild_associations
+                if not aschip_effective and report.tus_reparsed > 0:
+                    aschip_effective = True
+                    logger.warning(
+                        "重解析了 %d 个 TU，强制重建文档关联"
+                        "（rebuild_associations=False 被覆盖，防止关联边丢失）",
+                        report.tus_reparsed)
+                if aschip_effective:
                     self._rebuild_associations(rebuild_embeddings)
                     report.associations_rebuilt = True
                 # --- 7.5. 记录增量进度（task_4_5 惰性增量节流）---
@@ -259,6 +289,19 @@ class IncrementalUpdater:
 
         report.elapsed_seconds = time.time() - t0
         return report
+
+    def _get_failed_tus(self) -> list[str]:
+        """查询 parse_status 中历史失败的 TU 文件列表
+
+        用于 retry_failed：这些 TU 无文件变更时不会被增量更新触碰，
+        失败状态（可能是配置修复前的残留）会一直挂着形成假盲区。
+        """
+        db = GraphDB(self.db_path)
+        try:
+            return [row["source_file"] for row in db.get_all_parse_status()
+                    if row.get("status") == "failed"]
+        finally:
+            db.close()
 
     def _record_incremental_state(self, detector: "ChangeDetector",
                                   db: GraphDB) -> None:

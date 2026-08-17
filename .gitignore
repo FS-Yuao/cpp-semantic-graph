@@ -54,3 +54,7 @@ doc_graph/doc_graph_viz.html
 
 # 打包/分发产物(18GB,勿提交)
 du_package/
+
+# 运行时遥测与备份（2026-08-17）
+query_telemetry.jsonl
+doc_graph/doc_graph.db.bak

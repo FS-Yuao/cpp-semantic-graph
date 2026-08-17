@@ -159,18 +159,21 @@ class PolymorphismQuery:
         self,
         func_name: str,
         class_name: str,
+        namespace: str | None = None,
     ) -> list[OverrideInfo]:
         """查询虚函数的所有重写实现（递归所有子类）
 
         Args:
             func_name: 虚函数名
             class_name: 首次声明该虚函数的基类名
+            namespace: 限定基类 namespace（精确匹配，消歧同名类）
 
         Returns:
             重写信息列表
         """
         # 找基类虚函数节点
-        base_func_id = self._find_function_node(func_name, class_name)
+        base_func_id = self._find_function_node(
+            func_name, class_name, namespace=namespace)
         if base_func_id is None:
             logger.debug("未找到基类虚函数: %s::%s", class_name, func_name)
             return []
@@ -291,11 +294,13 @@ class PolymorphismQuery:
 
     def _find_function_node(
         self, func_name: str, class_name: str,
+        namespace: str | None = None,
     ) -> int | None:
         """查找函数节点 ID
 
         N+1 消除：get_edges_to 已 JOIN from 节点（from_name），
         直接用 from_name 匹配，无需 get_node_by_id。
+        namespace 参数为精确匹配类节点 namespace（消歧同名类）。
         """
         # 先找类节点
         class_nodes = self.db.find_node_by_name(class_name, "class")
@@ -303,6 +308,13 @@ class PolymorphismQuery:
             class_nodes = self.db.find_node_by_name(class_name, "struct")
         if not class_nodes:
             return None
+
+        if namespace:
+            # 精确匹配类节点 namespace（如 "update"，不含类名自身）
+            class_nodes = [n for n in class_nodes
+                           if (n.get("namespace", "") or "") == namespace]
+            if not class_nodes:
+                return None
 
         class_id = class_nodes[0]["id"]
 

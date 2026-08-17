@@ -43,6 +43,7 @@ from cpp_semantic_graph.query.polymorphism_query import PolymorphismQuery
 from cpp_semantic_graph.query.traverse import TraverseQuery
 from cpp_semantic_graph.query.doc_query import DocQuery
 from cpp_semantic_graph.query.blast_radius_query import BlastRadiusQuery
+from cpp_semantic_graph.query.include_query import IncludeQuery
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,7 @@ _pq: PolymorphismQuery | None = None
 _tq: TraverseQuery | None = None
 _dq: DocQuery | None = None
 _bq: BlastRadiusQuery | None = None
+_iq: "IncludeQuery | None" = None
 
 # task_4_5: 惰性增量状态（进程内缓存，避免每次查询都读 DB/git）
 _lazy_config = None            # ProjectConfig 缓存（首次 from_yaml 后复用）
@@ -133,7 +135,7 @@ def _ensure_fresh() -> None:
     8. 刷新查询连接（_gq 等置 None，下次 _get_queries 重建）
     任何异常 -> warning + return（查询用旧图谱，不阻塞）
     """
-    global _gq, _cq, _pq, _tq, _dq, _bq, _last_checked_head
+    global _gq, _cq, _pq, _tq, _dq, _bq, _iq, _last_checked_head
     try:
         config = _load_config_for_lazy()
         if config is None or not config.lazy_increment_enabled:
@@ -187,13 +189,13 @@ def _ensure_fresh() -> None:
                     report.files_changed, report.tus_reparsed, report.tus_failed)
         # 刷新查询连接（增量后 DB 已变，旧连接指向旧数据）
         # 先 close 旧连接再置 None，避免 SQLite 连接泄漏
-        for _q in (_gq, _cq, _pq, _tq, _dq, _bq):
+        for _q in (_gq, _cq, _pq, _tq, _dq, _bq, _iq):
             if _q:
                 try:
                     _q.close()
                 except Exception:
                     pass
-        _gq = _cq = _pq = _tq = _dq = _bq = None
+        _gq = _cq = _pq = _tq = _dq = _bq = _iq = None
     except Exception as e:
         logger.warning("惰性增量失败，查询用旧图谱: %s", e)
 
@@ -225,12 +227,156 @@ def _get_blast() -> BlastRadiusQuery:
     return _bq
 
 
+def _get_include() -> IncludeQuery:
+    """Lazy init：首次调用时建立 IncludeQuery（include 影响面查询）"""
+    global _iq
+    _ensure_fresh()
+    if _iq is None:
+        if not _db_path or not Path(_db_path).exists():
+            raise FileNotFoundError(f"图谱数据库不存在: {_db_path}")
+        _iq = IncludeQuery(_db_path)
+    return _iq
+
+
 def _query_error(e: Exception) -> str:
     """统一处理查询异常，避免 database is locked 等异常传播到 MCP 框架层（主题D）"""
     if isinstance(e, FileNotFoundError):
         return str(e)
     logger.exception("MCP 查询异常")
     return f"查询失败（{type(e).__name__}）: {e}"
+
+
+# ── 调用点源码行文本（第二批改进：省掉查询后的一次 Read 往返）──
+
+# 文件内容缓存: {abs_path: (mtime, lines)}，容量上限防长会话内存膨胀
+_src_cache: dict[str, tuple[float, list[str]]] = {}
+_SRC_CACHE_MAX = 64
+
+# rel_path → abs_path 映射（惰性构建自 compile_commands.json，与解析器同口径）
+_rel_abs_map: dict[str, str] | None = None
+
+
+def _build_rel_abs_map() -> dict[str, str]:
+    """从 compile_commands.json 构建 相对路径→绝对路径 映射
+
+    解析器的 make_relative_path 是"source_paths 子串截断"，不可简单逆向；
+    这里对每个 TU 绝对路径套用同一函数建立精确反查表。
+    """
+    config = _load_config_for_lazy()
+    if config is None or not config.compile_commands:
+        return {}
+    import json as _json
+    try:
+        with open(config.compile_commands, encoding="utf-8") as f:
+            entries = _json.load(f)
+    except Exception as e:
+        logger.warning("加载 compile_commands 失败（源码行文本降级）: %s", e)
+        return {}
+    mapping: dict[str, str] = {}
+    for entry in entries:
+        fp = entry.get("file", "")
+        if fp:
+            mapping.setdefault(config.make_relative_path(fp), fp)
+    return mapping
+
+
+def _resolve_src_path(rel_file: str) -> str:
+    """DB 相对路径 → 绝对路径；失败返回空串
+
+    主路径：compile_commands 反查表（与解析器 make_relative_path 同口径）。
+    兜底：source_paths 候选根拼接（覆盖 compile_commands 外的纯头文件）。
+    """
+    global _rel_abs_map
+    if _rel_abs_map is None:
+        _rel_abs_map = _build_rel_abs_map()
+    abs_path = _rel_abs_map.get(rel_file)
+    if abs_path and Path(abs_path).exists():
+        return abs_path
+    # 兜底：候选根 = compile_commands 目录（含 app/ 变体）+ source_path
+    config = _load_config_for_lazy()
+    if config is not None and config.compile_commands:
+        base = Path(config.compile_commands).parent
+        for prefix in ("", "app"):
+            for sp in config.source_paths:
+                cand = base / prefix / sp / rel_file
+                if cand.exists():
+                    return str(cand)
+    return ""
+
+
+def _read_source_line(rel_file: str, line_no: int) -> str:
+    """读源文件指定行（1-based），带 mtime 缓存；任何失败返回空串（优雅降级）"""
+    try:
+        abs_path = _resolve_src_path(rel_file)
+        if not abs_path:
+            return ""
+        mtime = Path(abs_path).stat().st_mtime
+        cached = _src_cache.get(abs_path)
+        if cached is None or cached[0] != mtime:
+            with open(abs_path, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            if len(_src_cache) >= _SRC_CACHE_MAX:
+                _src_cache.pop(next(iter(_src_cache)))  # FIFO 驱逐
+            _src_cache[abs_path] = (mtime, lines)
+        lines = _src_cache[abs_path][1]
+        if 1 <= line_no <= len(lines):
+            return lines[line_no - 1].strip()[:200]
+        return ""
+    except Exception:
+        return ""
+
+
+def _annotate_call_lines(results) -> None:
+    """给 CallInfo 列表动态挂 call_line_text（dataclass 无 slots）"""
+    for call in results:
+        f = call.caller_file
+        ln = call.caller_line
+        if f and ln:
+            call.call_line_text = _read_source_line(f, ln)
+
+
+# ── 查询遥测（第二批改进：空结果/耗时分析的数据基础）──
+
+def _telemetry_path() -> Path:
+    return Path(_db_path).parent / "query_telemetry.jsonl"
+
+
+def _telemetry(tool_name: str):
+    """MCP 工具遥测装饰器：append 一行 JSON 到 DB 同目录 query_telemetry.jsonl
+
+    记录 ts/tool/args/n_results/duration_ms；n_results 取返回文本中 '###' 标题数
+    （零侵入的近似计数），参数错误/异常记 -1。遥测自身异常绝不影响查询。
+    """
+    import functools
+    import json as _json
+    import time as _time
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            t0 = _time.monotonic()
+            try:
+                out = fn(*args, **kwargs)
+                n = out.count("###") if isinstance(out, str) else -1
+                return out
+            except Exception:
+                n = -1
+                raise
+            finally:
+                try:
+                    rec = {
+                        "ts": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "tool": tool_name,
+                        "args": {k: v for k, v in kwargs.items() if v},
+                        "n_results": n,
+                        "duration_ms": round((_time.monotonic() - t0) * 1000, 1),
+                    }
+                    with open(_telemetry_path(), "a", encoding="utf-8") as f:
+                        f.write(_json.dumps(rec, ensure_ascii=False) + "\n")
+                except Exception:
+                    pass
+        return wrapper
+    return deco
 
 
 # ── Markdown 格式化 ──
@@ -271,6 +417,19 @@ def _fmt_inheritance(info) -> str:
             f"{parent_ns}{info.parent.name}\n")
 
 
+def _qualified(namespace: str, class_name: str, name: str) -> str:
+    """拼接完整限定名，避免类名双写
+
+    成员函数节点的 namespace 已含所属类（形如 "update::FirmwareUpdate"），
+    此时不能再拼 class_name，否则输出 "update::FirmwareUpdate::FirmwareUpdate::foo"。
+    """
+    if class_name and namespace.endswith(f"::{class_name}"):
+        return f"{namespace}::{name}"
+    ns = f"{namespace}::" if namespace else ""
+    cls = f"{class_name}::" if class_name else ""
+    return f"{ns}{cls}{name}"
+
+
 def _fmt_call_info(call, *, is_caller: bool) -> str:
     """格式化调用关系信息
 
@@ -278,22 +437,24 @@ def _fmt_call_info(call, *, is_caller: bool) -> str:
     is_caller=False: 展示被调用方（它调用了谁）
     """
     if is_caller:
-        ns = f"{call.caller_namespace}::" if call.caller_namespace else ""
-        cls = f"{call.caller_class}::" if call.caller_class else ""
-        return (f"### {ns}{cls}{call.caller_name}\n"
+        line_text = getattr(call, "call_line_text", "")
+        src = f"- 调用点: `{line_text}`\n" if line_text else ""
+        return (f"### {_qualified(call.caller_namespace, call.caller_class, call.caller_name)}\n"
                 f"- 文件: {call.caller_file}:{call.caller_line}\n"
+                f"{src}"
                 f"- 调用类型: {call.call_type}\n")
     else:
-        ns = f"{call.callee_namespace}::" if call.callee_namespace else ""
-        cls = f"{call.callee_class}::" if call.callee_class else ""
-        return (f"### {ns}{cls}{call.callee_name}\n"
+        line_text = getattr(call, "call_line_text", "")
+        src = f"- 调用点: {call.caller_file}:{call.caller_line} `{line_text}`\n" \
+            if line_text else ""
+        return (f"### {_qualified(call.callee_namespace, call.callee_class, call.callee_name)}\n"
                 f"- 文件: {call.callee_file}\n"
+                f"{src}"
                 f"- 调用类型: {call.call_type}\n")
 
 
 def _fmt_override(oi) -> str:
-    ns = f"{oi.namespace}::" if oi.namespace else ""
-    return (f"### {ns}{oi.class_name}::{oi.function_name}\n"
+    return (f"### {_qualified(oi.namespace, oi.class_name, oi.function_name)}\n"
             f"- 签名: {oi.signature}\n"
             f"- 文件: {oi.file_path}:{oi.line_number}\n"
             f"- 重写基类: {oi.base_class}\n")
@@ -432,6 +593,7 @@ def _fmt_blast_radius(result, direction: str) -> str:
 # ── MCP 工具定义 ──
 
 @mcp.tool()
+@_telemetry("cpp_search_class")
 def cpp_search_class(name: str, exact: bool = False) -> str:
     """按类名搜索 C++ 类定义。用于：找类在哪定义、查类的基本信息（命名空间、文件位置、是否抽象）。不适合：查继承关系（用 cpp_get_inheritance）、查函数（用 cpp_search_function）。
 
@@ -446,7 +608,7 @@ def cpp_search_class(name: str, exact: bool = False) -> str:
         return _query_error(e)
 
     if not results:
-        return f'未找到匹配 "{name}" 的类。'
+        return f'未找到匹配 "{name}" 的类。' + '\n提示: 本图谱只覆盖配置的 source_paths 范围（workspace 业务模块）；SDK/BSW/foundation 符号不在覆盖内，请改用 clangd MCP 查询。'
 
     lines = [f'## 搜索结果：类 "{name}"（{len(results)} 个）\n\n']
     for i, ci in enumerate(results, 1):
@@ -455,6 +617,7 @@ def cpp_search_class(name: str, exact: bool = False) -> str:
 
 
 @mcp.tool()
+@_telemetry("cpp_search_function")
 def cpp_search_function(name: str, class_name: str = "") -> str:
     """按函数名搜索 C++ 函数定义。用于：找函数定义位置、查看函数签名和所属类。不适合：查调用关系（用 cpp_get_callers/cpp_get_callees）。
 
@@ -469,7 +632,7 @@ def cpp_search_function(name: str, class_name: str = "") -> str:
         return _query_error(e)
 
     if not results:
-        return f'未找到匹配 "{name}" 的函数。'
+        return f'未找到匹配 "{name}" 的函数。' + '\n提示: 本图谱只覆盖配置的 source_paths 范围（workspace 业务模块）；SDK/BSW/foundation 符号不在覆盖内，请改用 clangd MCP 查询。'
 
     lines = [f'## 搜索结果：函数 "{name}"（{len(results)} 个）\n\n']
     for i, fi in enumerate(results, 1):
@@ -478,6 +641,7 @@ def cpp_search_function(name: str, class_name: str = "") -> str:
 
 
 @mcp.tool()
+@_telemetry("cpp_get_inheritance")
 def cpp_get_inheritance(class_name: str, direction: str = "down",
                         depth: int = 1) -> str:
     """查询类的继承关系（支持多级）。用于：查父类/子类、理解类层次结构。direction="down" 查子类，"up" 查父类。
@@ -510,75 +674,105 @@ def cpp_get_inheritance(class_name: str, direction: str = "down",
 
 
 @mcp.tool()
-def cpp_get_callers(function_name: str, class_name: str = "") -> str:
+@_telemetry("cpp_get_callers")
+def cpp_get_callers(name: str = "", class_name: str = "",
+                    namespace: str = "", function_name: str = "") -> str:
     """查询谁调用了指定函数（影响面分析）。用于：修改函数前评估影响范围、理解函数被谁依赖。不适合：查函数调用了谁（用 cpp_get_callees）。
 
     Args:
-        function_name: 被调用方函数名（如 "getValue"）
+        name: 被调用方函数名（如 "getValue"）
         class_name: 限定所属类名（可选）
+        namespace: 限定函数 namespace（可选，精确匹配如 "update::FileHandler"，
+            消歧同名重载时使用）
+        function_name: 已废弃别名，等价于 name（保留向后兼容）
     """
+    fn = name or function_name
+    if not fn:
+        return "参数错误: 请提供 name（或旧参数 function_name）"
     try:
         _, cq, _, _, _ = _get_queries()
-        results = cq.get_callers(function_name, class_name=class_name or None)
+        results = cq.get_callers(
+            fn, class_name=class_name or None,
+            namespace=namespace or None)
     except Exception as e:
         return _query_error(e)
 
     if not results:
-        return f'未找到调用 "{function_name}" 的代码。'
+        return f'未找到调用 "{fn}" 的代码。' + '\n提示: 本图谱只覆盖配置的 source_paths 范围（workspace 业务模块）；SDK/BSW/foundation 符号不在覆盖内，请改用 clangd MCP 查询。'
 
-    lines = [f'## 调用 "{function_name}" 的代码（{len(results)} 个）\n\n']
+    _annotate_call_lines(results)  # 调用点源码行文本（第二批改进）
+    lines = [f'## 调用 "{fn}" 的代码（{len(results)} 个）\n\n']
     for i, call in enumerate(results, 1):
         lines.append(f"{i}. {_fmt_call_info(call, is_caller=True)}\n")
     return "".join(lines)
 
 
 @mcp.tool()
-def cpp_get_callees(function_name: str, class_name: str = "") -> str:
+@_telemetry("cpp_get_callees")
+def cpp_get_callees(name: str = "", class_name: str = "",
+                    namespace: str = "", function_name: str = "") -> str:
     """查询指定函数调用了谁（调用链分析）。用于：理解函数内部逻辑、追踪依赖路径。不适合：查谁调用了此函数（用 cpp_get_callers）。
 
     Args:
-        function_name: 调用方函数名（如 "doWork"）
+        name: 调用方函数名（如 "doWork"）
         class_name: 限定所属类名（可选）
+        namespace: 限定函数 namespace（可选，精确匹配，消歧同名重载）
+        function_name: 已废弃别名，等价于 name（保留向后兼容）
     """
+    fn = name or function_name
+    if not fn:
+        return "参数错误: 请提供 name（或旧参数 function_name）"
     try:
         _, cq, _, _, _ = _get_queries()
-        results = cq.get_callees(function_name, class_name=class_name or None)
+        results = cq.get_callees(
+            fn, class_name=class_name or None,
+            namespace=namespace or None)
     except Exception as e:
         return _query_error(e)
 
     if not results:
-        return f'未找到 "{function_name}" 调用的代码。'
+        return f'未找到 "{fn}" 调用的代码。' + '\n提示: 本图谱只覆盖配置的 source_paths 范围（workspace 业务模块）；SDK/BSW/foundation 符号不在覆盖内，请改用 clangd MCP 查询。'
 
-    lines = [f'## "{function_name}" 调用的代码（{len(results)} 个）\n\n']
+    _annotate_call_lines(results)  # 调用点源码行文本（第二批改进）
+    lines = [f'## "{fn}" 调用的代码（{len(results)} 个）\n\n']
     for i, call in enumerate(results, 1):
         lines.append(f"{i}. {_fmt_call_info(call, is_caller=False)}\n")
     return "".join(lines)
 
 
 @mcp.tool()
-def cpp_get_overrides(function_name: str, class_name: str) -> str:
+@_telemetry("cpp_get_overrides")
+def cpp_get_overrides(name: str = "", class_name: str = "",
+                      namespace: str = "", function_name: str = "") -> str:
     """查询虚函数的所有重写实现。用于：查接口的所有实现、理解多态调度。适合分析 override 和纯虚函数的具体实现。
 
     Args:
-        function_name: 虚函数名（如 "doWork"）
+        name: 虚函数名（如 "doWork"）
         class_name: 声明该虚函数的基类名（必填，如 "MyBaseClass"）
+        namespace: 限定基类 namespace（可选，精确匹配如 "update"，消歧同名类）
+        function_name: 已废弃别名，等价于 name（保留向后兼容）
     """
+    fn = name or function_name
+    if not fn or not class_name:
+        return "参数错误: 请提供 name（或旧参数 function_name）和 class_name"
     try:
         _, _, pq, _, _ = _get_queries()
-        results = pq.get_all_overrides(function_name, class_name=class_name)
+        results = pq.get_all_overrides(
+            fn, class_name=class_name, namespace=namespace or None)
     except Exception as e:
         return _query_error(e)
 
     if not results:
-        return f'未找到 "{function_name}" 的重写实现。'
+        return f'未找到 "{fn}" 的重写实现。' + '\n提示: 本图谱只覆盖配置的 source_paths 范围（workspace 业务模块）；SDK/BSW/foundation 符号不在覆盖内，请改用 clangd MCP 查询。'
 
-    lines = [f'## "{function_name}" 的重写实现（{len(results)} 个）\n\n']
+    lines = [f'## "{fn}" 的重写实现（{len(results)} 个）\n\n']
     for i, oi in enumerate(results, 1):
         lines.append(f"{i}. {_fmt_override(oi)}\n")
     return "".join(lines)
 
 
 @mcp.tool()
+@_telemetry("cpp_get_file_symbols")
 def cpp_get_file_symbols(file_path: str) -> str:
     """查询文件内的所有类和函数符号。用于：快速了解文件内容、确认文件包含哪些定义。
 
@@ -620,6 +814,44 @@ def cpp_get_file_symbols(file_path: str) -> str:
 
 
 @mcp.tool()
+@_telemetry("cpp_get_include_impact")
+def cpp_get_include_impact(header_path: str) -> str:
+    """查询修改头文件会影响哪些翻译单元（include 依赖影响面）。用于：改 .h 前评估重编译/重解析范围、review 时确认头文件变更波及面。递归追溯（A include B、B include C，则改 C 影响 A、B）。
+
+    Args:
+        header_path: 头文件路径或文件名（部分匹配，如 "base_device_update.h"）
+    """
+    if not header_path:
+        return "参数错误: 请提供 header_path"
+    try:
+        iq = _get_include()
+        affected = iq.get_all_includers(header_path)
+    except Exception as e:
+        return _query_error(e)
+
+    if not affected:
+        return (f'未找到 include "{header_path}" 的翻译单元。\n'
+                f'提示: 本图谱只覆盖配置的 source_paths 范围。'
+                f'SDK/BSW/foundation 头文件不在覆盖内，请改用 clangd 查询。')
+
+    tus = [f for f in affected if f.endswith((".cpp", ".cc", ".cxx"))]
+    headers = [f for f in affected if f not in tus]
+    lines = [f'## 修改 "{header_path}" 的影响面（{len(affected)} 个文件）\n\n']
+    if tus:
+        lines.append(f"### 受影响翻译单元（{len(tus)} 个，下次增量更新会重解析）\n\n")
+        for i, f in enumerate(tus, 1):
+            lines.append(f"{i}. {f}\n")
+    if headers:
+        lines.append(f"\n### 传递包含的中间头文件（{len(headers)} 个）\n\n")
+        for i, f in enumerate(headers[:20], 1):
+            lines.append(f"{i}. {f}\n")
+        if len(headers) > 20:
+            lines.append(f" ... 共 {len(headers)} 个\n")
+    return "".join(lines)
+
+
+@mcp.tool()
+@_telemetry("cpp_traverse_graph")
 def cpp_traverse_graph(start: str, relation_types: list[str] | None = None,
                         direction: str = "outgoing", depth: int = 3,
                         max_results: int = 50) -> str:
@@ -678,6 +910,7 @@ def cpp_traverse_graph(start: str, relation_types: list[str] | None = None,
 
 
 @mcp.tool()
+@_telemetry("cpp_blast_radius")
 def cpp_blast_radius(symbols: list[str] | None = None,
                      files: list[str] | None = None,
                      depth: int = 3,
@@ -720,6 +953,7 @@ def cpp_blast_radius(symbols: list[str] | None = None,
 
 
 @mcp.tool()
+@_telemetry("cpp_search_docs")
 def cpp_search_docs(keyword: str, tag: str = "", max_results: int = 10,
                      min_confidence: float = 0.7) -> str:
     """搜索项目文档，返回文档切片+关联代码。用于：查设计说明、找任务文档、理解架构决策。搜索文档标题和内容，同时定位到相关代码实现。
@@ -753,6 +987,7 @@ def cpp_search_docs(keyword: str, tag: str = "", max_results: int = 10,
 
 
 @mcp.tool()
+@_telemetry("cpp_get_code_docs")
 def cpp_get_code_docs(symbol: str, min_confidence: float = 0.0,
                       max_results: int = 10) -> str:
     """查询描述指定代码符号的文档切片（反向：代码 -> 文档）。用于：改代码前查设计说明、理解某函数/类的设计意图、找架构文档依据。比 cpp_search_docs 反向：给定代码符号，直接返回讲它的文档。

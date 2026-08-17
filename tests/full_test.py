@@ -292,16 +292,116 @@ def grep_scan_dirs(name, kind, dirs):
         return [], 60.0
 
 
+def test_formatter():
+    """0.5 MCP 格式化层单测
+
+    背景：本测试其余部分直读 SQLite，不经过 mcp_server 格式化函数，
+    2026-08-17 的 qualified name 双写 bug 即此盲区漏网。
+    这里直接对格式化函数做纯函数单测（stub 对象，不连 DB）。
+    """
+    import sys
+    from types import SimpleNamespace
+
+    print("=" * 70)
+    print("0.5 MCP 格式化层单测（_qualified / _fmt_call_info / _fmt_override）")
+    print("=" * 70)
+
+    # 导入 server 模块需要 fastmcp；无该依赖时优雅跳过（其余测试不受影响）
+    pkg_parent = str(Path(__file__).resolve().parents[2])
+    if pkg_parent not in sys.path:
+        sys.path.insert(0, pkg_parent)
+    try:
+        from cpp_semantic_graph.mcp_server.server import (
+            _qualified, _fmt_call_info, _fmt_override)
+    except ImportError as e:
+        print(f"  [SKIP] 无法导入 mcp_server.server（{e}），跳过格式化层测试")
+        return
+
+    n_pass = 0
+    n_fail = 0
+
+    def check(desc, actual, expect_sub, not_expect=""):
+        nonlocal n_pass, n_fail
+        ok = expect_sub in actual and (not not_expect or not_expect not in actual)
+        print(f"  [{'✓' if ok else '✗'}] {desc}")
+        if ok:
+            n_pass += 1
+        else:
+            n_fail += 1
+            print(f"      实际输出: {actual!r}")
+
+    # --- _qualified：类名不得双写（2026-08-17 修复回归）---
+    check("成员函数 namespace 已含类名",
+          _qualified("update::FirmwareUpdate", "FirmwareUpdate", "PerformUpdate"),
+          "update::FirmwareUpdate::PerformUpdate", "FirmwareUpdate::FirmwareUpdate")
+    check("自由函数 namespace 无类名",
+          _qualified("update", "", "foo"), "update::foo")
+    check("全局函数", _qualified("", "", "main"), "main")
+    check("多层 namespace", _qualified("a::b::C", "C", "f"), "a::b::C::f")
+    check("namespace 与类名不一致时仍拼接",
+          _qualified("update", "FirmwareUpdate", "f"), "update::FirmwareUpdate::f")
+
+    # --- _fmt_call_info：caller/callee 双分支 ---
+    caller = SimpleNamespace(
+        caller_namespace="update::FirmwareUpdate", caller_class="FirmwareUpdate",
+        caller_name="PerformUpdate", caller_file="chip_update.cpp",
+        caller_line=727, call_type="calls_direct",
+        callee_name="", callee_class="", callee_namespace="",
+        callee_file="", is_virtual_dispatch=False)
+    check("callers 输出无双写",
+          _fmt_call_info(caller, is_caller=True),
+          "update::FirmwareUpdate::PerformUpdate", "FirmwareUpdate::FirmwareUpdate")
+
+    # --- call_line_text 注入展示（第二批改进）---
+    caller2 = SimpleNamespace(
+        caller_namespace="update::FirmwareUpdate", caller_class="FirmwareUpdate",
+        caller_name="PerformUpdate", caller_file="chip_update.cpp",
+        caller_line=727, call_type="calls_direct",
+        call_line_text="ExecuteDriveUpdate(cmd);",
+        callee_name="", callee_class="", callee_namespace="",
+        callee_file="", is_virtual_dispatch=False)
+    check("callers 带 call_line_text 显示调用点",
+          _fmt_call_info(caller2, is_caller=True),
+          "调用点: `ExecuteDriveUpdate(cmd);`")
+    check("无 call_line_text 的 stub 不崩且无调用点行",
+          _fmt_call_info(caller, is_caller=True),
+          "调用类型", "调用点")
+    callee = SimpleNamespace(
+        caller_namespace="", caller_class="", caller_name="",
+        caller_file="", caller_line=0, call_type="calls_direct",
+        callee_namespace="update::FileHandler", callee_class="FileHandler",
+        callee_name="FileExists", callee_file="file_handler.h",
+        is_virtual_dispatch=False)
+    check("callees 输出无双写",
+          _fmt_call_info(callee, is_caller=False),
+          "update::FileHandler::FileExists", "FileHandler::FileHandler")
+
+    # --- _fmt_override ---
+    oi = SimpleNamespace(namespace="update::SwitchUpdate", class_name="SwitchUpdate",
+                         function_name="TryPrepare", signature="bool TryPrepare() override",
+                         file_path="switch_update.cpp", line_number=24,
+                         base_class="DeviceAdapter")
+    check("overrides 输出无双写",
+          _fmt_override(oi),
+          "update::SwitchUpdate::TryPrepare", "SwitchUpdate::SwitchUpdate")
+
+    print(f"\n  格式化层结果: {n_pass} 通过, {n_fail} 失败")
+    if n_fail:
+        raise SystemExit(1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--efficiency", action="store_true")
     ap.add_argument("--accuracy", action="store_true")
+    ap.add_argument("--formatter", action="store_true")
     args = ap.parse_args()
-    run_all = not (args.efficiency or args.accuracy)
+    run_all = not (args.efficiency or args.accuracy or args.formatter)
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     try:
+        test_formatter()
         if run_all or True:
             test_smoke(conn)
         if run_all or args.accuracy:

@@ -76,6 +76,7 @@ class CallQuery:
         func_name: str,
         class_name: str | None = None,
         call_type: str | None = None,
+        namespace: str | None = None,
     ) -> list[CallInfo]:
         """查询谁调用了指定函数
 
@@ -83,12 +84,15 @@ class CallQuery:
             func_name: 被调用方函数名
             class_name: 限定被调用方所属类
             call_type: 限定调用类型 (direct / virtual / callback)
+            namespace: 限定被调用方 namespace（精确匹配，消歧同名重载）
+                成员函数形如 "update::FileHandler"，自由函数形如 "update"
 
         Returns:
             调用方信息列表
         """
         # 找到目标函数节点
-        target_ids = self._find_function_ids(func_name, class_name)
+        target_ids = self._find_function_ids(
+            func_name, class_name, namespace=namespace)
         if not target_ids:
             return []
 
@@ -155,6 +159,7 @@ class CallQuery:
         func_name: str,
         class_name: str | None = None,
         call_type: str | None = None,
+        namespace: str | None = None,
     ) -> list[CallInfo]:
         """查询指定函数调用了谁
 
@@ -162,12 +167,14 @@ class CallQuery:
             func_name: 调用方函数名
             class_name: 限定调用方所属类
             call_type: 限定调用类型
+            namespace: 限定调用方 namespace（精确匹配，消歧同名重载）
 
         Returns:
             被调用方信息列表
         """
         # 找到调用方函数节点
-        source_ids = self._find_function_ids(func_name, class_name)
+        source_ids = self._find_function_ids(
+            func_name, class_name, namespace=namespace)
         if not source_ids:
             return []
 
@@ -439,24 +446,28 @@ class CallQuery:
 
     def _find_function_ids(
         self, func_name: str, class_name: str | None = None,
+        namespace: str | None = None,
     ) -> list[int]:
         """查找函数节点 ID 列表
 
         优先返回 .cpp 定义节点（有调用边），.h 声明节点排后。
         通过 namespace LIKE 匹配类名，同时覆盖声明和定义节点。
+        namespace 参数为精确匹配（消歧同名重载），优先于 class_name 生效。
         """
+        all_funcs = self.db.find_node_by_name(func_name, "function")
+        matched = all_funcs
+        if namespace:
+            # 精确匹配 namespace（如 "update::FileHandler"），排除同名重载
+            matched = [n for n in matched
+                       if (n.get("namespace", "") or "") == namespace]
         if class_name:
             # 按 namespace 匹配类名 + 函数名查找
             # namespace 是 '::' 分隔路径（末段=所属类名），按段精确匹配避免子串误匹配（主题A-5）
             # 'Update' 不再误匹配 'FirmwareUpdate'
-            all_funcs = self.db.find_node_by_name(func_name, "function")
             matched = [
-                n for n in all_funcs
+                n for n in matched
                 if class_name in ((n.get("namespace", "") or "").split("::"))
             ]
-        else:
-            # 只按函数名查找
-            matched = self.db.find_node_by_name(func_name, "function")
 
         # 定义优先（.cpp/.cc 文件中的节点通常有调用边）
         definition_ids = [n["id"] for n in matched
