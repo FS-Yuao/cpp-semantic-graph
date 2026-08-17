@@ -152,6 +152,7 @@ class DocIngester:
             "files_skipped": 0,
             "sections_created": 0,
             "sections_updated": 0,
+            "sections_deleted": 0,
         }
 
         md_files = sorted(doc_root.rglob("*.md"))
@@ -195,6 +196,16 @@ class DocIngester:
                 else:
                     self.db.upsert_node(node)
                     stats["sections_created"] += 1
+
+            # P1 修复（2026-08-17）：清理该文件的过期 doc_section。
+            # unique_key 含行号，文档编辑后行号漂移会产生新 key，旧 key 节点
+            # 若不清理会永久残留（重复累积，连带关联边成对膨胀）。
+            # 权威集合 = 本次解析出的 unique_keys；CASCADE 连带删重复关联边。
+            deleted = self.db.delete_removed_nodes(
+                rel_path, {s.unique_key for s in sections})
+            if deleted:
+                stats["sections_deleted"] += deleted
+                logger.info("清理 %s: 删除 %d 个过期 doc_section", rel_path, deleted)
 
             stats["files_processed"] += 1
 
