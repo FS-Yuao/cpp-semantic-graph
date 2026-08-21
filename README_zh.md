@@ -557,7 +557,7 @@ section_split:
 
 # 手动精准关联（不侵入文档原文）
 manual_links:
-  - doc: "architecture/OTA_FLOW.md"
+  - doc: "architecture/UPDATE_FLOW.md"
     heading: "升级流程"
     code:
       - "DeviceAdapter"
@@ -576,6 +576,44 @@ pip install sentence-transformers
 ```
 
 默认使用 `all-MiniLM-L6-v2` 模型。中文项目建议换 `bge-small-zh-v1.5` 或 `multilingual-e5-small`。
+
+---
+
+## 🧠 记忆层（findings）—— 别再重复推导同样的结论
+
+`doc_graph/` 子项目把文档融合升级为**团队记忆中枢**：AI 会话中得出的持久结论
+（约束/教训/决策/事实/风险）作为一等记录存储，**锚定到代码符号**，查询触达
+该符号时自动浮出。
+
+```
+会话得出结论
+  → record_finding_tool（幂等写入 + 符号锚定）
+  → 下个会话查询该符号 → 结论自动带出
+  → 代码演进 → check_finding_freshness 自动标记失效
+```
+
+**在文档融合之上新增的能力：**
+
+| 能力 | 实现方式 |
+|------|---------|
+| 结论存储 | 独立 SQLite 三表（finding / finding_symbol / finding_fts），全量重建不丢 |
+| 符号锚定 | 结论挂到代码符号；任何图谱查询触达该符号即召回 |
+| 三路 RRF 检索 | FTS5 + LIKE + 符号反查并行，Reciprocal Rank Fusion 融合 |
+| 中文/驼峰分词 | 查 "boot chain" 能命中 `QueryBootChain`；中文逐字匹配 |
+| 同义扩展 | 内置中英技术词表（崩溃↔crash↔挂↔abort…），口语查询命中书面结论 |
+| 向量重排（可选） | 本地 bge-small（fastembed，纯 CPU），仅对词法命中集重排 |
+| 失效检测 | 锚定符号与代码图谱比对，符号消失 → 自动标 stale |
+
+**如实的工程结论**（全部实测过，详见 `doc_graph/` 文档）：
+- bi-encoder（bge-small 33M、e5-large 560M）对"短中文查询 vs 短中文结论"**无判别力**——
+  所有相似度挤在 0.8+ 密集区，阈值不可分。因此向量**只用于词法命中集内的重排**，
+  不作独立召回源。
+- cross-encoder（bge-reranker-base）强否定可靠、弱肯定不可靠——留作可选闸门，非默认。
+- 最终方案很朴素：调用侧改写（MCP 调用方本身就是 LLM）+ 确定性同义词表。
+  零 API、零 GPU、完全离线。
+
+服务形态为 **streamable-HTTP 单例**（systemd 守护），所有 MCP 客户端共享单进程，
+详见 `doc_graph/README.md`。
 
 ---
 

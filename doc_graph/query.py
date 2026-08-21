@@ -18,6 +18,8 @@ from __future__ import annotations
 import os, sys, json, sqlite3, argparse, re
 from collections import deque
 
+from finding_store import search_findings, get_findings_by_symbols
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB = os.path.join(SCRIPT_DIR, "doc_graph.db")
 # cppsg 代码图谱：默认在上级目录（cpp_semantic_graph/semantic_graph_full.db）
@@ -31,55 +33,107 @@ def get_conn(db_path: str = DEFAULT_DB) -> sqlite3.Connection:
     return conn
 
 
-# ─── 1. FTS5 起始节点定位 ─────────────────────────────────────
+# ─── 1. 起始节点定位（三路并行 + RRF 融合）─────────────────────
+
+def _rrf_fuse(rankings: list[list[str]], sources: list[str],
+              k: int = 60, limit: int = 5,
+              full_backstop: tuple[str, ...] = ("fts5",)) -> list[dict]:
+    """多路排序结果 RRF 融合：score(d) = Σ 1/(k + rank_i(d))，k=60。
+
+    两路同时命中的文档得分高于任一单路，天然实现"多证据优先"。
+    保底规则（回归护栏 A6）：
+      - full_backstop 中的路（默认 fts5）：top-limit 全部保底入选——
+        旧降级链在 FTS5 命中时起点集就是 FTS5 top-limit，全保才能保证
+        融合起始集是旧行为的超集，BFS 召回单调不减；
+      - 其他路：rank-1 保底（旧链中它们只在 FTS5 miss 时作为起点）。
+    """
+    scores: dict[str, float] = {}
+    hit_sources: dict[str, list[str]] = {}
+    backstop_ids: list[str] = []
+    for ranking, src in zip(rankings, sources):
+        for rank, doc_id in enumerate(ranking):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
+            hit_sources.setdefault(doc_id, []).append(src)
+        if src in full_backstop:
+            backstop_ids.extend(ranking[:limit])
+        elif ranking:
+            backstop_ids.append(ranking[0])
+
+    fused_ids = [d for d, _ in sorted(scores.items(), key=lambda x: -x[1])]
+    # 保底：RRF top-limit 之后，按优先级追加未入选的保底文档
+    selected = fused_ids[:limit]
+    for bid in backstop_ids:
+        if bid not in selected:
+            selected.append(bid)
+
+    return [{"doc_id": d, "score": round(scores.get(d, 0.0), 6),
+             "source": "+".join(hit_sources.get(d, ["leader"]))}
+            for d in selected]
+
 
 def fts5_search(conn: sqlite3.Connection, keyword: str, limit: int = 5) -> list[dict]:
-    """FTS5 全文搜索 → 起始文档列表。未命中时降级为 LIKE 搜索。"""
-    try:
-        tokens = re.findall(r'[A-Za-z]+|\d+|[\u4e00-\u9fff]+', keyword)
-        # 空串或纯标点（提取不到有效 token）直接返回空，避免 FTS5 语法错 + LIKE %% 全匹配
-        if not tokens:
-            return []
-        match_parts = []
-        for t in tokens:
-            if re.match(r'^[\u4e00-\u9fff]+$', t):
-                match_parts.extend(list(t))
-            else:
-                match_parts.append(t)
-        match_expr = ' OR '.join(match_parts)
+    """三路并行检索起始文档 + RRF 融合排序。
 
+    路 1 FTS5 全文（title/summary/path/tags）
+    路 2 LIKE 子串（标题/摘要兜底，FTS5 分词 miss 时仍可命中）
+    路 3 符号反查（关键词命中 symbol 名 → 提到该符号的文档）
+
+    原为降级链（FTS5 命中即短路），现改为三路全跑 + 融合：
+    排序只会因多路证据而更优，且单路 miss 不再丢结果。
+    """
+    tokens = re.findall(r'[A-Za-z]+|\d+|[\u4e00-\u9fff]+', keyword)
+    if not tokens:
+        return []
+    match_parts = []
+    for t in tokens:
+        if re.match(r'^[\u4e00-\u9fff]+$', t):
+            match_parts.extend(list(t))
+        else:
+            match_parts.append(t)
+    match_expr = ' OR '.join(match_parts)
+
+    per_route = limit * 3  # 每路多取，融合后截断
+    rankings: list[list[str]] = []
+    route_names: list[str] = []
+
+    # 路 1: FTS5
+    try:
         rows = conn.execute("""
             SELECT doc_id, bm25(doc_fts) AS score
             FROM doc_fts WHERE doc_fts MATCH ?
             ORDER BY score LIMIT ?
-        """, (match_expr, limit)).fetchall()
-
+        """, (match_expr, per_route)).fetchall()
         if rows:
-            return [{"doc_id": r["doc_id"], "score": r["score"], "source": "fts5"} for r in rows]
+            rankings.append([r["doc_id"] for r in rows])
+            route_names.append("fts5")
     except Exception as e:
-        # 记录错误但不中断，降级到 LIKE 搜索
-        print(f"[doc_graph] FTS5 搜索降级到 LIKE: {e}", file=sys.stderr)
+        print(f"[doc_graph] FTS5 路异常（跳过，不影响其他路）: {e}", file=sys.stderr)
 
-    # 降级：LIKE 搜索标题/路径/标签/摘要
+    # 路 2: LIKE（标题/摘要/路径/标签子串）
     rows = conn.execute("""
-        SELECT id AS doc_id, 0 AS score
+        SELECT id AS doc_id
         FROM node WHERE type = 'document'
-          AND (title LIKE ? OR path LIKE ? OR tags LIKE ? OR summary LIKE ?)
+          AND (title LIKE ? OR summary LIKE ? OR path LIKE ? OR tags LIKE ?)
         LIMIT ?
-    """, (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit)).fetchall()
-
+    """, (f"%{keyword}%",) * 4 + (per_route,)).fetchall()
     if rows:
-        return [{"doc_id": r["doc_id"], "score": 0, "source": "like"} for r in rows]
+        rankings.append([r["doc_id"] for r in rows])
+        route_names.append("like")
 
-    # 再降级：符号反查（搜索关键词匹配 symbol 名 → 找到提到该符号的文档）
+    # 路 3: 符号反查
     rows = conn.execute("""
-        SELECT DISTINCT e.src AS doc_id, 0 AS score
+        SELECT DISTINCT e.src AS doc_id
         FROM edge e
         WHERE e.rel = 'mentions_symbol' AND e.dst LIKE ?
         LIMIT ?
-    """, (f"%{keyword}%", limit)).fetchall()
+    """, (f"%{keyword}%", per_route)).fetchall()
+    if rows:
+        rankings.append([r["doc_id"] for r in rows])
+        route_names.append("symbol")
 
-    return [{"doc_id": r["doc_id"], "score": 0, "source": "symbol"} for r in rows]
+    if not rankings:
+        return []
+    return _rrf_fuse(rankings, route_names, limit=limit)
 
 
 # ─── 2. BFS 图遍历 ────────────────────────────────────────────
@@ -212,16 +266,24 @@ def doc_graph_search(keyword: str, depth: int = 2,
                      edge_filter: list[str] | None = None,
                      bridge_to_code: bool = True,
                      db_path: str = DEFAULT_DB) -> dict:
-    """搜索文档图谱，返回结构化关联结果"""
+    """搜索文档图谱，返回结构化关联结果（含经验结论 findings）"""
     conn = get_conn(db_path)
     try:
-        # Step 1: FTS5 定位
+        # Step 1: 三路融合定位起始文档
         start_docs = fts5_search(conn, keyword, limit=3)
+
+        # Step 1.5: 经验结论——关键词直查（即使无文档命中也返回）
+        findings: list[dict] = []
+        seen_fids: set[str] = set()
+        for f in search_findings(keyword=keyword, limit=5, db_path=db_path):
+            seen_fids.add(f["id"])
+            findings.append(f)
 
         if not start_docs:
             return {"query": keyword, "start_docs": [], "docs": [], "knowledge": [],
-                    "symbols": [], "code_nodes": [],
-                    "message": f"未找到匹配 '{keyword}' 的文档"}
+                    "symbols": [], "code_nodes": [], "findings": findings,
+                    "message": (f"未找到匹配 '{keyword}' 的文档"
+                                + (f"，但有 {len(findings)} 条相关经验结论" if findings else ""))}
 
         # Step 2: BFS 遍历
         all_results = {"docs": [], "knowledge": [], "symbols": []}
@@ -264,8 +326,21 @@ def doc_graph_search(keyword: str, depth: int = 2,
                     code_nodes.append({"symbol": sym["name"],
                                        "confidence": sym["confidence"], "cppsg": cppsg_nodes})
 
+        # Step 4: 经验结论——BFS 符号交集 + cppsg 命中符号反查
+        anchor_names = [s["name"] for s in all_results["symbols"][:30]]
+        for cn in code_nodes:
+            for node in cn.get("cppsg", []):
+                if isinstance(node, dict) and node.get("name"):
+                    anchor_names.append(node["name"])
+        for f in get_findings_by_symbols(anchor_names, db_path=db_path):
+            if f["id"] not in seen_fids:
+                seen_fids.add(f["id"])
+                findings.append(f)
+        findings.sort(key=lambda x: (x.get("status") != "active",
+                                     x.get("updated_at", "")), reverse=False)
+
         return {"query": keyword, "start_docs": start_docs,
-                **all_results, "code_nodes": code_nodes}
+                **all_results, "code_nodes": code_nodes, "findings": findings}
     finally:
         conn.close()
 
@@ -326,6 +401,15 @@ def print_result(result: dict):
                     print(f"      调用方: {', '.join(c['name'] for c in node['callers'][:5])}")
                 if node.get("callees"):
                     print(f"      被调用: {', '.join(c['name'] for c in node['callees'][:5])}")
+
+    if result.get("findings"):
+        print(f"\n🧠 经验结论 ({len(result['findings'])} 条):")
+        for f in result['findings'][:10]:
+            mark = " ⚠️stale" if f.get("status") == "stale" else ""
+            conf = "" if f.get("confidence") == "confirmed" else " (suspected)"
+            print(f"  [{f.get('ftype',''):10s}] {f.get('title','')[:60]}{mark}{conf}")
+            if f.get("symbols"):
+                print(f"      锚定符号: {', '.join(f['symbols'][:5])}")
 
 
 def main():

@@ -416,14 +416,7 @@ def detect_doc_type(rel_path: str, content: str, frontmatter: dict) -> str:
     if '/review_reports/' in p or p.startswith('review_reports/'): return 'review'
     if '/task/' in p or p.startswith('task/'):             return 'task'
     if 'completion status' in p:                            return 'report'
-    if '/ab_switch/' in p:                                   return 'link'
-    if '/doip_uds/' in p:                                    return 'link'
-    if '/ota_flow/' in p:                                   return 'link'
-    if '/du_mcc/' in p:                                      return 'link'
-    if '/nvidia_switch_upgrade/' in p:                      return 'link'
-    if '/origin_requier/' in p:                             return 'requirement'
-    if '/workspace_system_architecture/' in p:                 return 'design'
-    if 'claude_code_graph' in p:                             return 'report'
+    # 项目特定目录 → doc_type 的映射在此按需扩展（如 if '/my_link_dir/' in p: return 'link'）
     if re.search(r'## .+\n-\s*\*\*类型\*\*', content):       return 'diary'
     return 'doc'
 
@@ -652,7 +645,14 @@ def parse_doc(full_path: str, rel_path: str,
 # ─── SQLite 输出 ──────────────────────────────────────────────
 
 def write_sqlite(nodes: list[Node], edges: list[Edge], db_path: str):
-    """写入 SQLite 数据库（含 FTS5）"""
+    """写入 SQLite 数据库（含 FTS5）。
+
+    全量重建前先导出经验结论（finding 三表），重建后回写——
+    finding 由 MCP 在线写入，生命周期独立于本解析管道（见 finding_store.py）。
+    """
+    from finding_store import export_findings, import_findings
+    finding_snapshot = export_findings(db_path)
+
     if os.path.exists(db_path):
         os.remove(db_path)
 
@@ -738,6 +738,11 @@ def write_sqlite(nodes: list[Node], edges: list[Edge], db_path: str):
 
     conn.commit()
     conn.close()
+
+    # 回写经验结论（finding 三表独立于本次重建）
+    restored = import_findings(finding_snapshot, db_path)
+    if restored:
+        print(f"🧠 已保留经验结论 {restored} 条（finding 表不受全量重建影响）")
 
 
 # ─── 验证报告 ─────────────────────────────────────────────────
@@ -832,7 +837,7 @@ def print_validation_report(nodes, edges, warnings):
 def main():
     parser = argparse.ArgumentParser(description='文档知识图谱解析器 v2')
     parser.add_argument('docs_root', nargs='?', default='../..',
-                        help='docs 根目录（默认：../../ 即 example_update_service/docs/）')
+                        help='docs 根目录（默认：../../ 即你的项目 docs/ 目录）')
     parser.add_argument('--db', default='doc_graph.db', help='SQLite 输出路径')
     parser.add_argument('--json', default=None, help='JSON 输出路径（可选）')
     parser.add_argument('--config', default=None, help='doc_config.yaml 路径（不指定则自动查找）')

@@ -572,8 +572,8 @@ section_split:
 
 # Manual precise links (no intrusion into doc text)
 manual_links:
-  - doc: "architecture/OTA_FLOW.md"
-    heading: "升级流程"
+  - doc: "architecture/UPDATE_FLOW.md"
+    heading: "Update flow"
     code:
       - "DeviceAdapter"
       - "FirmwareUpdate"
@@ -593,6 +593,47 @@ pip install sentence-transformers
 ```
 
 Defaults to `all-MiniLM-L6-v2`. For Chinese projects, `bge-small-zh-v1.5` or `multilingual-e5-small` is recommended.
+
+---
+
+## 🧠 Memory layer (findings) — stop re-deriving the same conclusions
+
+The `doc_graph/` sub-project extends doc fusion into a **team memory hub**: durable
+conclusions from AI sessions (constraints, lessons, decisions, facts, risks) are
+stored as first-class records, **anchored to code symbols**, and automatically
+surfaced whenever those symbols are queried.
+
+```
+Session derives a conclusion
+  → record_finding_tool (idempotent, symbol-anchored)
+  → next session queries the symbol → finding surfaces automatically
+  → code evolves → check_finding_freshness marks it stale
+```
+
+**What it adds on top of doc fusion:**
+
+| Capability | How |
+|------------|-----|
+| Finding store | Independent SQLite tables (finding / finding_symbol / finding_fts), survives full graph rebuilds |
+| Symbol anchoring | Findings link to code symbols; any doc-graph query touching that symbol brings them back |
+| 3-way RRF retrieval | FTS5 + LIKE + symbol backref run in parallel, fused with Reciprocal Rank Fusion |
+| CJK & camelCase tokenization | `QueryBootChain` is found by "boot chain"; Chinese matched per-character |
+| Synonym expansion | Built-in zh↔en tech table (崩溃↔crash↔挂↔abort…) — colloquial queries hit formal conclusions |
+| Vector rerank (optional) | Local bge-small via fastembed, CPU-only, reranks lexical hits only |
+| Staleness detection | Anchored symbols checked against the code graph; vanished symbols → `stale` |
+
+**Honest engineering notes** (all measured, see `doc_graph/` docs):
+- Bi-encoders (bge-small 33M, e5-large 560M) **cannot** separate relevant from
+  irrelevant pairs for "short zh query vs short zh conclusion" — everything sits
+  in a dense 0.8+ similarity band. Vectors are therefore used **only for reranking
+  lexical hits**, never as an independent recall source.
+- A cross-encoder (bge-reranker-base) gives reliable *strong negatives* but
+  unreliable *weak positives* — kept as an optional gate, not shipped as default.
+- The winning combo is boring: caller-side rewriting (the MCP caller *is* an LLM)
+  + a deterministic synonym table. Zero API, zero GPU, fully offline.
+
+Runs as a **streamable-HTTP singleton** (systemd), so all MCP clients share one
+process — see `doc_graph/README.md`.
 
 ---
 

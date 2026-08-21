@@ -58,3 +58,15 @@ du_package/
 # 运行时遥测与备份（2026-08-17）
 query_telemetry.jsonl
 doc_graph/doc_graph.db.bak
+
+# 内部任务记录与实验脚本（2026-08-21 开源脱敏，勿提交）
+doc_graph/tasks/
+doc_graph/legacy_snapshot*/
+doc_graph/test_memory_layer.py
+
+# 本地运行配置（指向内部代码路径；公开版用 cpp_semantic_graph.yaml.template）
+cpp_semantic_graph.yaml
+config/doc_config.yaml
+
+# 内部验证基线（含内部代码符号）
+validation/clangd_baseline.json
