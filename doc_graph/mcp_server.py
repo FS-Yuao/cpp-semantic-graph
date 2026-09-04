@@ -47,7 +47,7 @@ def doc_graph_search_tool(
     bridge_to_code: bool = True,
     edge_filter: list[str] | None = None,
 ) -> str:
-    """搜索文档知识图谱，返回文档、知识点、代码符号和关联的代码节点。
+    """[deprecated → doc_search(scope=all)] 搜索文档知识图谱，返回文档、知识点、代码符号和关联的代码节点。
 
     当用户问关于文档关联、任务历史、决策追溯、设计方案等问题时使用此工具。
     当用户需要同时查文档和代码时，设置 bridge_to_code=true。
@@ -86,7 +86,7 @@ def doc_graph_search_tool(
 
 @mcp.tool()
 def list_documents(doc_type: str = "", status: str = "") -> str:
-    """列出文档图谱中的所有文档，可按类型和状态过滤。
+    """[deprecated → doc_admin(action=list)] 列出文档图谱中的所有文档，可按类型和状态过滤。
 
     Args:
         doc_type: 文档类型过滤，可选: task, diary, review, design, link, requirement, report
@@ -168,7 +168,7 @@ def search_findings_tool(
     ftype: str = "",
     limit: int = 10,
 ) -> str:
-    """检索已沉淀的经验结论（上次关于 X 的结论/教训/约束是什么）。
+    """[deprecated → doc_search(scope=findings)] 检索已沉淀的经验结论（上次关于 X 的结论/教训/约束是什么）。
 
     与 doc_graph_search_tool 的区别：本工具只查经验结论（finding）表，不遍历文档图，
     适合"之前得出过什么结论"的直查。doc_graph_search_tool 的结果里也会附带 findings。
@@ -193,7 +193,7 @@ def search_findings_tool(
 
 @mcp.tool()
 def check_finding_freshness_tool() -> str:
-    """检测经验结论的时效性：锚定符号在 cppsg 代码图谱中是否还存在。
+    """[deprecated → doc_admin(action=freshness)] 检测经验结论的时效性：锚定符号在 cppsg 代码图谱中是否还存在。
 
     代码重构/删除后，结论可能已失效。本工具将 finding 锚定的符号与 cppsg
     当前节点比对（宽松匹配），自动做幂等状态迁移：
@@ -212,7 +212,7 @@ def check_finding_freshness_tool() -> str:
 
 @mcp.tool()
 def get_doc_stats() -> str:
-    """获取文档知识图谱的统计信息。
+    """[deprecated → doc_admin(action=stats)] 获取文档知识图谱的统计信息。
 
     Returns:
         JSON 格式的统计信息，含节点数、边数、文档类型分布、边类型分布等。
@@ -324,3 +324,98 @@ if __name__ == "__main__":
         mcp.run(transport="streamable-http")
     else:
         mcp.run()
+
+
+# ============ 场景化打包工具（2026-09-03，与 cppsg tool_consolidation_design 同型）============
+# 6→3：doc_search（检索合并）/ record_finding_tool（写，保留）/ doc_admin（管理合并）。
+# 旧工具 docstring 标 deprecated 保留兜底，usage 归零后删除。
+
+@mcp.tool()
+def doc_search(
+    keyword: str = "",
+    scope: str = "all",
+    symbol: str = "",
+    ftype: str = "",
+    depth: int = 2,
+    bridge_to_code: bool = True,
+    limit: int = 10,
+) -> str:
+    """场景化检索文档知识图谱。scope="all"（默认）= 全图检索（文档+知识点+符号+findings，BFS 关联）；
+    scope="findings" = 直查经验结论表（"之前关于 X 的结论/教训/约束"）。
+
+    Args:
+        keyword: 关键词（中英文均可，建议附带同义词提升召回，如"崩溃 crash 挂"）
+        scope: "all"（默认，全图）/ "findings"（只查经验结论）
+        symbol: scope="findings" 时可按代码符号过滤（返回锚定该符号的所有结论）
+        ftype: scope="findings" 时类型过滤: fact | constraint | decision | lesson | risk
+        depth: scope="all" 时 BFS 遍历深度（默认 2）
+        bridge_to_code: scope="all" 时是否桥接 cppsg 代码节点（默认 true）
+        limit: scope="findings" 时最大返回条数（默认 10）
+    """
+    db_path = os.environ.get("DOC_GRAPH_DB", DEFAULT_DB)
+    if scope == "findings":
+        result = search_findings(keyword=keyword, symbol=symbol, ftype=ftype,
+                                 limit=limit, db_path=db_path)
+        return json.dumps({"total": len(result), "findings": result},
+                          ensure_ascii=False, indent=2, default=str)
+    result = doc_graph_search(
+        keyword=keyword, depth=depth, edge_filter=None,
+        bridge_to_code=bridge_to_code, db_path=db_path,
+    )
+    return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+
+
+@mcp.tool()
+def doc_admin(action: str = "stats", doc_type: str = "", status: str = "") -> str:
+    """场景化管理查询：action="stats"（图谱统计：节点/边/类型分布/覆盖率）、"list"（文档清单，可按类型/状态过滤）、"freshness"（finding 时效检查：锚定符号在 cppsg 是否仍存在，重建后调用）。
+
+    Args:
+        action: "stats"（默认）/ "list" / "freshness"
+        doc_type: action="list" 时类型过滤: task, diary, review, design, link, requirement, report
+        status: action="list" 时状态过滤（如: 已完成, 待评审）
+    """
+    import sqlite3
+    db_path = os.environ.get("DOC_GRAPH_DB", DEFAULT_DB)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        if action == "freshness":
+            return json.dumps(check_freshness(db_path=db_path),
+                              ensure_ascii=False, indent=2, default=str)
+        if action == "list":
+            query = ("SELECT id, title, summary, doc_type, status, date, path "
+                     "FROM node WHERE type = 'document'")
+            params = []
+            if doc_type:
+                query += " AND doc_type = ?"
+                params.append(doc_type)
+            if status:
+                query += " AND status LIKE ?"
+                params.append(f"%{status}%")
+            query += " ORDER BY date DESC"
+            docs = [dict(r) for r in conn.execute(query, params).fetchall()]
+            return json.dumps({"total": len(docs), "documents": docs},
+                              ensure_ascii=False, indent=2)
+        node_total = conn.execute("SELECT COUNT(*) FROM node").fetchone()[0]
+        edge_total = conn.execute("SELECT COUNT(*) FROM edge").fetchone()[0]
+        doc_types = conn.execute(
+            "SELECT doc_type, COUNT(*) as cnt FROM node WHERE type='document' "
+            "GROUP BY doc_type ORDER BY cnt DESC").fetchall()
+        edge_types = conn.execute(
+            "SELECT rel, COUNT(*) as cnt, SUM(manual) as manual_cnt FROM edge "
+            "GROUP BY rel ORDER BY cnt DESC").fetchall()
+        doc_total = conn.execute(
+            "SELECT COUNT(*) FROM node WHERE type='document'").fetchone()[0]
+        legacy = conn.execute(
+            "SELECT COUNT(*) FROM node WHERE type='document' AND legacy=1").fetchone()[0]
+        manual = conn.execute(
+            "SELECT COUNT(*) FROM node WHERE type='document' AND manual=1").fetchone()[0]
+        return json.dumps({
+            "nodes": node_total, "edges": edge_total,
+            "documents": doc_total, "legacy_documents": legacy,
+            "manual_documents": manual,
+            "doc_type_distribution": [dict(r) for r in doc_types],
+            "edge_type_distribution": [dict(r) for r in edge_types],
+        }, ensure_ascii=False, indent=2, default=str)
+    finally:
+        conn.close()

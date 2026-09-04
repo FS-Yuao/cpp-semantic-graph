@@ -595,7 +595,7 @@ def _fmt_blast_radius(result, direction: str) -> str:
 @mcp.tool()
 @_telemetry("cpp_search_class")
 def cpp_search_class(name: str, exact: bool = False) -> str:
-    """按类名搜索 C++ 类定义。用于：找类在哪定义、查类的基本信息（命名空间、文件位置、是否抽象）。不适合：查继承关系（用 cpp_get_inheritance）、查函数（用 cpp_search_function）。
+    """[deprecated → cpp_symbol_lookup] 按类名搜索 C++ 类定义。用于：找类在哪定义、查类的基本信息（命名空间、文件位置、是否抽象）。不适合：查继承关系（用 cpp_get_inheritance）、查函数（用 cpp_search_function）。
 
     Args:
         name: 类名（支持模糊匹配，如 "MyClass" 或 "Update"）
@@ -619,7 +619,7 @@ def cpp_search_class(name: str, exact: bool = False) -> str:
 @mcp.tool()
 @_telemetry("cpp_search_function")
 def cpp_search_function(name: str, class_name: str = "") -> str:
-    """按函数名搜索 C++ 函数定义。用于：找函数定义位置、查看函数签名和所属类。不适合：查调用关系（用 cpp_get_callers/cpp_get_callees）。
+    """[deprecated → cpp_symbol_lookup] 按函数名搜索 C++ 函数定义。用于：找函数定义位置、查看函数签名和所属类。不适合：查调用关系（用 cpp_get_callers/cpp_get_callees）。
 
     Args:
         name: 函数名（如 "doWork"）
@@ -677,7 +677,7 @@ def cpp_get_inheritance(class_name: str, direction: str = "down",
 @_telemetry("cpp_get_callers")
 def cpp_get_callers(name: str = "", class_name: str = "",
                     namespace: str = "", function_name: str = "") -> str:
-    """查询谁调用了指定函数（影响面分析）。用于：修改函数前评估影响范围、理解函数被谁依赖。不适合：查函数调用了谁（用 cpp_get_callees）。
+    """[deprecated → cpp_relationship] 查询谁调用了指定函数（影响面分析）。用于：修改函数前评估影响范围、理解函数被谁依赖。不适合：查函数调用了谁（用 cpp_get_callees）。
 
     Args:
         name: 被调用方函数名（如 "getValue"）
@@ -711,7 +711,7 @@ def cpp_get_callers(name: str = "", class_name: str = "",
 @_telemetry("cpp_get_callees")
 def cpp_get_callees(name: str = "", class_name: str = "",
                     namespace: str = "", function_name: str = "") -> str:
-    """查询指定函数调用了谁（调用链分析）。用于：理解函数内部逻辑、追踪依赖路径。不适合：查谁调用了此函数（用 cpp_get_callers）。
+    """[deprecated → cpp_relationship] 查询指定函数调用了谁（调用链分析）。用于：理解函数内部逻辑、追踪依赖路径。不适合：查谁调用了此函数（用 cpp_get_callers）。
 
     Args:
         name: 调用方函数名（如 "doWork"）
@@ -744,7 +744,7 @@ def cpp_get_callees(name: str = "", class_name: str = "",
 @_telemetry("cpp_get_overrides")
 def cpp_get_overrides(name: str = "", class_name: str = "",
                       namespace: str = "", function_name: str = "") -> str:
-    """查询虚函数的所有重写实现。用于：查接口的所有实现、理解多态调度。适合分析 override 和纯虚函数的具体实现。
+    """[deprecated → cpp_relationship] 查询虚函数的所有重写实现。用于：查接口的所有实现、理解多态调度。适合分析 override 和纯虚函数的具体实现。
 
     Args:
         name: 虚函数名（如 "doWork"）
@@ -774,7 +774,7 @@ def cpp_get_overrides(name: str = "", class_name: str = "",
 @mcp.tool()
 @_telemetry("cpp_get_file_symbols")
 def cpp_get_file_symbols(file_path: str) -> str:
-    """查询文件内的所有类和函数符号。用于：快速了解文件内容、确认文件包含哪些定义。
+    """[deprecated → cpp_symbol_lookup] 查询文件内的所有类和函数符号。用于：快速了解文件内容、确认文件包含哪些定义。
 
     Args:
         file_path: 文件路径（部分匹配即可，如 "my_module.h"）
@@ -816,7 +816,7 @@ def cpp_get_file_symbols(file_path: str) -> str:
 @mcp.tool()
 @_telemetry("cpp_get_include_impact")
 def cpp_get_include_impact(header_path: str) -> str:
-    """查询修改头文件会影响哪些翻译单元（include 依赖影响面）。用于：改 .h 前评估重编译/重解析范围、review 时确认头文件变更波及面。递归追溯（A include B、B include C，则改 C 影响 A、B）。
+    """[deprecated → cpp_impact_analysis] 查询修改头文件会影响哪些翻译单元（include 依赖影响面）。用于：改 .h 前评估重编译/重解析范围、review 时确认头文件变更波及面。递归追溯（A include B、B include C，则改 C 影响 A、B）。
 
     Args:
         header_path: 头文件路径或文件名（部分匹配，如 "base_device_update.h"）
@@ -855,7 +855,7 @@ def cpp_get_include_impact(header_path: str) -> str:
 def cpp_traverse_graph(start: str, relation_types: list[str] | None = None,
                         direction: str = "outgoing", depth: int = 3,
                         max_results: int = 50) -> str:
-    """多跳遍历图谱，沿指定关系类型查询关联节点。用于：影响面分析（修改 X 会影响什么）、跨模块关联查询、复杂依赖链追踪。这是最灵活的查询，支持多种关系类型组合。
+    """[deprecated → cpp_impact_analysis] 多跳遍历图谱，沿指定关系类型查询关联节点。用于：影响面分析（修改 X 会影响什么）、跨模块关联查询、复杂依赖链追踪。这是最灵活的查询，支持多种关系类型组合。
 
     常用关系类型: inherits_public, inherits_protected, overrides, belongs_to,
     calls_direct, calls_virtual, calls_callback, doc_describes_code, code_refers_to_doc
@@ -917,7 +917,7 @@ def cpp_blast_radius(symbols: list[str] | None = None,
                      include_overrides: bool = True,
                      include_subclasses: bool = True,
                      direction: str = "up") -> str:
-    """计算改动爆炸半径：输入改动的符号/文件，返回受影响文件清单 + 分层调用链。用于：改动前评估影响面、确定 review 范围、定位多态调度受影响方。比 cpp_get_callers（一跳）更全：递归追多层 + 虚函数 override 展开 + 文件维度去重 + 按跳数分层。
+    """[deprecated → cpp_impact_analysis] 计算改动爆炸半径：输入改动的符号/文件，返回受影响文件清单 + 分层调用链。用于：改动前评估影响面、确定 review 范围、定位多态调度受影响方。比 cpp_get_callers（一跳）更全：递归追多层 + 虚函数 override 展开 + 文件维度去重 + 按跳数分层。
 
     方向语义：direction="up"（默认）= 谁受影响（被谁调用，改动向后传播）;
              "down" = 依赖什么（调用了谁，前置依赖）。
@@ -1033,6 +1033,140 @@ def cpp_get_code_docs(symbol: str, min_confidence: float = 0.0,
 
 
 # ── 启动入口 ──
+
+# ============ 场景化打包工具（2026-09-03，设计见 docs/tool_consolidation_design.md）============
+# agent 意图是场景级的：原子工具（上方，docstring 已标 deprecated）保留兜底，遥测分开统计。
+# 场景函数直接调用查询层（gq/cq/pq/tq/iq）+ fmt 函数，不经过装饰后的原子入口，遥测互不污染。
+
+@mcp.tool()
+@_telemetry("cpp_symbol_lookup")
+def cpp_symbol_lookup(name: str, class_name: str = "") -> str:
+    """场景化查询：这个符号是什么、在哪（类与函数一次查全）。
+
+    Args:
+        name: 符号名（类名或函数名，支持模糊匹配，如 "MccAdapter"）
+        class_name: 限定函数所属类名（可选）
+    """
+    try:
+        gq, _, _, _, _ = _get_queries()
+        classes = gq.search_class(name)
+        funcs = gq.search_function(name, class_name=class_name or None)
+    except Exception as e:
+        return _query_error(e)
+
+    if not classes and not funcs:
+        return (f'未找到匹配 "{name}" 的类或函数。'
+                '\n提示: 本图谱只覆盖配置的 source_paths 范围（workspace 业务模块）；'
+                'SDK/BSW/foundation 符号不在覆盖内，请改用 clangd MCP 查询。')
+
+    parts = [f'## 符号 "{name}" 查找结果\n\n']
+    if classes:
+        parts.append(f'### 类（{len(classes)} 个）\n\n')
+        for i, ci in enumerate(classes, 1):
+            parts.append(f"{i}. {_fmt_class(ci)}\n")
+        parts.append("\n")
+    if funcs:
+        parts.append(f'### 函数（{len(funcs)} 个）\n\n')
+        for i, fi in enumerate(funcs, 1):
+            parts.append(f"{i}. {_fmt_function(fi)}\n")
+    return "".join(parts)
+
+
+@mcp.tool()
+@_telemetry("cpp_relationship")
+def cpp_relationship(name: str, direction: str = "callers",
+                     class_name: str = "", namespace: str = "") -> str:
+    """场景化查询：符号的调用关系。direction="callers" 查谁调用它（影响面）、"callees" 查它调用谁（依赖链）、"overrides" 查虚函数的全部重写实现（需 class_name=基类名）。
+
+    Args:
+        name: 函数名（如 "doPartitionSwitch"）
+        direction: "callers"（默认）/ "callees" / "overrides"
+        class_name: 限定所属类名（callers/callees 可选；overrides 必填=基类名）
+        namespace: 限定 namespace（可选，精确匹配，消歧同名重载）
+    """
+    if direction not in ("callers", "callees", "overrides"):
+        return 'direction 必须是 "callers"、"callees" 或 "overrides"'
+    if not name:
+        return "参数错误: 请提供 name"
+    if direction == "overrides" and not class_name:
+        return '参数错误: direction="overrides" 时必须提供 class_name（声明虚函数的基类名）'
+    try:
+        _, cq, pq, _, _ = _get_queries()
+        if direction == "callers":
+            results = cq.get_callers(name, class_name=class_name or None,
+                                     namespace=namespace or None)
+        elif direction == "callees":
+            results = cq.get_callees(name, class_name=class_name or None,
+                                     namespace=namespace or None)
+        else:
+            results = pq.get_all_overrides(name, class_name=class_name,
+                                           namespace=namespace or None)
+    except Exception as e:
+        return _query_error(e)
+
+    if not results:
+        label = {"callers": "调用方", "callees": "被调用方", "overrides": "重写实现"}[direction]
+        return (f'未找到 "{name}" 的{label}。'
+                '\n提示: 本图谱只覆盖配置的 source_paths 范围（workspace 业务模块）；'
+                'SDK/BSW/foundation 符号不在覆盖内，请改用 clangd MCP 查询。')
+
+    is_caller = direction == "callers"
+    if is_caller:
+        _annotate_call_lines(results)
+    label = {"callers": "调用方", "callees": "被调用方", "overrides": "重写实现"}[direction]
+    lines = [f'## "{name}" 的{label}（{len(results)} 个）\n\n']
+    for i, r in enumerate(results, 1):
+        if direction == "overrides":
+            lines.append(f"{i}. {_fmt_override(r)}\n")
+        else:
+            lines.append(f"{i}. {_fmt_call_info(r, is_caller=is_caller)}\n")
+    return "".join(lines)
+
+
+@mcp.tool()
+@_telemetry("cpp_impact_analysis")
+def cpp_impact_analysis(symbols: list[str] | None = None,
+                        files: list[str] | None = None,
+                        depth: int = 3) -> str:
+    """场景化影响面分析：改动这些符号/文件会影响谁（爆炸半径递归调用链为主视图；files 含 .h 时附加头文件波及的翻译单元清单）。改动前评估影响面、确定 review 范围用这个，不必再单独调 cpp_blast_radius/cpp_traverse_graph。
+
+    Args:
+        symbols: 改动符号名列表（函数名/类名，支持 "Class::func" 形式）
+        files: 改动文件路径列表（.cpp 展开为文件内符号；.h 附加 include 波及清单）
+        depth: 最大递归跳数 [1,5]（默认 3）
+    """
+    if not symbols and not files:
+        return "至少提供 symbols 或 files 之一"
+    if depth < 1 or depth > 5:
+        return "depth 范围 [1, 5]"
+
+    parts = []
+    try:
+        bq = _get_blast()
+        result = bq.compute(symbols=symbols, files=files, depth=depth,
+                            include_overrides=True, include_subclasses=True,
+                            direction="up")
+        parts.append("### 一、爆炸半径（谁受影响，按跳数分层）\n\n")
+        parts.append(_fmt_blast_radius(result, "up"))
+
+        headers = [f for f in (files or []) if f.endswith((".h", ".hpp"))]
+        if headers:
+            iq = _get_include()
+            parts.append("\n### 二、头文件波及（include 依赖）\n")
+            for h in headers:
+                affected = iq.get_all_includers(h)
+                if affected:
+                    tus = [f for f in affected if f.endswith((".cpp", ".cc", ".cxx"))]
+                    parts.append(f'\n改 "{h}" 影响 {len(affected)} 个文件'
+                                 f'（其中翻译单元 {len(tus)} 个）\n')
+                else:
+                    parts.append(f'\n改 "{h}"：图谱内无 include 依赖记录'
+                                 '（可能在 SDK/BSW 范围外）\n')
+    except Exception as e:
+        return _query_error(e)
+
+    return "".join(parts)
+
 
 def _infer_project_name(db_path: str) -> str:
     """从 DB 路径推断项目名称
