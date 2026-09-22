@@ -70,3 +70,4 @@ config/doc_config.yaml
 
 # 内部验证基线（含内部代码符号）
 validation/clangd_baseline.json
+doc_graph/doc_graph_telemetry.jsonl

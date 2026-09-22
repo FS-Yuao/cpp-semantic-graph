@@ -38,9 +38,65 @@ DEFAULT_DB = os.path.join(SCRIPT_DIR, "doc_graph.db")
 mcp = FastMCP("doc-graph")
 
 
+# ─── 服务端遥测（2026-09-22 加，照 cppsg mcp_server/server.py 的 _telemetry 模式）───
+# 目的：工具级用量/耗时/空结果统计不依赖客户端会话转录（09-08 起已停摆）。
+# 记录追加到本目录 doc_graph_telemetry.jsonl：ts/tool/args(截断)/n_results/duration_ms。
+# n_results = 返回 JSON 顶层 list 元素数（或 dict 的 list 值元素数之和），0=空结果，-1=异常。
+# 遥测自身异常绝不影响查询。
+
+TELEMETRY_PATH = os.path.join(SCRIPT_DIR, "doc_graph_telemetry.jsonl")
+
+
+def _count_results(out) -> int:
+    """数返回 JSON 里的条目数；非 JSON/解析失败记 -1"""
+    try:
+        d = json.loads(out) if isinstance(out, str) else out
+    except Exception:
+        return -1
+    if isinstance(d, list):
+        return len(d)
+    if isinstance(d, dict):
+        n = sum(len(v) for v in d.values() if isinstance(v, list))
+        return n if n else (len(d) if d else 0)
+    return -1
+
+
+def _telemetry(tool_name: str):
+    import functools
+    import time as _time
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            t0 = _time.monotonic()
+            try:
+                out = fn(*args, **kwargs)
+                n = _count_results(out)
+                return out
+            except Exception:
+                n = -1
+                raise
+            finally:
+                try:
+                    rec = {
+                        "ts": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "tool": tool_name,
+                        "args": {k: str(v)[:60] for k, v in kwargs.items() if v},
+                        "n_results": n,
+                        "duration_ms": round((_time.monotonic() - t0) * 1000, 1),
+                    }
+                    with open(TELEMETRY_PATH, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                except Exception:
+                    pass
+        return wrapper
+    return deco
+
+
 # ─── 工具定义 ─────────────────────────────────────────────────
 
 @mcp.tool()
+@_telemetry("doc_graph_search_tool")
 def doc_graph_search_tool(
     keyword: str,
     depth: int = 2,
@@ -85,6 +141,7 @@ def doc_graph_search_tool(
 
 
 @mcp.tool()
+@_telemetry("list_documents")
 def list_documents(doc_type: str = "", status: str = "") -> str:
     """[deprecated → doc_admin(action=list)] 列出文档图谱中的所有文档，可按类型和状态过滤。
 
@@ -121,6 +178,7 @@ def list_documents(doc_type: str = "", status: str = "") -> str:
 
 
 @mcp.tool()
+@_telemetry("record_finding_tool")
 def record_finding_tool(
     title: str,
     detail: str = "",
@@ -162,6 +220,7 @@ def record_finding_tool(
 
 
 @mcp.tool()
+@_telemetry("search_findings_tool")
 def search_findings_tool(
     keyword: str = "",
     symbol: str = "",
@@ -192,6 +251,7 @@ def search_findings_tool(
 
 
 @mcp.tool()
+@_telemetry("check_finding_freshness_tool")
 def check_finding_freshness_tool() -> str:
     """[deprecated → doc_admin(action=freshness)] 检测经验结论的时效性：锚定符号在 cppsg 代码图谱中是否还存在。
 
@@ -211,6 +271,7 @@ def check_finding_freshness_tool() -> str:
 
 
 @mcp.tool()
+@_telemetry("get_doc_stats")
 def get_doc_stats() -> str:
     """[deprecated → doc_admin(action=stats)] 获取文档知识图谱的统计信息。
 
@@ -331,6 +392,7 @@ if __name__ == "__main__":
 # 旧工具 docstring 标 deprecated 保留兜底，usage 归零后删除。
 
 @mcp.tool()
+@_telemetry("doc_search")
 def doc_search(
     keyword: str = "",
     scope: str = "all",
@@ -366,6 +428,7 @@ def doc_search(
 
 
 @mcp.tool()
+@_telemetry("doc_admin")
 def doc_admin(action: str = "stats", doc_type: str = "", status: str = "") -> str:
     """场景化管理查询：action="stats"（图谱统计：节点/边/类型分布/覆盖率）、"list"（文档清单，可按类型/状态过滤）、"freshness"（finding 时效检查：锚定符号在 cppsg 是否仍存在，重建后调用）。
 
