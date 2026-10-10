@@ -7,9 +7,12 @@
 功能：
   1. finding / finding_symbol / finding_fts 三表 schema（幂等迁移）
   2. record_finding：写入 + 同 title 幂等合并
-  3. search_findings：FTS5 关键词 + 符号反查 + 类型过滤
+  3. search_findings：FTS5 关键词 + 符号反查 + 类型过滤（生命周期衰减排序）
   4. get_findings_by_symbols：符号交集查询（供 query.py 的 doc_graph_search join）
   5. export_findings / import_findings：parser 全量重建时的防丢失通道
+  6. 生命周期机制（2026-10-10，借鉴 Hindsight observations 证据模型）：
+     evidence_count 证据计数 + last_confirmed 最近确认时间，召回时衰减排序，
+     解决"结论只进不出、库自我污染"
 
 与 node/edge 表的关系：完全独立。node/edge/doc_fts 由 parser.py 全量重建管理，
 finding 三表由本模块在线写入管理，parser 重建时通过 export/import 保留。
@@ -134,6 +137,7 @@ def _get_conn(db_path: str = DEFAULT_DB) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000")
     _ensure_schema(conn)
     _ensure_embedding_column(conn)
+    _ensure_lifecycle_columns(conn)
     return conn
 
 
@@ -190,10 +194,12 @@ def record_finding(title: str, detail: str = "", ftype: str = "fact",
             fid, created_at = existing["id"], existing["created_at"]
             c.execute("""
                 UPDATE finding SET detail=?, ftype=?, symbols=?, source=?,
-                    confidence=?, tags=?, updated_at=?, embedding=?
+                    confidence=?, tags=?, updated_at=?, embedding=?,
+                    evidence_count=COALESCE(evidence_count,0)+1, last_confirmed=?
                 WHERE id=?
             """, (detail, ftype, json.dumps(symbols, ensure_ascii=False), source,
-                  confidence, json.dumps(tags or [], ensure_ascii=False), now, emb, fid))
+                  confidence, json.dumps(tags or [], ensure_ascii=False), now, emb,
+                  now, fid))
             action = "updated"
             # 重建锚定表：先删后插，避免残留已移除的符号
             c.execute("DELETE FROM finding_symbol WHERE finding_id=?", (fid,))
@@ -202,12 +208,13 @@ def record_finding(title: str, detail: str = "", ftype: str = "fact",
             fid = _make_id(title)
             c.execute("""
                 INSERT INTO finding
-                (id, ftype, title, detail, symbols, source, status, confidence, tags, created_at, updated_at, embedding)
-                VALUES (?,?,?,?,?,?, 'active', ?, ?, ?, ?, ?)
+                (id, ftype, title, detail, symbols, source, status, confidence, tags,
+                 created_at, updated_at, embedding, evidence_count, last_confirmed)
+                VALUES (?,?,?,?,?,?, 'active', ?, ?, ?, ?, ?, 1, ?)
             """, (fid, ftype, title, detail,
                   json.dumps(symbols, ensure_ascii=False), source,
                   confidence, json.dumps(tags or [], ensure_ascii=False),
-                  now, now, emb))
+                  now, now, emb, now))
             action = "created"
 
         for sym in symbols:
@@ -281,7 +288,9 @@ def search_findings(keyword: str = "", symbol: str = "", ftype: str = "",
         rows = conn.execute(sql, params).fetchall()
 
         if not keyword:
-            rows = sorted(rows, key=lambda r: r["updated_at"] or "", reverse=True)
+            # 生命周期衰减排序：加成（证据+新鲜度）优先，同分再看更新时间
+            rows = sorted(rows, key=lambda r: (_lifecycle_boost(r), r["updated_at"] or ""),
+                          reverse=True)
             return [_row_to_finding(r) for r in rows[:limit]]
 
         # ── 词法路：finding_fts MATCH 命中 id 集合（含同义表扩展）──
@@ -322,8 +331,13 @@ def search_findings(keyword: str = "", symbol: str = "", ftype: str = "",
                                  key=lambda r: r["updated_at"] or "", reverse=True)]
         fused = _rrf_merge(lexical_ranked, vector_ids, limit=limit)
 
+        # 生命周期衰减：RRF 分乘 (1 + 0.5*加成)——证据充分/新鲜者接近名次内上浮，
+        # 不改变 RRF 大名次格局（RRF 分差远大于 0.5 加成的量级差异被限制在邻名次）
         by_id = {r["id"]: r for r in rows}
-        return [_row_to_finding(by_id[fid]) for fid in fused if fid in by_id]
+        scored = [(s * (1.0 + 0.5 * _lifecycle_boost(by_id[fid])), fid)
+                  for fid, s in fused if fid in by_id]
+        scored.sort(reverse=True)
+        return [_row_to_finding(by_id[fid]) for _, fid in scored]
     finally:
         conn.close()
 
@@ -358,12 +372,14 @@ def get_findings_by_symbols(symbol_names: list[str],
             ORDER BY f.updated_at DESC
         """, list(names)).fetchall()
         # 去重（一个 finding 锚定多个符号时 join 出多行）
-        seen, result = set(), []
+        seen, uniq = set(), []
         for r in rows:
             if r["id"] not in seen:
                 seen.add(r["id"])
-                result.append(_row_to_finding(r))
-        return result[: max(limit_per_symbol * len(names), 10)]
+                uniq.append(r)
+        # 生命周期衰减排序：加成优先，同分再看更新时间
+        uniq.sort(key=lambda r: (_lifecycle_boost(r), r["updated_at"] or ""), reverse=True)
+        return [_row_to_finding(r) for r in uniq[: max(limit_per_symbol * len(names), 10)]]
     finally:
         conn.close()
 
@@ -453,8 +469,10 @@ def check_freshness(db_path: str = DEFAULT_DB, cppsg_db_path: str = CPPSG_DB) ->
                                          "from": "active", "to": "stale",
                                          "missing_symbols": missing})
             elif not all_gone and r["status"] == "stale":
-                conn.execute("UPDATE finding SET status='active', updated_at=? WHERE id=?",
-                             (now, r["id"]))
+                # 恢复 active = 锚定符号回归 = 一次证据支持：计数+1 并刷新确认时间
+                conn.execute("""UPDATE finding SET status='active', updated_at=?,
+                                evidence_count=COALESCE(evidence_count,0)+1, last_confirmed=?
+                                WHERE id=?""", (now, now, r["id"]))
                 result["recovered"] += 1
                 result["detail"].append({"id": r["id"], "title": r["title"],
                                          "from": "stale", "to": "active",
@@ -544,6 +562,66 @@ def _ensure_embedding_column(conn: sqlite3.Connection):
         conn.commit()
 
 
+# ─── 生命周期机制（evidence_count / last_confirmed，2026-10-10）───
+# 动机：finding 只进不出 → 库越大噪音召回越多（自我污染），且无时间衰减刹车。
+# 借鉴 Hindsight observations 模型：新证据不覆盖旧信念，而是强化（计数）+ 记录确认时间。
+# 三个"被证据支持"事件刷新 last_confirmed：①record 同 title 幂等更新（再验证）
+# ②freshness 检测 stale→active 恢复（锚定符号回归）③新建（初建即 1 次证据）。
+# 纯检测（check_freshness 确认 active 不变）不刷新，避免周期任务稀释语义。
+
+_LIFECYCLE_EVIDENCE_CAP = 10   # 证据计数封顶（防老结论无限加权）
+_LIFECYCLE_DECAY_DAYS = 180    # 新鲜度线性衰减窗口（天）
+
+
+def _ensure_lifecycle_columns(conn: sqlite3.Connection):
+    """finding 表幂等追加 evidence_count / last_confirmed 列（照 embedding 列先例）。"""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(finding)")]
+    changed = False
+    if "evidence_count" not in cols:
+        conn.execute("ALTER TABLE finding ADD COLUMN evidence_count INTEGER DEFAULT 0")
+        changed = True
+    if "last_confirmed" not in cols:
+        conn.execute("ALTER TABLE finding ADD COLUMN last_confirmed TEXT")
+        changed = True
+    if changed:
+        conn.commit()
+
+
+def _parse_db_time(s: str | None) -> "datetime | None":
+    """解析 DB 时间字段（兼容历史多种格式），失败返回 None。"""
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s.strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _lifecycle_boost(row) -> float:
+    """生命周期排序加成，范围 0~1：0.4*证据归一 + 0.6*新鲜度。
+
+    证据：min(evidence_count, cap)/cap；新鲜度：max(0, 1 - 距最近确认天数/180)，
+    "最近确认"取 max(last_confirmed, updated_at)。被反复验证的结论浮上来，
+    长期未确认的自然沉底——排序层面实现"库自我污染"的刹车。
+    """
+    ev = row["evidence_count"] if "evidence_count" in row.keys() else 0
+    try:
+        ev = min(int(ev or 0), _LIFECYCLE_EVIDENCE_CAP)
+    except (TypeError, ValueError):
+        ev = 0
+    lc = _parse_db_time(row["last_confirmed"] if "last_confirmed" in row.keys() else None)
+    ua = _parse_db_time(row["updated_at"] if "updated_at" in row.keys() else None)
+    latest = max((t for t in (lc, ua) if t), default=None)
+    if latest is None:
+        recency = 0.0
+    else:
+        days = (datetime.now() - latest).total_seconds() / 86400.0
+        recency = max(0.0, 1.0 - max(0.0, days) / _LIFECYCLE_DECAY_DAYS)
+    return 0.4 * (ev / _LIFECYCLE_EVIDENCE_CAP) + 0.6 * recency
+
+
 def _vector_search(conn: sqlite3.Connection, keyword: str,
                    top_k: int = 8) -> list[tuple[str, float]]:
     """向量路检索：查询向量 vs 库存 embedding 余弦 top-K。
@@ -561,14 +639,17 @@ def _vector_search(conn: sqlite3.Connection, keyword: str,
 
 
 def _rrf_merge(lexical_ids: list[str], vector_ids: list[str],
-               k: int = 60, limit: int = 10) -> list[str]:
-    """FTS 词法路 + 向量路 RRF 融合排序。"""
+               k: int = 60, limit: int = 10) -> list[tuple[str, float]]:
+    """FTS 词法路 + 向量路 RRF 融合排序，返回 [(finding_id, rrf_score)] 按分降序。
+
+    返回分数而非仅 id 列表：供调用方叠加生命周期衰减权重后重排。
+    """
     scores: dict[str, float] = {}
     for rank, fid in enumerate(lexical_ids):
         scores[fid] = scores.get(fid, 0.0) + 1.0 / (k + rank + 1)
     for rank, fid in enumerate(vector_ids):
         scores[fid] = scores.get(fid, 0.0) + 1.0 / (k + rank + 1)
-    return [d for d, _ in sorted(scores.items(), key=lambda x: -x[1])][:limit]
+    return sorted(scores.items(), key=lambda x: -x[1])[:limit]
 
 
 # ─── parser 重建防丢失通道 ─────────────────────────────────────
@@ -604,13 +685,15 @@ def import_findings(snapshot: dict, db_path: str = DEFAULT_DB) -> int:
         for f in findings:
             c.execute("""
                 INSERT OR REPLACE INTO finding
-                (id, ftype, title, detail, symbols, source, status, confidence, tags, created_at, updated_at, embedding)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                (id, ftype, title, detail, symbols, source, status, confidence, tags,
+                 created_at, updated_at, embedding, evidence_count, last_confirmed)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (f["id"], f["ftype"], f["title"], f.get("detail", ""),
                   f.get("symbols", "[]"), f.get("source", ""),
                   f.get("status", "active"), f.get("confidence", "confirmed"),
                   f.get("tags", "[]"), f["created_at"], f["updated_at"],
-                  f.get("embedding")))
+                  f.get("embedding"),
+                  f.get("evidence_count", 0), f.get("last_confirmed")))
             c.execute("""
                 INSERT INTO finding_fts (finding_id, title, detail, tags)
                 VALUES (?,?,?,?)
