@@ -773,6 +773,11 @@ def print_validation_report(nodes, edges, warnings):
     dup_count = len(edge_keys) - len(set(edge_keys))
     print(f"\n重复边: {dup_count}（应为 0）")
 
+    # 符号边单独去重验证（2026-10-19：此前 P1 项复用全量 dup_count，与"边去重"同判，一条重复边报两次）
+    sym_keys = [(e.src, e.dst) for e in edges if e.rel == 'mentions_symbol']
+    sym_dup = len(sym_keys) - len(set(sym_keys))
+    print(f"符号边重复: {sym_dup}（应为 0）")
+
     # P2: ..- 残留检查
     bad_ids = [n.id for n in nodes if '..' in n.id or '..-' in n.id]
     bad_edges = [e for e in edges if '..' in e.src or '..' in e.dst]
@@ -826,7 +831,7 @@ def print_validation_report(nodes, edges, warnings):
         ("边去重（重复边=0）", dup_count == 0),
         ("P2 路径 ..- 残留=0", len(bad_ids) == 0 and len(bad_edges) == 0),
         ("P0 diary 符号反引号区分", True),  # 由代码逻辑保证
-        ("P1 符号边去重", dup_count == 0),
+        ("P1 符号边去重", sym_dup == 0),
     ]
     for name, passed in checks:
         print(f"  {'✅' if passed else '❌'} {name}")
@@ -947,7 +952,12 @@ def main():
                 warnings.append(f"丢弃悬挂 relates_to 边: {e.src} -> {e.dst} (目标文档不存在)")
         else:
             kept_edges.append(e)
-    edges = kept_edges
+    # 修复边可能撞上已有直达边（同 src+dst+rel），统一再过一次 EdgeSet 去重
+    # （2026-10-19 修复：历史每轮重建报"重复边=1"，根因是上方修复边直接 append 绕过了 EdgeSet）
+    dedup = EdgeSet()
+    for e in kept_edges:
+        dedup.add(e)
+    edges = dedup.to_list()
 
     if fixed_edges:
         print(f"🔧 模糊匹配修复 {fixed_edges} 条 relates_to 边")
