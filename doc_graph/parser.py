@@ -298,7 +298,8 @@ def extract_symbols_from_diary_assoc(text: str) -> list[str]:
 
 
 def extract_first_paragraph(lines: list[str], skip_blockquote: bool = True,
-                             start_idx: int = 0, max_chars: int = 200) -> str:
+                             start_idx: int = 0, max_chars: int = 200,
+                             stop_at_heading: bool = False) -> str:
     """提取第一个实质段落作为摘要
 
     跳过：空行、标题(#)、代码块(```)、表格(|)、分隔线(---)
@@ -306,6 +307,12 @@ def extract_first_paragraph(lines: list[str], skip_blockquote: bool = True,
 
     如果没有段落，降级收集前 3 个列表项作为摘要。
     返回截断到 max_chars 的纯文本。
+
+    stop_at_heading=True（章节级）：遇到下一个二级标题（## ）立即停止——
+    2026-10-23 修复"多节同 summary"缺陷：原实现标题仅在收集态才终止扫描，
+    章节自身无实质段落（纯列表/表格/代码块）时会穿透进后续章节抓别人的
+    段落（且段落优先级高于本章节列表摘要），导致 782 对跨章节重复摘要。
+    文档级摘要（start_idx=0 全文扫）保持 False 不受影响。
     """
     in_code_block = False
     collecting = False
@@ -324,6 +331,10 @@ def extract_first_paragraph(lines: list[str], skip_blockquote: bool = True,
             continue
         if in_code_block:
             continue
+
+        # 章节级边界：下一个二级标题即本章节内容结束，立即停止
+        if stop_at_heading and stripped.startswith('## '):
+            break
 
         # 跳过空行（收集阶段遇到空行=段落结束）
         if not stripped:
@@ -553,13 +564,12 @@ def parse_doc(full_path: str, rel_path: str,
                 title=sec_title, path=rel_path, line=content_start + i + 1,
             )
             # 知识点摘要：提取 ## 标题后的第一个实质段落
+            # （stop_at_heading=章节边界，不穿透到后续章节——2026-10-23 修复）
             current_knode.summary = extract_first_paragraph(
-                body_lines, skip_blockquote=True, start_idx=i + 1, max_chars=200)
+                body_lines, skip_blockquote=True, start_idx=i + 1, max_chars=200,
+                stop_at_heading=True)
 
-            nodes_out.append(current_knode)
-            edge_set.add(Edge(src=doc_id, dst=kid, rel='has_knowledge', manual=False))
-
-            # diary 增强：扫描 ## 后的 - **字段**
+            # diary 增强：扫描 ## 后的 - **字段**（**结论** 行可补全空摘要）
             if doc_type == 'diary':
                 for j in range(i + 1, len(body_lines)):
                     if body_lines[j].startswith('## ') or body_lines[j].strip().startswith('```'):
@@ -599,6 +609,16 @@ def parse_doc(full_path: str, rel_path: str,
                     if m:
                         current_knode.ktype = m.group(1)
                         break
+
+            # 准入过滤（2026-10-23）：空摘要章节（纯代码块/纯表格/无实质内容）
+            # 不建 knowledge 节点与 has_knowledge 边——此类章节原实现靠穿透抓
+            # 邻居章节内容充数，是 782 对跨章节重复摘要的根因之一
+            if not current_knode.summary:
+                current_knode = None
+                continue
+
+            nodes_out.append(current_knode)
+            edge_set.add(Edge(src=doc_id, dst=kid, rel='has_knowledge', manual=False))
 
     # 8. 扫描 markdown 链接 → relates_to 边（auto，去重）
     in_code_block = False

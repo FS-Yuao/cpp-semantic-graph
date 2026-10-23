@@ -101,33 +101,32 @@ def doc_graph_search_tool(
     keyword: str,
     depth: int = 2,
     bridge_to_code: bool = True,
+    include_detail: bool = False,
     edge_filter: list[str] | None = None,
 ) -> str:
-    """[deprecated → doc_search(scope=all)] 搜索文档知识图谱，返回文档、知识点、代码符号和关联的代码节点。
+    """[deprecated → doc_search(scope=all)] 搜索文档知识图谱（渐进披露：默认目录级，两步查询）。
 
     当用户问关于文档关联、任务历史、决策追溯、设计方案等问题时使用此工具。
-    当用户需要同时查文档和代码时，设置 bridge_to_code=true。
+
+    两步查询法（渐进披露，2026-10-23 起）：
+    ① 默认（include_detail=false）返回目录级：文档 title/path/一句话摘要、
+       知识点标题索引、符号名列表、findings 精简（id/title/状态）；
+    ② 从目录判断哪些相关后，带 include_detail=true 重查同一关键词，
+       返回文档/知识点全文摘要、符号对象与 cppsg 桥接节点（callers/callees）。
 
     Args:
         keyword: 搜索关键词（中文或英文，如"分区"、"GNSS"、"UpdateManager"）
         depth: BFS 遍历深度，默认 2（1=直接关联，2=关联的关联）
-        bridge_to_code: 是否桥接到 cppsg 代码图谱，默认 true
+        bridge_to_code: 是否桥接到 cppsg 代码图谱，默认 true（仅 detail 模式生效）
+        include_detail: 是否返回全量详情，默认 false（目录级）
         edge_filter: 限定边类型，可选值: has_knowledge, relates_to, mentions_symbol
 
-    Returns:
-        JSON 格式的搜索结果，包含:
-        - start_docs: FTS5/LIKE 命中的起始文档
-        - docs: BFS 遍历到的关联文档
-        - knowledge: BFS 遍历到的知识点
-        - symbols: BFS 遍历到的代码符号
-        - code_nodes: 符号桥接到 cppsg 的代码节点（含 callers/callees）
-
     示例:
-        # 搜索"分区"相关文档和代码
-        doc_graph_search_tool("分区", depth=2, bridge_to_code=true)
+        # 第一步：目录级定位相关文档
+        doc_graph_search_tool("串口让渡")
 
-        # 只搜文档间关联，不查代码
-        doc_graph_search_tool("GNSS", depth=1, bridge_to_code=false)
+        # 第二步：确认相关后取全文详情
+        doc_graph_search_tool("串口让渡", include_detail=true)
     """
     db_path = os.environ.get("DOC_GRAPH_DB", DEFAULT_DB)
     result = doc_graph_search(
@@ -135,6 +134,7 @@ def doc_graph_search_tool(
         depth=depth,
         edge_filter=edge_filter,
         bridge_to_code=bridge_to_code,
+        include_detail=include_detail,
         db_path=db_path,
     )
     return json.dumps(result, ensure_ascii=False, indent=2, default=str)
@@ -255,9 +255,12 @@ def search_findings_tool(
 def check_finding_freshness_tool() -> str:
     """[deprecated → doc_admin(action=freshness)] 检测经验结论的时效性：锚定符号在 cppsg 代码图谱中是否还存在。
 
-    代码重构/删除后，结论可能已失效。本工具将 finding 锚定的符号与 cppsg
-    当前节点比对（宽松匹配），自动做幂等状态迁移：
-    - 全部锚定符号消失 → active → stale（查询时会带 ⚠️ 提示）
+    代码重构/删除后，结论可能已失效。三层判定（2026-10-22 起）：
+    0. 域外豁免：MCU 日志/芯片标识类锚定不适用代码存在性判据，跳过；
+    1. 锚定符号与 cppsg 当前节点比对（宽松匹配），全部消失才进入下一层；
+    2. 仓库级兜底 grep（BSW/SDK/工具链检索根），符号在仓库源码中仍存在则不判 stale。
+    自动做幂等状态迁移：
+    - 全部锚定符号在仓库中消失 → active → stale（查询时会带 ⚠️ 提示）
     - stale 结论的符号回归 → stale → active（自动恢复）
 
     建议在 cppsg 重建后调用一次。
@@ -400,10 +403,10 @@ def doc_search(
     ftype: str = "",
     depth: int = 2,
     bridge_to_code: bool = True,
+    include_detail: bool = False,
     limit: int = 10,
 ) -> str:
-    """场景化检索文档知识图谱。scope="all"（默认）= 全图检索（文档+知识点+符号+findings，BFS 关联）；
-    scope="findings" = 直查经验结论表（"之前关于 X 的结论/教训/约束"）。
+    """场景化检索文档知识图谱（渐进披露）。scope="all"（默认）= 全图检索（文档+知识点+符号+findings，BFS 关联，默认目录级返回，include_detail=true 取全文详情）；scope="findings" = 直查经验结论表（"之前关于 X 的结论/教训/约束"）。
 
     Args:
         keyword: 关键词（中英文均可，建议附带同义词提升召回，如"崩溃 crash 挂"）
@@ -411,7 +414,8 @@ def doc_search(
         symbol: scope="findings" 时可按代码符号过滤（返回锚定该符号的所有结论）
         ftype: scope="findings" 时类型过滤: fact | constraint | decision | lesson | risk
         depth: scope="all" 时 BFS 遍历深度（默认 2）
-        bridge_to_code: scope="all" 时是否桥接 cppsg 代码节点（默认 true）
+        bridge_to_code: scope="all" 时是否桥接 cppsg 代码节点（默认 true，仅 detail 模式生效）
+        include_detail: scope="all" 时是否返回全量详情（默认 false 目录级：文档一句话摘要/知识点标题索引/符号名列表）
         limit: scope="findings" 时最大返回条数（默认 10）
     """
     db_path = os.environ.get("DOC_GRAPH_DB", DEFAULT_DB)
@@ -422,7 +426,7 @@ def doc_search(
                           ensure_ascii=False, indent=2, default=str)
     result = doc_graph_search(
         keyword=keyword, depth=depth, edge_filter=None,
-        bridge_to_code=bridge_to_code, db_path=db_path,
+        bridge_to_code=bridge_to_code, include_detail=include_detail, db_path=db_path,
     )
     return json.dumps(result, ensure_ascii=False, indent=2, default=str)
 
@@ -430,7 +434,7 @@ def doc_search(
 @mcp.tool()
 @_telemetry("doc_admin")
 def doc_admin(action: str = "stats", doc_type: str = "", status: str = "") -> str:
-    """场景化管理查询：action="stats"（图谱统计：节点/边/类型分布/覆盖率）、"list"（文档清单，可按类型/状态过滤）、"freshness"（finding 时效检查：锚定符号在 cppsg 是否仍存在，重建后调用）。
+    """场景化管理查询：action="stats"（图谱统计：节点/边/类型分布/覆盖率）、"list"（文档清单，可按类型/状态过滤）、"freshness"（finding 时效检查：三层判定——域外豁免/cppsg 比对/仓库兜底 grep，重建后调用）。
 
     Args:
         action: "stats"（默认）/ "list" / "freshness"

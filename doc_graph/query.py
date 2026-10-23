@@ -262,11 +262,57 @@ def bridge_symbol_to_cppsg(symbol_name: str, cppsg_db_path: str = CPPSG_DB) -> l
 
 # ─── 4. 组合搜索 ──────────────────────────────────────────────
 
+def _compact_search_result(result: dict, symbol_cap: int = 30,
+                           knowledge_cap: int = 20) -> dict:
+    """渐进披露裁剪（2026-10-23 O-1）：默认返回目录级，正文按需展开。
+
+    对标渐进披露模式（先目录后正文）：文档只回 title/path/一句话摘要（100 字符
+    截断），知识点只回标题索引（不带 summary），符号折叠为纯名字列表（manual
+    优先排序保持），findings 精简为 id/title/状态/置信度，cppsg 桥接不展开。
+    背景：原全量返回单次查询可超 100+ 符号对象与 30+ 知识点全文摘要，
+    有效信息占比低（2026-10-22 冒烟实证）。
+    """
+    compact = {
+        "query": result["query"],
+        "mode": "compact",
+        "hint": ("目录级结果。判断相关后带 include_detail=true 重查同一关键词，"
+                 "可获文档/知识点全文摘要、符号详情与 cppsg 桥接节点。"),
+        "start_docs": result["start_docs"],
+        "docs": [{
+            "id": d["id"], "title": d.get("title", ""), "path": d.get("path", ""),
+            "doc_type": d.get("doc_type", ""), "status": d.get("status", ""),
+            "date": d.get("date", ""), "hop": d.get("hop", 0),
+            "summary": (d.get("summary") or "")[:100],
+        } for d in result.get("docs", [])],
+        "knowledge": [{
+            "id": k["id"], "title": k.get("title", ""), "path": k.get("path", ""),
+            "line": k.get("line", 0), "ktype": k.get("ktype", ""),
+            "hop": k.get("hop", 0), "parent_doc": k.get("parent_doc"),
+        } for k in result.get("knowledge", [])[:knowledge_cap]],
+        "knowledge_total": len(result.get("knowledge", [])),
+        "symbols": [s["name"] for s in result.get("symbols", [])[:symbol_cap]],
+        "symbols_total": len(result.get("symbols", [])),
+        "code_nodes": [],  # 渐进模式不展开桥接，include_detail=true 时返回
+        "findings": [{
+            "id": f["id"], "title": f.get("title", ""), "ftype": f.get("ftype", ""),
+            "status": f.get("status", ""), "confidence": f.get("confidence", ""),
+            "updated_at": f.get("updated_at", ""),
+        } for f in result.get("findings", [])],
+    }
+    if result.get("message"):
+        compact["message"] = result["message"]
+    return compact
+
+
 def doc_graph_search(keyword: str, depth: int = 2,
                      edge_filter: list[str] | None = None,
                      bridge_to_code: bool = True,
+                     include_detail: bool = False,
                      db_path: str = DEFAULT_DB) -> dict:
-    """搜索文档图谱，返回结构化关联结果（含经验结论 findings）"""
+    """搜索文档图谱，返回结构化关联结果（含经验结论 findings）。
+
+    include_detail=False（默认）返回目录级（渐进披露第一步，见 _compact_search_result）；
+    True 返回全量（第二步）。"""
     conn = get_conn(db_path)
     try:
         # Step 1: 三路融合定位起始文档
@@ -280,10 +326,11 @@ def doc_graph_search(keyword: str, depth: int = 2,
             findings.append(f)
 
         if not start_docs:
-            return {"query": keyword, "start_docs": [], "docs": [], "knowledge": [],
-                    "symbols": [], "code_nodes": [], "findings": findings,
-                    "message": (f"未找到匹配 '{keyword}' 的文档"
-                                + (f"，但有 {len(findings)} 条相关经验结论" if findings else ""))}
+            result = {"query": keyword, "start_docs": [], "docs": [], "knowledge": [],
+                      "symbols": [], "code_nodes": [], "findings": findings,
+                      "message": (f"未找到匹配 '{keyword}' 的文档"
+                                  + (f"，但有 {len(findings)} 条相关经验结论" if findings else ""))}
+            return result if include_detail else _compact_search_result(result)
 
         # Step 2: BFS 遍历
         all_results = {"docs": [], "knowledge": [], "symbols": []}
@@ -317,9 +364,10 @@ def doc_graph_search(keyword: str, depth: int = 2,
                 deduped_syms.append(item)
         all_results["symbols"] = deduped_syms
 
-        # Step 3: 符号桥接
+        # Step 3: 符号桥接（仅 detail 模式——渐进模式 code_nodes 不展开，
+        # 省去桥接查询开销；锚定符号反查 findings 仍走 BFS 符号）
         code_nodes = []
-        if bridge_to_code:
+        if bridge_to_code and include_detail:
             for sym in all_results["symbols"][:10]:
                 cppsg_nodes = bridge_symbol_to_cppsg(sym["name"])
                 if cppsg_nodes:
@@ -339,8 +387,9 @@ def doc_graph_search(keyword: str, depth: int = 2,
         findings.sort(key=lambda x: (x.get("status") != "active",
                                      x.get("updated_at", "")), reverse=False)
 
-        return {"query": keyword, "start_docs": start_docs,
-                **all_results, "code_nodes": code_nodes, "findings": findings}
+        result = {"query": keyword, "start_docs": start_docs,
+                  **all_results, "code_nodes": code_nodes, "findings": findings}
+        return result if include_detail else _compact_search_result(result)
     finally:
         conn.close()
 
@@ -417,6 +466,8 @@ def main():
     parser.add_argument('keyword', help='搜索关键词')
     parser.add_argument('--depth', type=int, default=2, help='BFS 遍历深度')
     parser.add_argument('--bridge', action='store_true', help='桥接到 cppsg')
+    parser.add_argument('--detail', action='store_true',
+                        help='全量模式（默认渐进披露：目录级返回）')
     parser.add_argument('--json', action='store_true', help='输出 JSON')
     parser.add_argument('--db', default=DEFAULT_DB, help='数据库路径')
     parser.add_argument('--edge-filter', nargs='+',
@@ -425,7 +476,8 @@ def main():
 
     result = doc_graph_search(args.keyword, depth=args.depth,
                               edge_filter=args.edge_filter,
-                              bridge_to_code=args.bridge, db_path=args.db)
+                              bridge_to_code=args.bridge, include_detail=args.detail,
+                              db_path=args.db)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     else:
