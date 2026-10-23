@@ -19,7 +19,7 @@ finding 三表由本模块在线写入管理，parser 重建时通过 export/imp
 """
 
 from __future__ import annotations
-import os, sys, json, sqlite3, re, hashlib
+import os, sys, json, sqlite3, re, hashlib, subprocess
 from datetime import datetime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -395,6 +395,57 @@ def _is_code_symbol(name: str) -> bool:
     return bool(name) and "." not in name and re.match(r'^[A-Za-z_][\w:~]*$', name)
 
 
+# 域外锚定注册表（2026-10-22 定）：这些模式是 MCU 串口/芯片/寄存器日志标识符，
+# 永远不会出现在任何代码库里，cppsg 存在性判据对它们无效——freshness 误标 14 条
+# findings 的根因之一。命中即整体豁免 stale 检测（无法判定 ≠ 已失效）。
+_OUT_OF_DOMAIN_RE = re.compile(
+    r"^(TLF\d+|MucRst|SocPwrCtrl\w*|DUS_ERR_VSC|dusIOWrite|hvrtos_vscdlib)$"
+)
+
+# 仓库级兜底检索根（2026-10-22 定）：cppsg 只覆盖 ap-aa/app 业务模块，
+# BSW（dm/DoIP 栈，如 Conversation/UDPHandler）、SDK、工具链脚本符号全部查空——
+# "不在 cppsg" ≠ "已删除"。仅在全部锚定符号 cppsg 查空时才逐符号兜底 grep。
+_REPO_SEARCH_ROOTS = [
+    "/mnt/code1/adc4.0",
+    "/mnt/code1/cpp_semantic_graph",
+    os.path.expanduser("~/.codebuddy"),
+]
+_REPO_GREP_ARGS = (
+    ["grep", "-rlF", "-m1", "--no-messages",
+     "--include=*.h", "--include=*.hpp", "--include=*.cpp",
+     "--include=*.cc", "--include=*.py", "--include=*.sh",
+     "--exclude-dir=.git", "--exclude-dir=out", "--exclude-dir=toolchains",
+     "--exclude-dir=build_logs", "--exclude-dir=node_modules"]
+)
+
+
+def _symbol_exists_in_repo(symbol_name: str, cache: dict) -> bool:
+    """仓库级兜底存在性判据：符号字符串出现在任一检索根的源码文件里即视为存在。
+
+    全名（Class::method）优先精确匹配定义/调用点；全名查空再用短名（method）
+    兜底——短名命中偏宽松，但 stale 误标的代价（AI 无视有效结论）高于漏标，
+    与 _symbol_exists_in_cppsg 的宽松原则一致。仅 check_freshness 在
+    cppsg 全查空时调用，单次运行经 cache 去重。
+    """
+    base = symbol_name[7:] if symbol_name.startswith("symbol:") else symbol_name
+    if base in cache:
+        return cache[base]
+    found = False
+    for probe in dict.fromkeys([base, base.split("::")[-1]]):
+        if not probe:
+            continue
+        try:
+            r = subprocess.run(_REPO_GREP_ARGS + [probe] + _REPO_SEARCH_ROOTS,
+                               capture_output=True, timeout=60)
+            if r.stdout.strip():
+                found = True
+                break
+        except (subprocess.TimeoutExpired, OSError):
+            continue  # 单符号检索失败按未找到处理，交由上层 all_gone 判定
+    cache[base] = found
+    return found
+
+
 def _symbol_exists_in_cppsg(symbol_name: str, cppsg_conn: sqlite3.Connection) -> bool:
     """符号在 cppsg 代码图谱中是否存在（宽松判定，三级匹配）。
 
@@ -427,12 +478,17 @@ def _symbol_exists_in_cppsg(symbol_name: str, cppsg_conn: sqlite3.Connection) ->
 def check_freshness(db_path: str = DEFAULT_DB, cppsg_db_path: str = CPPSG_DB) -> dict:
     """检测 finding 锚定符号在 cppsg 的存在性，幂等双向状态迁移。
 
-    全部锚定符号消失 → active → stale（结论可能已失效）
-    stale 且任一符号回归 → stale → active（自动恢复）
+    三层判定（2026-10-22 起，修正"BSW/日志域符号误标 stale"缺陷）：
+      0. 域外豁免：锚定全部命中域外注册表（MCU 日志/芯片标识）→ 无法判定，
+         不标 stale；已是 stale 的恢复 active（历史误标矫正路径）
+      1. cppsg 存在性（原逻辑）：全部锚定符号消失 → active → stale
+      2. 仓库级兜底：cppsg 全查空时逐符号 grep 检索根（BSW/SDK/工具链域），
+         任一符号在仓库源码中出现 → 视为存在，不标 stale
+    stale 且任一符号回归（1/2 层任一判活）→ stale → active（自动恢复）
 
     Returns:
         {"checked": n, "stale_marked": n, "recovered": n,
-         "detail": [{id, title, from, to, missing_symbols}]}
+         "detail": [{id, title, from, to, missing_symbols, reason}]}
     """
     if not os.path.exists(cppsg_db_path):
         return {"error": f"cppsg 数据库不存在: {cppsg_db_path}"}
@@ -448,17 +504,34 @@ def check_freshness(db_path: str = DEFAULT_DB, cppsg_db_path: str = CPPSG_DB) ->
 
         result = {"checked": len(rows), "stale_marked": 0, "recovered": 0, "detail": []}
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        repo_cache: dict = {}
         for r in rows:
             try:
                 symbols = json.loads(r["symbols"] or "[]")
             except (json.JSONDecodeError, TypeError):
                 symbols = []
             # 只检测代码符号锚定；服务名/文件名等运维锚定不适用 cppsg 存在性判据
-            symbols = [s for s in symbols if _is_code_symbol(s)]
+            # 域外注册表命中的（MCU 日志/芯片标识）同样豁免——它们不在任何代码库里
+            symbols = [s for s in symbols
+                       if _is_code_symbol(s) and not _OUT_OF_DOMAIN_RE.match(s)]
             if not symbols:
-                continue  # 无代码符号锚定的结论无法检测，跳过
+                # 全部锚定在判据适用域外 → 无法判定时效，不标 stale；
+                # 已是 stale 的必为历史误标（本逻辑下不可能标出），恢复 active
+                if r["status"] == "stale":
+                    conn.execute("UPDATE finding SET status='active', updated_at=? WHERE id=?",
+                                 (now, r["id"]))
+                    result["recovered"] += 1
+                    result["detail"].append({"id": r["id"], "title": r["title"],
+                                             "from": "stale", "to": "active",
+                                             "missing_symbols": [],
+                                             "reason": "out_of_domain"})
+                continue  # 无可判定锚定的结论跳过
 
             missing = [s for s in symbols if not _symbol_exists_in_cppsg(s, cppsg_conn)]
+            if len(missing) == len(symbols):
+                # cppsg 全查空 ≠ 已删除：BSW/SDK/工具链域符号做仓库级兜底确认
+                missing = [s for s in missing
+                           if not _symbol_exists_in_repo(s, repo_cache)]
             all_gone = len(missing) == len(symbols)
 
             if all_gone and r["status"] == "active":
@@ -467,7 +540,8 @@ def check_freshness(db_path: str = DEFAULT_DB, cppsg_db_path: str = CPPSG_DB) ->
                 result["stale_marked"] += 1
                 result["detail"].append({"id": r["id"], "title": r["title"],
                                          "from": "active", "to": "stale",
-                                         "missing_symbols": missing})
+                                         "missing_symbols": missing,
+                                         "reason": "symbols_gone"})
             elif not all_gone and r["status"] == "stale":
                 # 恢复 active = 锚定符号回归 = 一次证据支持：计数+1 并刷新确认时间
                 conn.execute("""UPDATE finding SET status='active', updated_at=?,
@@ -476,7 +550,8 @@ def check_freshness(db_path: str = DEFAULT_DB, cppsg_db_path: str = CPPSG_DB) ->
                 result["recovered"] += 1
                 result["detail"].append({"id": r["id"], "title": r["title"],
                                          "from": "stale", "to": "active",
-                                         "missing_symbols": missing})
+                                         "missing_symbols": missing,
+                                         "reason": "symbol_back"})
         conn.commit()
         return result
     finally:
