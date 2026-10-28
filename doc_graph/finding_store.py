@@ -19,7 +19,7 @@ finding 三表由本模块在线写入管理，parser 重建时通过 export/imp
 """
 
 from __future__ import annotations
-import os, sys, json, sqlite3, re, hashlib
+import os, sys, json, sqlite3, re, hashlib, subprocess
 from datetime import datetime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -129,6 +129,34 @@ def _ensure_schema(conn: sqlite3.Connection):
     conn.commit()
 
 
+def _ensure_memory_metadata(conn):
+    """Additive migration: legacy findings belong to the original ADC4 corpus."""
+    conn.execute("BEGIN IMMEDIATE")
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(finding)")}
+    for name, spec in {
+        "project_id": "TEXT NOT NULL DEFAULT 'adc4'",
+        "scope": "TEXT NOT NULL DEFAULT 'project'",
+        "revision": "TEXT NOT NULL DEFAULT ''",
+        "conditions": "TEXT NOT NULL DEFAULT ''",
+        "source_document_id": "TEXT NOT NULL DEFAULT ''",
+    }.items():
+        if name not in columns:
+            conn.execute(f"ALTER TABLE finding ADD COLUMN {name} {spec}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_finding_project ON finding(project_id, status)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS finding_revision (
+        finding_id TEXT NOT NULL, snapshot_hash TEXT NOT NULL, snapshot TEXT NOT NULL,
+        saved_at TEXT NOT NULL, PRIMARY KEY(finding_id,snapshot_hash))""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS finding_evidence (
+        finding_id TEXT NOT NULL, evidence_key TEXT NOT NULL, content_hash TEXT NOT NULL,
+        source TEXT NOT NULL, confirmed_at TEXT NOT NULL,
+        PRIMARY KEY(finding_id, evidence_key, content_hash))""")
+    conn.commit()
+
+
+def _project(project_id=None):
+    return project_id or os.environ.get("DOC_GRAPH_PROJECT", "adc4")
+
+
 def _get_conn(db_path: str = DEFAULT_DB) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=5.0)
     conn.row_factory = sqlite3.Row
@@ -138,6 +166,7 @@ def _get_conn(db_path: str = DEFAULT_DB) -> sqlite3.Connection:
     _ensure_schema(conn)
     _ensure_embedding_column(conn)
     _ensure_lifecycle_columns(conn)
+    _ensure_memory_metadata(conn)
     return conn
 
 
@@ -162,72 +191,102 @@ def _fts_tokens(keyword: str) -> str:
     return " OR ".join(parts)
 
 
-def record_finding(title: str, detail: str = "", ftype: str = "fact",
+def record_finding(title: str, detail: str = "", ftype: str | None = None,
                    symbols: list[str] | None = None, source: str = "",
-                   tags: list[str] | None = None,
-                   confidence: str = "confirmed",
-                   db_path: str = DEFAULT_DB) -> dict:
-    """写入一条经验结论。同 title 已存在 → 更新（幂等合并，防重复沉淀）。
+                   tags: list[str] | None = None, confidence: str | None = None,
+                   db_path: str = DEFAULT_DB, *, project_id: str | None = None,
+                   scope: str | None = None, revision: str | None = None,
+                   conditions: str | None = None, evidence_key: str = "",
+                   source_document_id: str | None = None) -> dict:
+    """Idempotent per-project record. Editing is not independent validation.
 
-    Returns:
-        {"action": "created"|"updated", "id": ..., "symbols_anchored": n}
+    Explicit confirmed requires a source plus a caller-supplied evidence key;
+    keys deduplicate retries for the same content. Claims remain caller reports.
     """
+    import uuid
     title = (title or "").strip()
     if not title:
         return {"error": "title 不能为空"}
-    if ftype not in FTYPES:
-        return {"error": f"ftype 非法: {ftype}，合法值: {FTYPES}"}
-    if confidence not in CONFIDENCES:
-        return {"error": f"confidence 非法: {confidence}，合法值: {CONFIDENCES}"}
-
-    symbols = sorted(set(s for s in (symbols or []) if s and s.strip()))
+    if ftype is not None and ftype not in FTYPES:
+        return {"error": "invalid ftype"}
+    if confidence is not None and confidence not in CONFIDENCES:
+        return {"error": "invalid confidence"}
+    if scope is not None and scope not in ("project", "portable"):
+        return {"error": "scope must be project or portable"}
+    project_id = _project(project_id)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # 向量提前算（created/updated 共用；None=向量功能降级中）
-    emb = _embed_one(f"{title}。{detail}" if detail else title)
     conn = _get_conn(db_path)
     try:
-        c = conn.cursor()
-        existing = c.execute(
-            "SELECT id, created_at FROM finding WHERE title = ?", (title,)).fetchone()
-
-        if existing:
-            fid, created_at = existing["id"], existing["created_at"]
-            c.execute("""
-                UPDATE finding SET detail=?, ftype=?, symbols=?, source=?,
-                    confidence=?, tags=?, updated_at=?, embedding=?,
-                    evidence_count=COALESCE(evidence_count,0)+1, last_confirmed=?
-                WHERE id=?
-            """, (detail, ftype, json.dumps(symbols, ensure_ascii=False), source,
-                  confidence, json.dumps(tags or [], ensure_ascii=False), now, emb,
-                  now, fid))
-            action = "updated"
-            # 重建锚定表：先删后插，避免残留已移除的符号
-            c.execute("DELETE FROM finding_symbol WHERE finding_id=?", (fid,))
-            c.execute("DELETE FROM finding_fts WHERE finding_id=?", (fid,))
+        conn.execute("BEGIN IMMEDIATE")
+        old = conn.execute("SELECT * FROM finding WHERE project_id=? AND title=?",
+                           (project_id, title)).fetchone()
+        if old and old["status"] in ("revoked", "superseded"):
+            return {"error": "historical finding cannot be silently revived; use a new title"}
+        def prior(key, value, default):
+            return value if value is not None else (old[key] if old else default)
+        new_detail = detail or (old["detail"] if old else "")
+        new_source = source or (old["source"] if old else "")
+        new_symbols = sorted(set(symbols or (json.loads(old["symbols"] or "[]") if old else [])))
+        new_tags = prior("tags", tags, [])
+        if isinstance(new_tags, str):
+            new_tags = json.loads(new_tags or "[]")
+        new_scope = prior("scope", scope, "project")
+        new_revision = prior("revision", revision, "")
+        new_conditions = prior("conditions", conditions, "")
+        new_doc = prior("source_document_id", source_document_id, "")
+        if new_scope == "portable" and (not new_conditions or not new_source):
+            return {"error": "portable knowledge requires conditions and source"}
+        payload = json.dumps([title, new_detail, new_symbols, new_revision, new_conditions, new_doc],
+                             ensure_ascii=False, sort_keys=True)
+        digest = hashlib.sha256(payload.encode()).hexdigest()
+        old_payload = (json.dumps([old["title"], old["detail"], json.loads(old["symbols"] or "[]"),
+                                  old["revision"], old["conditions"], old["source_document_id"]], ensure_ascii=False, sort_keys=True)
+                       if old else None)
+        changed = old_payload != payload
+        new_confidence = confidence or ((old["confidence"] if not changed else "suspected")
+                                        if old else "suspected")
+        if confidence == "confirmed" and (not evidence_key.strip() or not source.strip()):
+            return {"error": "confirmed requires source and an explicit evidence_key"}
+        fid = old["id"] if old else "finding:" + uuid.uuid4().hex
+        count = (old["evidence_count"] or 0) if old and not changed else 0
+        last = old["last_confirmed"] if old and not changed else None
+        if confidence == "confirmed":
+            conn.execute("INSERT OR IGNORE INTO finding_evidence VALUES(?,?,?,?,?)",
+                         (fid, evidence_key, digest, source, now))
+            count = conn.execute("SELECT COUNT(*) FROM finding_evidence WHERE finding_id=? AND content_hash=?",
+                                 (fid, digest)).fetchone()[0]
+            last = now
+        values = (ftype or (old["ftype"] if old else "fact"), title, new_detail,
+                  json.dumps(new_symbols, ensure_ascii=False), new_source,
+                  new_confidence, json.dumps(new_tags, ensure_ascii=False), now,
+                  count, last, project_id, new_scope, new_revision, new_conditions, new_doc)
+        if old:
+            if changed:
+                snapshot = dict(old)
+                snapshot.pop("embedding", None)
+                snapshot = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+                conn.execute("INSERT OR IGNORE INTO finding_revision VALUES(?,?,?,?)",
+                             (fid, hashlib.sha256(snapshot.encode()).hexdigest(), snapshot, now))
+            conn.execute("""UPDATE finding SET ftype=?,title=?,detail=?,symbols=?,source=?,
+                confidence=?,tags=?,updated_at=?,evidence_count=?,last_confirmed=?,project_id=?,
+                scope=?,revision=?,conditions=?,source_document_id=?,embedding=CASE WHEN ? THEN NULL ELSE embedding END,
+                status=CASE WHEN ? THEN 'active' ELSE status END
+                WHERE id=?""", (*values, changed, bool(new_doc and changed), fid))
         else:
-            fid = _make_id(title)
-            c.execute("""
-                INSERT INTO finding
-                (id, ftype, title, detail, symbols, source, status, confidence, tags,
-                 created_at, updated_at, embedding, evidence_count, last_confirmed)
-                VALUES (?,?,?,?,?,?, 'active', ?, ?, ?, ?, ?, 1, ?)
-            """, (fid, ftype, title, detail,
-                  json.dumps(symbols, ensure_ascii=False), source,
-                  confidence, json.dumps(tags or [], ensure_ascii=False),
-                  now, now, emb, now))
-            action = "created"
-
-        for sym in symbols:
-            c.execute("INSERT OR IGNORE INTO finding_symbol (finding_id, symbol_name) VALUES (?,?)",
-                      (fid, sym))
-
-        c.execute("""
-            INSERT INTO finding_fts (finding_id, title, detail, tags)
-            VALUES (?,?,?,?)
-        """, (fid, _preprocess_cjk_for_fts(title), _preprocess_cjk_for_fts(detail),
-              _preprocess_cjk_for_fts(json.dumps(tags or [], ensure_ascii=False))))
+            conn.execute("""INSERT INTO finding(ftype,title,detail,symbols,source,confidence,tags,
+                updated_at,evidence_count,last_confirmed,project_id,scope,revision,conditions,source_document_id,id,created_at,status)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active')""", (*values, fid, now))
+        conn.execute("DELETE FROM finding_symbol WHERE finding_id=?", (fid,))
+        conn.executemany("INSERT INTO finding_symbol VALUES(?,?)", [(fid, x) for x in new_symbols])
+        conn.execute("DELETE FROM finding_fts WHERE finding_id=?", (fid,))
+        conn.execute("INSERT INTO finding_fts VALUES(?,?,?,?)", (fid,
+                     _preprocess_cjk_for_fts(title), _preprocess_cjk_for_fts(new_detail),
+                     _preprocess_cjk_for_fts(json.dumps(new_tags, ensure_ascii=False))))
         conn.commit()
-        return {"action": action, "id": fid, "symbols_anchored": len(symbols)}
+        return {"action": "updated" if old else "created", "id": fid,
+                "project_id": project_id, "scope": new_scope, "confidence": new_confidence,
+                "evidence_count": count, "symbols_anchored": len(new_symbols),
+                "evidence_semantics": "caller-reported validation, not independently verified by MCP"}
     finally:
         conn.close()
 
@@ -262,8 +321,9 @@ def backfill_embeddings(db_path: str = DEFAULT_DB) -> int:
 
 
 def search_findings(keyword: str = "", symbol: str = "", ftype: str = "",
-                    status: str = "active,stale",
-                    limit: int = 10, db_path: str = DEFAULT_DB) -> list[dict]:
+                    status: str = "active",
+                    limit: int = 10, db_path: str = DEFAULT_DB, *,
+                    project_id: str | None = None, include_portable: bool = False) -> list[dict]:
     """检索经验结论：关键词（FTS5 词法 + 向量语义 RRF 融合）/ 符号锚定 / 类型 可组合。
 
     词法路命中字面词（符号名/崩溃），向量路命中同义改述（"程序挂了"→"崩溃"）。
@@ -275,6 +335,8 @@ def search_findings(keyword: str = "", symbol: str = "", ftype: str = "",
         ph = ",".join("?" * len(statuses))
         sql = f"SELECT * FROM finding WHERE status IN ({ph})"
         params: list = list(statuses)
+        sql += " AND (project_id=?" + (" OR scope='portable'" if include_portable else "") + ")"
+        params.append(_project(project_id))
 
         if ftype:
             sql += " AND ftype = ?"
@@ -297,12 +359,14 @@ def search_findings(keyword: str = "", symbol: str = "", ftype: str = "",
         expanded = " ".join([keyword] + expand_synonyms(keyword))
         match = _fts_tokens(expanded)
         lexical_ids: set[str] = set()
+        lexical_scores = {}
         if match:
             try:
                 fts_rows = conn.execute(
-                    "SELECT finding_id FROM finding_fts WHERE finding_fts MATCH ?",
+                    "SELECT finding_id,bm25(finding_fts) AS relevance FROM finding_fts WHERE finding_fts MATCH ? ORDER BY relevance",
                     (match,)).fetchall()
                 lexical_ids = {r["finding_id"] for r in fts_rows}
+                lexical_scores = {r["finding_id"]: r["relevance"] for r in fts_rows}
             except Exception as e:
                 print(f"[finding_store] 词法路异常（跳过该路）: {e}", file=sys.stderr)
 
@@ -313,7 +377,7 @@ def search_findings(keyword: str = "", symbol: str = "", ftype: str = "",
         # 【排序增强】而非独立召回源：仅在词法路有命中时对命中集做语义加权排序；
         # 词法零命中时不召回，避免"最不相关里挑最相关"的垃圾结果。
         # finding 库规模化后换 bge-m3/bge-base 可重新评估独立召回。
-        qblob = _embed_one(keyword, mode="query")
+        qblob = _embed_one(keyword, mode="query") if lexical_ids else None
         vec_scored: list[tuple[float, str]] = []
         if qblob is not None and lexical_ids:
             for r in rows:
@@ -328,7 +392,8 @@ def search_findings(keyword: str = "", symbol: str = "", ftype: str = "",
             return []
         lexical_ranked = [r["id"] for r in
                           sorted((r for r in rows if r["id"] in lexical_ids),
-                                 key=lambda r: r["updated_at"] or "", reverse=True)]
+                                 key=lambda r: (0 if keyword.lower() in (r["title"] + " " + r["detail"]).lower() else 1,
+                                                lexical_scores.get(r["id"], 0), -_lifecycle_boost(r)))]
         fused = _rrf_merge(lexical_ranked, vector_ids, limit=limit)
 
         # 生命周期衰减：RRF 分乘 (1 + 0.5*加成)——证据充分/新鲜者接近名次内上浮，
@@ -344,7 +409,8 @@ def search_findings(keyword: str = "", symbol: str = "", ftype: str = "",
 
 def get_findings_by_symbols(symbol_names: list[str],
                             limit_per_symbol: int = 3,
-                            db_path: str = DEFAULT_DB) -> list[dict]:
+                            db_path: str = DEFAULT_DB, *,
+                            project_id: str | None = None) -> list[dict]:
     """按符号名集合批量取锚定的 findings（供 doc_graph_search join 用）。
 
     匹配规则：finding_symbol.symbol_name 与传入名相等，或互为 ClassName::Method
@@ -368,9 +434,9 @@ def get_findings_by_symbols(symbol_names: list[str],
         rows = conn.execute(f"""
             SELECT f.* FROM finding f
             JOIN finding_symbol fs ON fs.finding_id = f.id
-            WHERE fs.symbol_name IN ({ph}) AND f.status IN ('active', 'stale')
+            WHERE fs.symbol_name IN ({ph}) AND f.status='active' AND f.project_id=?
             ORDER BY f.updated_at DESC
-        """, list(names)).fetchall()
+        """, list(names) + [_project(project_id)]).fetchall()
         # 去重（一个 finding 锚定多个符号时 join 出多行）
         seen, uniq = set(), []
         for r in rows:
@@ -384,6 +450,36 @@ def get_findings_by_symbols(symbol_names: list[str],
         conn.close()
 
 
+def revoke_finding(finding_id: str, reason: str = "",
+                   db_path: str = DEFAULT_DB) -> dict:
+    """撤销一条经验结论（status → revoked）。
+
+    2026-10-23 评审修复（P1-1）：状态机一直画着 active→revoked 转移但全系统
+    无任何可达路径——错误结论（如被后续实证推翻的推断）只能靠新结论对冲，
+    旧错误条目永远 active 可召回（B110 互斥结论对实证）。
+
+    revoked 不进默认召回（search 默认 status="active,stale"），但保留审计入口
+    （status="revoked" 显式查询可回溯），与"只进不出"治理目标闭环。
+    """
+    conn = _get_conn(db_path)
+    try:
+        row = conn.execute("SELECT id, status, title FROM finding WHERE id=?",
+                           (finding_id,)).fetchone()
+        if not row:
+            return {"error": f"finding 不存在: {finding_id}"}
+        if row["status"] == "revoked":
+            return {"action": "noop", "id": finding_id, "note": "已是 revoked"}
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        marker = f"\n\n======【revoked {now}】{reason or '人工撤销'}======"
+        conn.execute("UPDATE finding SET status='revoked', updated_at=?, "
+                     "detail=detail || ? WHERE id=?", (now, marker, finding_id))
+        conn.commit()
+        return {"action": "revoked", "id": finding_id,
+                "title": row["title"], "reason": reason}
+    finally:
+        conn.close()
+
+
 # ─── stale 自动检测（T7）──────────────────────────────────────
 
 def _is_code_symbol(name: str) -> bool:
@@ -393,6 +489,57 @@ def _is_code_symbol(name: str) -> bool:
     C++ 标识符特征：字母数字 + :: + _ + ~。
     """
     return bool(name) and "." not in name and re.match(r'^[A-Za-z_][\w:~]*$', name)
+
+
+# 域外锚定注册表（2026-10-22 定）：这些模式是 MCU 串口/芯片/寄存器日志标识符，
+# 永远不会出现在任何代码库里，cppsg 存在性判据对它们无效——freshness 误标 14 条
+# findings 的根因之一。命中即整体豁免 stale 检测（无法判定 ≠ 已失效）。
+_OUT_OF_DOMAIN_RE = re.compile(
+    r"^(TLF\d+|MucRst|SocPwrCtrl\w*|DUS_ERR_VSC|dusIOWrite|hvrtos_vscdlib)$"
+)
+
+# 仓库级兜底检索根（2026-10-22 定）：cppsg 只覆盖 ap-aa/app 业务模块，
+# BSW（dm/DoIP 栈，如 Conversation/UDPHandler）、SDK、工具链脚本符号全部查空——
+# "不在 cppsg" ≠ "已删除"。仅在全部锚定符号 cppsg 查空时才逐符号兜底 grep。
+_REPO_SEARCH_ROOTS = [
+    "/mnt/code1/adc4.0",
+    "/mnt/code1/cpp_semantic_graph",
+    os.path.expanduser("~/.codebuddy"),
+]
+_REPO_GREP_ARGS = (
+    ["grep", "-rlF", "-m1", "--no-messages",
+     "--include=*.h", "--include=*.hpp", "--include=*.cpp",
+     "--include=*.cc", "--include=*.py", "--include=*.sh",
+     "--exclude-dir=.git", "--exclude-dir=out", "--exclude-dir=toolchains",
+     "--exclude-dir=build_logs", "--exclude-dir=node_modules"]
+)
+
+
+def _symbol_exists_in_repo(symbol_name: str, cache: dict) -> bool:
+    """仓库级兜底存在性判据：符号字符串出现在任一检索根的源码文件里即视为存在。
+
+    全名（Class::method）优先精确匹配定义/调用点；全名查空再用短名（method）
+    兜底——短名命中偏宽松，但 stale 误标的代价（AI 无视有效结论）高于漏标，
+    与 _symbol_exists_in_cppsg 的宽松原则一致。仅 check_freshness 在
+    cppsg 全查空时调用，单次运行经 cache 去重。
+    """
+    base = symbol_name[7:] if symbol_name.startswith("symbol:") else symbol_name
+    if base in cache:
+        return cache[base]
+    found = False
+    for probe in dict.fromkeys([base, base.split("::")[-1]]):
+        if not probe:
+            continue
+        try:
+            r = subprocess.run(_REPO_GREP_ARGS + [probe] + _REPO_SEARCH_ROOTS,
+                               capture_output=True, timeout=60)
+            if r.stdout.strip():
+                found = True
+                break
+        except (subprocess.TimeoutExpired, OSError):
+            continue  # 单符号检索失败按未找到处理，交由上层 all_gone 判定
+    cache[base] = found
+    return found
 
 
 def _symbol_exists_in_cppsg(symbol_name: str, cppsg_conn: sqlite3.Connection) -> bool:
@@ -427,12 +574,17 @@ def _symbol_exists_in_cppsg(symbol_name: str, cppsg_conn: sqlite3.Connection) ->
 def check_freshness(db_path: str = DEFAULT_DB, cppsg_db_path: str = CPPSG_DB) -> dict:
     """检测 finding 锚定符号在 cppsg 的存在性，幂等双向状态迁移。
 
-    全部锚定符号消失 → active → stale（结论可能已失效）
-    stale 且任一符号回归 → stale → active（自动恢复）
+    三层判定（2026-10-22 起，修正"BSW/日志域符号误标 stale"缺陷）：
+      0. 域外豁免：锚定全部命中域外注册表（MCU 日志/芯片标识）→ 无法判定，
+         不标 stale；已是 stale 的恢复 active（历史误标矫正路径）
+      1. cppsg 存在性（原逻辑）：全部锚定符号消失 → active → stale
+      2. 仓库级兜底：cppsg 全查空时逐符号 grep 检索根（BSW/SDK/工具链域），
+         任一符号在仓库源码中出现 → 视为存在，不标 stale
+    stale 且任一符号回归（1/2 层任一判活）→ stale → active（自动恢复）
 
     Returns:
         {"checked": n, "stale_marked": n, "recovered": n,
-         "detail": [{id, title, from, to, missing_symbols}]}
+         "detail": [{id, title, from, to, missing_symbols, reason}]}
     """
     if not os.path.exists(cppsg_db_path):
         return {"error": f"cppsg 数据库不存在: {cppsg_db_path}"}
@@ -443,22 +595,39 @@ def check_freshness(db_path: str = DEFAULT_DB, cppsg_db_path: str = CPPSG_DB) ->
     try:
         rows = conn.execute("""
             SELECT f.id, f.title, f.status, f.symbols
-            FROM finding f WHERE f.status IN ('active', 'stale')
-        """).fetchall()
+            FROM finding f WHERE f.status IN ('active', 'stale') AND f.project_id=? AND COALESCE(f.source_document_id,'')=''
+        """, (_project(),)).fetchall()
 
         result = {"checked": len(rows), "stale_marked": 0, "recovered": 0, "detail": []}
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        repo_cache: dict = {}
         for r in rows:
             try:
                 symbols = json.loads(r["symbols"] or "[]")
             except (json.JSONDecodeError, TypeError):
                 symbols = []
             # 只检测代码符号锚定；服务名/文件名等运维锚定不适用 cppsg 存在性判据
-            symbols = [s for s in symbols if _is_code_symbol(s)]
+            # 域外注册表命中的（MCU 日志/芯片标识）同样豁免——它们不在任何代码库里
+            symbols = [s for s in symbols
+                       if _is_code_symbol(s) and not _OUT_OF_DOMAIN_RE.match(s)]
             if not symbols:
-                continue  # 无代码符号锚定的结论无法检测，跳过
+                # 全部锚定在判据适用域外 → 无法判定时效，不标 stale；
+                # 已是 stale 的必为历史误标（本逻辑下不可能标出），恢复 active
+                if r["status"] == "stale":
+                    conn.execute("UPDATE finding SET status='active', updated_at=? WHERE id=?",
+                                 (now, r["id"]))
+                    result["recovered"] += 1
+                    result["detail"].append({"id": r["id"], "title": r["title"],
+                                             "from": "stale", "to": "active",
+                                             "missing_symbols": [],
+                                             "reason": "out_of_domain"})
+                continue  # 无可判定锚定的结论跳过
 
             missing = [s for s in symbols if not _symbol_exists_in_cppsg(s, cppsg_conn)]
+            if len(missing) == len(symbols):
+                # cppsg 全查空 ≠ 已删除：BSW/SDK/工具链域符号做仓库级兜底确认
+                missing = [s for s in missing
+                           if not _symbol_exists_in_repo(s, repo_cache)]
             all_gone = len(missing) == len(symbols)
 
             if all_gone and r["status"] == "active":
@@ -467,16 +636,17 @@ def check_freshness(db_path: str = DEFAULT_DB, cppsg_db_path: str = CPPSG_DB) ->
                 result["stale_marked"] += 1
                 result["detail"].append({"id": r["id"], "title": r["title"],
                                          "from": "active", "to": "stale",
-                                         "missing_symbols": missing})
+                                         "missing_symbols": missing,
+                                         "reason": "symbols_gone"})
             elif not all_gone and r["status"] == "stale":
                 # 恢复 active = 锚定符号回归 = 一次证据支持：计数+1 并刷新确认时间
-                conn.execute("""UPDATE finding SET status='active', updated_at=?,
-                                evidence_count=COALESCE(evidence_count,0)+1, last_confirmed=?
-                                WHERE id=?""", (now, now, r["id"]))
+                conn.execute("UPDATE finding SET status='active', updated_at=? WHERE id=?",
+                             (now, r["id"]))
                 result["recovered"] += 1
                 result["detail"].append({"id": r["id"], "title": r["title"],
                                          "from": "stale", "to": "active",
-                                         "missing_symbols": missing})
+                                         "missing_symbols": missing,
+                                         "reason": "symbol_back"})
         conn.commit()
         return result
     finally:
@@ -503,6 +673,8 @@ os.makedirs(EMBED_CACHE_DIR, exist_ok=True)
 
 
 def _get_embed_model():
+    if os.environ.get("DOC_GRAPH_EMBED_ENABLED", "1") == "0":
+        return None
     """lazy 加载 embedding 模型。失败标记 unavailable，后续调用直接跳过。"""
     global _EMBED_MODEL, _EMBED_MODEL_STATE
     if _EMBED_MODEL_STATE == "ready":
@@ -613,7 +785,7 @@ def _lifecycle_boost(row) -> float:
         ev = 0
     lc = _parse_db_time(row["last_confirmed"] if "last_confirmed" in row.keys() else None)
     ua = _parse_db_time(row["updated_at"] if "updated_at" in row.keys() else None)
-    latest = max((t for t in (lc, ua) if t), default=None)
+    latest = lc  # Editing or symbol existence is not validation.
     if latest is None:
         recency = 0.0
     else:

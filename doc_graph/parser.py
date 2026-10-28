@@ -148,6 +148,8 @@ class Node:
     tags: list = field(default_factory=list)
     manual: bool = False   # True = 有 frontmatter
     legacy: bool = False   # True = 无 frontmatter 的旧文档
+    content: str = ""
+    content_hash: str = ""
 
 @dataclass
 class Edge:
@@ -298,7 +300,8 @@ def extract_symbols_from_diary_assoc(text: str) -> list[str]:
 
 
 def extract_first_paragraph(lines: list[str], skip_blockquote: bool = True,
-                             start_idx: int = 0, max_chars: int = 200) -> str:
+                             start_idx: int = 0, max_chars: int = 200,
+                             stop_at_heading: bool = False) -> str:
     """提取第一个实质段落作为摘要
 
     跳过：空行、标题(#)、代码块(```)、表格(|)、分隔线(---)
@@ -306,6 +309,12 @@ def extract_first_paragraph(lines: list[str], skip_blockquote: bool = True,
 
     如果没有段落，降级收集前 3 个列表项作为摘要。
     返回截断到 max_chars 的纯文本。
+
+    stop_at_heading=True（章节级）：遇到下一个二级标题（## ）立即停止——
+    2026-10-23 修复"多节同 summary"缺陷：原实现标题仅在收集态才终止扫描，
+    章节自身无实质段落（纯列表/表格/代码块）时会穿透进后续章节抓别人的
+    段落（且段落优先级高于本章节列表摘要），导致 782 对跨章节重复摘要。
+    文档级摘要（start_idx=0 全文扫）保持 False 不受影响。
     """
     in_code_block = False
     collecting = False
@@ -324,6 +333,10 @@ def extract_first_paragraph(lines: list[str], skip_blockquote: bool = True,
             continue
         if in_code_block:
             continue
+
+        # 章节级边界：下一个二级标题即本章节内容结束，立即停止
+        if stop_at_heading and stripped.startswith('## '):
+            break
 
         # 跳过空行（收集阶段遇到空行=段落结束）
         if not stripped:
@@ -494,6 +507,8 @@ def parse_doc(full_path: str, rel_path: str,
     doc_node = Node(
         id=doc_id,
         type='document',
+        content=content,
+        content_hash=__import__('hashlib').sha256(content.encode('utf-8')).hexdigest(),
         doc_type=doc_type,
         title=title,
         summary=frontmatter.get('summary', ''),
@@ -553,13 +568,12 @@ def parse_doc(full_path: str, rel_path: str,
                 title=sec_title, path=rel_path, line=content_start + i + 1,
             )
             # 知识点摘要：提取 ## 标题后的第一个实质段落
+            # （stop_at_heading=章节边界，不穿透到后续章节——2026-10-23 修复）
             current_knode.summary = extract_first_paragraph(
-                body_lines, skip_blockquote=True, start_idx=i + 1, max_chars=200)
+                body_lines, skip_blockquote=True, start_idx=i + 1, max_chars=200,
+                stop_at_heading=True)
 
-            nodes_out.append(current_knode)
-            edge_set.add(Edge(src=doc_id, dst=kid, rel='has_knowledge', manual=False))
-
-            # diary 增强：扫描 ## 后的 - **字段**
+            # diary 增强：扫描 ## 后的 - **字段**（**结论** 行可补全空摘要）
             if doc_type == 'diary':
                 for j in range(i + 1, len(body_lines)):
                     if body_lines[j].startswith('## ') or body_lines[j].strip().startswith('```'):
@@ -599,6 +613,21 @@ def parse_doc(full_path: str, rel_path: str,
                     if m:
                         current_knode.ktype = m.group(1)
                         break
+
+            # 准入过滤（2026-10-23）：空摘要章节（纯代码块/纯表格/无实质内容）
+            # 不建 knowledge 节点与 has_knowledge 边——此类章节原实现靠穿透抓
+            # 邻居章节内容充数，是 782 对跨章节重复摘要的根因之一
+            section_end = next((j for j in range(i + 1, len(body_lines))
+                                if body_lines[j].startswith('## ')), len(body_lines))
+            current_knode.content = '\n'.join(body_lines[i:section_end])
+            current_knode.content_hash = __import__('hashlib').sha256(
+                current_knode.content.encode('utf-8')).hexdigest()
+            if not current_knode.content.strip():
+                current_knode = None
+                continue
+
+            nodes_out.append(current_knode)
+            edge_set.add(Edge(src=doc_id, dst=kid, rel='has_knowledge', manual=False))
 
     # 8. 扫描 markdown 链接 → relates_to 边（auto，去重）
     in_code_block = False
@@ -647,102 +676,103 @@ def parse_doc(full_path: str, rel_path: str,
 def write_sqlite(nodes: list[Node], edges: list[Edge], db_path: str):
     """写入 SQLite 数据库（含 FTS5）。
 
-    全量重建前先导出经验结论（finding 三表），重建后回写——
-    finding 由 MCP 在线写入，生命周期独立于本解析管道（见 finding_store.py）。
+    事务内仅替换派生文档索引，保留在线 finding 和记忆表及数据库文件。
     """
-    from finding_store import export_findings, import_findings
-    finding_snapshot = export_findings(db_path)
-
-    if os.path.exists(db_path):
-        os.remove(db_path)
-
-    conn = sqlite3.connect(db_path)
+    # Rebuild only derived index tables, in one transaction on the existing file.
+    # Online memory/finding tables remain in place; SQLite serializes their writers.
+    conn = sqlite3.connect(db_path, timeout=30)
     c = conn.cursor()
-
-    c.execute("""
-        CREATE TABLE node (
-            id          TEXT PRIMARY KEY,
-            type        TEXT NOT NULL,
-            doc_type    TEXT,
-            title       TEXT,
-            summary     TEXT,
-            path        TEXT,
-            line        INTEGER DEFAULT 0,
-            ktype       TEXT,
-            conclusion  TEXT,
-            session     TEXT,
-            status      TEXT,
-            date        TEXT,
-            tags        TEXT,
-            manual      INTEGER DEFAULT 0,
-            legacy      INTEGER DEFAULT 0
-        )
-    """)
-    c.execute("""
-        CREATE TABLE edge (
-            src     TEXT NOT NULL,
-            dst     TEXT NOT NULL,
-            rel     TEXT NOT NULL,
-            manual  INTEGER DEFAULT 0,
-            PRIMARY KEY (src, dst, rel)
-        )
-    """)
-    c.execute("CREATE INDEX idx_edge_src ON edge(src)")
-    c.execute("CREATE INDEX idx_edge_dst ON edge(dst)")
-    c.execute("CREATE INDEX idx_edge_rel ON edge(rel)")
-
-    for n in nodes:
-        # 确保标量字段不是 list（frontmatter 空值可能被解析成 []）
-        status = n.status if isinstance(n.status, str) else ("" if not n.status else str(n.status))
-        date = n.date if isinstance(n.date, str) else str(n.date)
-        c.execute("""
-            INSERT OR REPLACE INTO node
-            (id, type, doc_type, title, summary, path, line, ktype, conclusion, session,
-             status, date, tags, manual, legacy)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            n.id, n.type, n.doc_type, n.title, n.summary, n.path, n.line,
-            n.ktype, n.conclusion, n.session, status, date,
-            json.dumps(n.tags, ensure_ascii=False) if isinstance(n.tags, (list, dict)) else (n.tags or "[]"),
-            int(n.manual), int(n.legacy),
-        ))
-
-    for e in edges:
-        c.execute("""
-            INSERT OR IGNORE INTO edge (src, dst, rel, manual)
-            VALUES (?,?,?,?)
-        """, (e.src, e.dst, e.rel, int(e.manual)))
-
-    # FTS5 虚拟表
+    c.execute("PRAGMA busy_timeout=30000")
+    c.execute("BEGIN IMMEDIATE")
     try:
+        for table in ("doc_fts", "edge", "node"):
+            c.execute(f"DROP TABLE IF EXISTS {table}")
         c.execute("""
-            CREATE VIRTUAL TABLE doc_fts USING fts5(
-                doc_id, title, summary, path, tags,
-                tokenize='unicode61'
+            CREATE TABLE node (
+                id          TEXT PRIMARY KEY,
+                type        TEXT NOT NULL,
+                doc_type    TEXT,
+                title       TEXT,
+                summary     TEXT,
+                path        TEXT,
+                line        INTEGER DEFAULT 0,
+                ktype       TEXT,
+                conclusion  TEXT,
+                session     TEXT,
+                status      TEXT,
+                date        TEXT,
+                tags        TEXT,
+                manual      INTEGER DEFAULT 0,
+                legacy      INTEGER DEFAULT 0,
+                content     TEXT DEFAULT '',
+                content_hash TEXT DEFAULT ''
             )
         """)
+        c.execute("""
+            CREATE TABLE edge (
+                src     TEXT NOT NULL,
+                dst     TEXT NOT NULL,
+                rel     TEXT NOT NULL,
+                manual  INTEGER DEFAULT 0,
+                PRIMARY KEY (src, dst, rel)
+            )
+        """)
+        c.execute("CREATE INDEX idx_edge_src ON edge(src)")
+        c.execute("CREATE INDEX idx_edge_dst ON edge(dst)")
+        c.execute("CREATE INDEX idx_edge_rel ON edge(rel)")
+
         for n in nodes:
-            if n.type == 'document':
-                c.execute("""
-                    INSERT INTO doc_fts (doc_id, title, summary, path, tags)
-                    VALUES (?,?,?,?,?)
-                """, (
-                    n.id,
-                    _preprocess_cjk_for_fts(n.title),
-                    _preprocess_cjk_for_fts(n.summary),
-                    n.path,
-                    _preprocess_cjk_for_fts(json.dumps(n.tags, ensure_ascii=False)),
-                ))
-    except Exception as ex:
-        print(f"⚠️ FTS5 创建跳过: {ex}")
+            # 确保标量字段不是 list（frontmatter 空值可能被解析成 []）
+            status = n.status if isinstance(n.status, str) else ("" if not n.status else str(n.status))
+            date = n.date if isinstance(n.date, str) else str(n.date)
+            c.execute("""
+                INSERT OR REPLACE INTO node
+                (id, type, doc_type, title, summary, path, line, ktype, conclusion, session,
+                 status, date, tags, manual, legacy, content, content_hash)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                n.id, n.type, n.doc_type, n.title, n.summary, n.path, n.line,
+                n.ktype, n.conclusion, n.session, status, date,
+                json.dumps(n.tags, ensure_ascii=False) if isinstance(n.tags, (list, dict)) else (n.tags or "[]"),
+                int(n.manual), int(n.legacy), n.content, n.content_hash,
+            ))
 
-    conn.commit()
-    conn.close()
+        for e in edges:
+            c.execute("""
+                INSERT OR IGNORE INTO edge (src, dst, rel, manual)
+                VALUES (?,?,?,?)
+            """, (e.src, e.dst, e.rel, int(e.manual)))
 
-    # 回写经验结论（finding 三表独立于本次重建）
-    restored = import_findings(finding_snapshot, db_path)
-    if restored:
-        print(f"🧠 已保留经验结论 {restored} 条（finding 表不受全量重建影响）")
+        # FTS5 虚拟表
+        try:
+            c.execute("""
+                CREATE VIRTUAL TABLE doc_fts USING fts5(
+                    doc_id, title, summary, path, tags, content,
+                    tokenize='unicode61'
+                )
+            """)
+            for n in nodes:
+                if n.type == 'document':
+                    c.execute("""
+                        INSERT INTO doc_fts (doc_id, title, summary, path, tags, content)
+                        VALUES (?,?,?,?,?,?)
+                    """, (
+                        n.id,
+                        _preprocess_cjk_for_fts(n.title),
+                        _preprocess_cjk_for_fts(n.summary),
+                        n.path,
+                        _preprocess_cjk_for_fts(json.dumps(n.tags, ensure_ascii=False)),
+                        _preprocess_cjk_for_fts(n.content),
+                    ))
+        except Exception as ex:
+            raise RuntimeError(f"FTS5 index build failed: {ex}") from ex
+
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 # ─── 验证报告 ─────────────────────────────────────────────────

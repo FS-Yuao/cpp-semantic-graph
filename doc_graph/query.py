@@ -18,7 +18,7 @@ from __future__ import annotations
 import os, sys, json, sqlite3, argparse, re
 from collections import deque
 
-from finding_store import search_findings, get_findings_by_symbols
+from finding_store import search_findings, get_findings_by_symbols, _lifecycle_boost
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DB = os.path.join(SCRIPT_DIR, "doc_graph.db")
@@ -71,7 +71,8 @@ def _rrf_fuse(rankings: list[list[str]], sources: list[str],
             for d in selected]
 
 
-def fts5_search(conn: sqlite3.Connection, keyword: str, limit: int = 5) -> list[dict]:
+def fts5_search(conn: sqlite3.Connection, keyword: str, limit: int = 5,
+                include_history: bool = False) -> list[dict]:
     """三路并行检索起始文档 + RRF 融合排序。
 
     路 1 FTS5 全文（title/summary/path/tags）
@@ -92,15 +93,17 @@ def fts5_search(conn: sqlite3.Connection, keyword: str, limit: int = 5) -> list[
             match_parts.append(t)
     match_expr = ' OR '.join(match_parts)
 
+    visible = "" if include_history else " AND COALESCE(status,'') NOT IN ('archived','revoked','superseded','deprecated')"
     per_route = limit * 3  # 每路多取，融合后截断
     rankings: list[list[str]] = []
     route_names: list[str] = []
 
     # 路 1: FTS5
     try:
-        rows = conn.execute("""
+        rows = conn.execute(f"""
             SELECT doc_id, bm25(doc_fts) AS score
             FROM doc_fts WHERE doc_fts MATCH ?
+            AND doc_id IN (SELECT id FROM node WHERE type='document' {visible})
             ORDER BY score LIMIT ?
         """, (match_expr, per_route)).fetchall()
         if rows:
@@ -110,9 +113,9 @@ def fts5_search(conn: sqlite3.Connection, keyword: str, limit: int = 5) -> list[
         print(f"[doc_graph] FTS5 路异常（跳过，不影响其他路）: {e}", file=sys.stderr)
 
     # 路 2: LIKE（标题/摘要/路径/标签子串）
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT id AS doc_id
-        FROM node WHERE type = 'document'
+        FROM node WHERE type = 'document' {visible}
           AND (title LIKE ? OR summary LIKE ? OR path LIKE ? OR tags LIKE ?)
         LIMIT ?
     """, (f"%{keyword}%",) * 4 + (per_route,)).fetchall()
@@ -121,10 +124,11 @@ def fts5_search(conn: sqlite3.Connection, keyword: str, limit: int = 5) -> list[
         route_names.append("like")
 
     # 路 3: 符号反查
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT DISTINCT e.src AS doc_id
         FROM edge e
         WHERE e.rel = 'mentions_symbol' AND e.dst LIKE ?
+        AND e.src IN (SELECT id FROM node WHERE type='document' {visible})
         LIMIT ?
     """, (f"%{keyword}%", per_route)).fetchall()
     if rows:
@@ -139,7 +143,8 @@ def fts5_search(conn: sqlite3.Connection, keyword: str, limit: int = 5) -> list[
 # ─── 2. BFS 图遍历 ────────────────────────────────────────────
 
 def bfs_traverse(conn: sqlite3.Connection, start_id: str,
-                 depth: int = 2, edge_filter: list[str] | None = None) -> dict:
+                 depth: int = 2, edge_filter: list[str] | None = None,
+                 include_history: bool = False) -> dict:
     """从节点出发 BFS 遍历，返回关联的文档/知识点/符号"""
     visited = set()
     results = {"docs": [], "knowledge": [], "symbols": []}
@@ -157,6 +162,8 @@ def bfs_traverse(conn: sqlite3.Connection, start_id: str,
             continue
 
         node = dict(row)
+        if not include_history and node.get("status") in {"archived", "revoked", "superseded", "deprecated"}:
+            continue
         tags = node.get("tags", "[]")
         try:
             node["tags"] = json.loads(tags) if isinstance(tags, str) else tags
@@ -211,26 +218,18 @@ def bridge_symbol_to_cppsg(symbol_name: str, cppsg_db_path: str = CPPSG_DB) -> l
     try:
         short_name = symbol_name.split("::")[-1]
 
-        # Level 1: 精确匹配
-        rows = conn.execute("""
-            SELECT id, type, name, namespace, file_path, parent_class
-            FROM node WHERE name = ? AND type IN ('class', 'struct', 'function') LIMIT 5
-        """, (short_name,)).fetchall()
-
-        # Level 2: ClassName::MethodName 拆分
-        if not rows and "::" in symbol_name:
-            cls_name, method_name = symbol_name.rsplit("::", 1)
-            rows = conn.execute("""
-                SELECT id, type, name, namespace, file_path, parent_class
-                FROM node WHERE name = ? AND parent_class = ? AND type = 'function' LIMIT 5
-            """, (method_name, cls_name)).fetchall()
-
-        # Level 3: 模糊匹配
-        if not rows:
-            rows = conn.execute("""
-                SELECT id, type, name, namespace, file_path, parent_class
-                FROM node WHERE name LIKE ? AND type IN ('class', 'function') LIMIT 5
-            """, (f"%{short_name}%",)).fetchall()
+        if "::" in symbol_name:
+            owner, method = symbol_name.rsplit("::", 1)
+            rows = conn.execute("""SELECT id,type,name,namespace,file_path,parent_class FROM node
+                WHERE name=? AND (parent_class=? OR namespace=? OR namespace || '::' || parent_class=?)
+                AND type IN ('class','struct','function') LIMIT 5""",
+                (method, owner, owner, owner)).fetchall()
+        else:
+            rows = conn.execute("""SELECT id,type,name,namespace,file_path,parent_class FROM node
+                WHERE name=? AND type IN ('class','struct','function') LIMIT 5""", (short_name,)).fetchall()
+            if not rows:
+                rows = conn.execute("""SELECT id,type,name,namespace,file_path,parent_class FROM node
+                    WHERE name LIKE ? AND type IN ('class','function') LIMIT 5""", (f"%{short_name}%",)).fetchall()
 
         if not rows:
             return []
@@ -262,15 +261,66 @@ def bridge_symbol_to_cppsg(symbol_name: str, cppsg_db_path: str = CPPSG_DB) -> l
 
 # ─── 4. 组合搜索 ──────────────────────────────────────────────
 
+def _compact_search_result(result: dict, symbol_cap: int = 30,
+                           knowledge_cap: int = 20, doc_cap: int = 20,
+                           finding_cap: int = 15) -> dict:
+    """渐进披露裁剪（2026-10-23 O-1）：默认返回目录级，正文按需展开。
+
+    对标渐进披露模式（先目录后正文）：文档只回 title/path/一句话摘要（100 字符
+    截断），知识点只回标题索引（不带 summary），符号折叠为纯名字列表（manual
+    优先排序保持），findings 精简为 id/title/状态/置信度，cppsg 桥接不展开。
+    背景：原全量返回单次查询可超 100+ 符号对象与 30+ 知识点全文摘要，
+    有效信息占比低（2026-10-22 冒烟实证）。
+    2026-10-23 评审修复（P1-5）：docs/findings 加硬上限——符号密集查询经
+    findings 符号反查可带入 ~90 条（全库 119），目录级若不封顶可比旧全量还大。
+    """
+    compact = {
+        "query": result["query"],
+        "mode": "compact",
+        "hint": ("目录级结果。判断相关后带 include_detail=true 重查同一关键词，"
+                 "可获文档/知识点全文摘要、符号详情与 cppsg 桥接节点。"),
+        "start_docs": result["start_docs"],
+        "docs": [{
+            "id": d["id"], "title": d.get("title", ""), "path": d.get("path", ""),
+            "doc_type": d.get("doc_type", ""), "status": d.get("status", ""),
+            "date": d.get("date", ""), "hop": d.get("hop", 0),
+            "summary": (d.get("summary") or "")[:100],
+        } for d in result.get("docs", [])[:doc_cap]],
+        "docs_total": len(result.get("docs", [])),
+        "knowledge": [{
+            "id": k["id"], "title": k.get("title", ""), "path": k.get("path", ""),
+            "line": k.get("line", 0), "ktype": k.get("ktype", ""),
+            "hop": k.get("hop", 0), "parent_doc": k.get("parent_doc"),
+        } for k in result.get("knowledge", [])[:knowledge_cap]],
+        "knowledge_total": len(result.get("knowledge", [])),
+        "symbols": [s["name"] for s in result.get("symbols", [])[:symbol_cap]],
+        "symbols_total": len(result.get("symbols", [])),
+        "code_nodes": [],  # 渐进模式不展开桥接，include_detail=true 时返回
+        "findings": [{
+            "id": f["id"], "title": f.get("title", ""), "ftype": f.get("ftype", ""),
+            "status": f.get("status", ""), "confidence": f.get("confidence", ""),
+            "updated_at": f.get("updated_at", ""),
+        } for f in result.get("findings", [])[:finding_cap]],
+        "findings_total": len(result.get("findings", [])),
+    }
+    if result.get("message"):
+        compact["message"] = result["message"]
+    return compact
+
+
 def doc_graph_search(keyword: str, depth: int = 2,
                      edge_filter: list[str] | None = None,
                      bridge_to_code: bool = True,
-                     db_path: str = DEFAULT_DB) -> dict:
-    """搜索文档图谱，返回结构化关联结果（含经验结论 findings）"""
+                     include_detail: bool = False,
+                     db_path: str = DEFAULT_DB, include_history: bool = False) -> dict:
+    """搜索文档图谱，返回结构化关联结果（含经验结论 findings）。
+
+    include_detail=False（默认）返回目录级（渐进披露第一步，见 _compact_search_result）；
+    True 返回全量（第二步）。"""
     conn = get_conn(db_path)
     try:
         # Step 1: 三路融合定位起始文档
-        start_docs = fts5_search(conn, keyword, limit=3)
+        start_docs = fts5_search(conn, keyword, limit=3, include_history=include_history)
 
         # Step 1.5: 经验结论——关键词直查（即使无文档命中也返回）
         findings: list[dict] = []
@@ -280,15 +330,16 @@ def doc_graph_search(keyword: str, depth: int = 2,
             findings.append(f)
 
         if not start_docs:
-            return {"query": keyword, "start_docs": [], "docs": [], "knowledge": [],
-                    "symbols": [], "code_nodes": [], "findings": findings,
-                    "message": (f"未找到匹配 '{keyword}' 的文档"
-                                + (f"，但有 {len(findings)} 条相关经验结论" if findings else ""))}
+            result = {"query": keyword, "start_docs": [], "docs": [], "knowledge": [],
+                      "symbols": [], "code_nodes": [], "findings": findings,
+                      "message": (f"未找到匹配 '{keyword}' 的文档"
+                                  + (f"，但有 {len(findings)} 条相关经验结论" if findings else ""))}
+            return result if include_detail else _compact_search_result(result)
 
         # Step 2: BFS 遍历
         all_results = {"docs": [], "knowledge": [], "symbols": []}
         for start in start_docs:
-            result = bfs_traverse(conn, start["doc_id"], depth, edge_filter)
+            result = bfs_traverse(conn, start["doc_id"], depth, edge_filter, include_history)
             for key in all_results:
                 all_results[key].extend(result[key])
 
@@ -317,9 +368,10 @@ def doc_graph_search(keyword: str, depth: int = 2,
                 deduped_syms.append(item)
         all_results["symbols"] = deduped_syms
 
-        # Step 3: 符号桥接
+        # Step 3: 符号桥接（仅 detail 模式——渐进模式 code_nodes 不展开，
+        # 省去桥接查询开销；锚定符号反查 findings 仍走 BFS 符号）
         code_nodes = []
-        if bridge_to_code:
+        if bridge_to_code and include_detail:
             for sym in all_results["symbols"][:10]:
                 cppsg_nodes = bridge_symbol_to_cppsg(sym["name"])
                 if cppsg_nodes:
@@ -336,11 +388,14 @@ def doc_graph_search(keyword: str, depth: int = 2,
             if f["id"] not in seen_fids:
                 seen_fids.add(f["id"])
                 findings.append(f)
-        findings.sort(key=lambda x: (x.get("status") != "active",
-                                     x.get("updated_at", "")), reverse=False)
+        # 终排（2026-10-23 评审修复 P1-4）：统一走生命周期衰减排序（证据加成+
+        # 新鲜度），最新优先——原实现按 updated_at 升序把最新结论排在最后，
+        # 且丢弃了子查询内部的 evidence/衰减排序，与 HLD"衰减排序全量生效"宣称不符
+        # Direct keyword findings keep their relevance order; symbol neighbors follow.
 
-        return {"query": keyword, "start_docs": start_docs,
-                **all_results, "code_nodes": code_nodes, "findings": findings}
+        result = {"query": keyword, "start_docs": start_docs,
+                  **all_results, "code_nodes": code_nodes, "findings": findings}
+        return result if include_detail else _compact_search_result(result)
     finally:
         conn.close()
 
@@ -417,6 +472,8 @@ def main():
     parser.add_argument('keyword', help='搜索关键词')
     parser.add_argument('--depth', type=int, default=2, help='BFS 遍历深度')
     parser.add_argument('--bridge', action='store_true', help='桥接到 cppsg')
+    parser.add_argument('--detail', action='store_true',
+                        help='全量模式（默认渐进披露：目录级返回）')
     parser.add_argument('--json', action='store_true', help='输出 JSON')
     parser.add_argument('--db', default=DEFAULT_DB, help='数据库路径')
     parser.add_argument('--edge-filter', nargs='+',
@@ -425,7 +482,8 @@ def main():
 
     result = doc_graph_search(args.keyword, depth=args.depth,
                               edge_filter=args.edge_filter,
-                              bridge_to_code=args.bridge, db_path=args.db)
+                              bridge_to_code=args.bridge, include_detail=args.detail,
+                              db_path=args.db)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     else:

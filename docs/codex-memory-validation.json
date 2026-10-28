@@ -1,0 +1,31 @@
+{
+  "validated_date": "2026-10-28",
+  "skills": 13,
+  "metadata_checks": 13,
+  "codex_unit_tests": 19,
+  "hil_simulation_checks": 86,
+  "standalone_hil_validation_tests": 7,
+  "doc_graph_memory_tests": 19,
+  "readonly_adapter": {
+    "passed": true,
+    "insert_schema_and_version_writes_rejected": 3,
+    "fixture_unchanged": true,
+    "missing_db_not_created": true,
+    "tools_exposed": [
+      "cpp_get_file_symbols",
+      "cpp_get_include_impact",
+      "cpp_get_inheritance",
+      "cpp_relationship",
+      "cpp_symbol_lookup",
+      "cpp_traverse_graph"
+    ]
+  },
+  "archify_node_tests": 114,
+  "archify_skipped": 0,
+  "archify_golden": "passed",
+  "coverage_checks": 19,
+  "coverage_passed": true,
+  "production_databases_uploaded": false,
+  "device_contacted": false,
+  "scope": "Source-package checks on the sync host, not validation of a new project or device"
+}

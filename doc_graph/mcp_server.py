@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mcp.server.fastmcp import FastMCP
 from query import doc_graph_search
 from finding_store import (record_finding, search_findings, check_freshness,
-                           backfill_embeddings, FTYPES)
+                           backfill_embeddings, revoke_finding, FTYPES)
 
 # ─── 配置 ─────────────────────────────────────────────────────
 
@@ -101,33 +101,32 @@ def doc_graph_search_tool(
     keyword: str,
     depth: int = 2,
     bridge_to_code: bool = True,
+    include_detail: bool = False,
     edge_filter: list[str] | None = None,
 ) -> str:
-    """[deprecated → doc_search(scope=all)] 搜索文档知识图谱，返回文档、知识点、代码符号和关联的代码节点。
+    """[deprecated → doc_search(scope=all)] 搜索文档知识图谱（渐进披露：默认目录级，两步查询）。
 
     当用户问关于文档关联、任务历史、决策追溯、设计方案等问题时使用此工具。
-    当用户需要同时查文档和代码时，设置 bridge_to_code=true。
+
+    两步查询法（渐进披露，2026-10-23 起）：
+    ① 默认（include_detail=false）返回目录级：文档 title/path/一句话摘要、
+       知识点标题索引、符号名列表、findings 精简（id/title/状态）；
+    ② 从目录判断哪些相关后，带 include_detail=true 重查同一关键词，
+       返回文档/知识点全文摘要、符号对象与 cppsg 桥接节点（callers/callees）。
 
     Args:
         keyword: 搜索关键词（中文或英文，如"分区"、"GNSS"、"UpdateManager"）
         depth: BFS 遍历深度，默认 2（1=直接关联，2=关联的关联）
-        bridge_to_code: 是否桥接到 cppsg 代码图谱，默认 true
+        bridge_to_code: 是否桥接到 cppsg 代码图谱，默认 true（仅 detail 模式生效）
+        include_detail: 是否返回全量详情，默认 false（目录级）
         edge_filter: 限定边类型，可选值: has_knowledge, relates_to, mentions_symbol
 
-    Returns:
-        JSON 格式的搜索结果，包含:
-        - start_docs: FTS5/LIKE 命中的起始文档
-        - docs: BFS 遍历到的关联文档
-        - knowledge: BFS 遍历到的知识点
-        - symbols: BFS 遍历到的代码符号
-        - code_nodes: 符号桥接到 cppsg 的代码节点（含 callers/callees）
-
     示例:
-        # 搜索"分区"相关文档和代码
-        doc_graph_search_tool("分区", depth=2, bridge_to_code=true)
+        # 第一步：目录级定位相关文档
+        doc_graph_search_tool("串口让渡")
 
-        # 只搜文档间关联，不查代码
-        doc_graph_search_tool("GNSS", depth=1, bridge_to_code=false)
+        # 第二步：确认相关后取全文详情
+        doc_graph_search_tool("串口让渡", include_detail=true)
     """
     db_path = os.environ.get("DOC_GRAPH_DB", DEFAULT_DB)
     result = doc_graph_search(
@@ -135,6 +134,7 @@ def doc_graph_search_tool(
         depth=depth,
         edge_filter=edge_filter,
         bridge_to_code=bridge_to_code,
+        include_detail=include_detail,
         db_path=db_path,
     )
     return json.dumps(result, ensure_ascii=False, indent=2, default=str)
@@ -182,11 +182,16 @@ def list_documents(doc_type: str = "", status: str = "") -> str:
 def record_finding_tool(
     title: str,
     detail: str = "",
-    ftype: str = "fact",
+    ftype: str | None = None,
     symbols: list[str] | None = None,
     source: str = "",
     tags: list[str] | None = None,
-    confidence: str = "confirmed",
+    confidence: str | None = None,
+    project_id: str = "adc4",
+    scope: str | None = None,
+    revision: str | None = None,
+    conditions: str | None = None,
+    evidence_key: str = "",
 ) -> str:
     """沉淀一条经验结论到文档图谱（会话产出可复用结论时调用，防止下个会话重新推导）。
 
@@ -206,7 +211,12 @@ def record_finding_tool(
                  符号被查询时会自动带出本条结论，强烈建议填写）
         source: 来源（会话日期/任务名/文档路径）
         tags: 自由标签
-        confidence: confirmed(已验证) | suspected(推测未证实)
+        confidence: 缺省新建为 suspected，更新保留；confirmed 必须显式提供 source+evidence_key。
+        project_id: 来源项目，默认 adc4（旧库）；新项目不得继续使用该默认。
+        scope: project 或 portable；portable 必须有适用条件和出处。
+        revision: 适用源码/文档版本。
+        conditions: 适用条件与例外。
+        evidence_key: 一次实际验证的稳定标识；重复提交不增加证据数。
 
     Returns:
         JSON：{"action": "created"|"updated", "id": ..., "symbols_anchored": n}
@@ -215,7 +225,9 @@ def record_finding_tool(
     db_path = os.environ.get("DOC_GRAPH_DB", DEFAULT_DB)
     result = record_finding(title=title, detail=detail, ftype=ftype,
                             symbols=symbols, source=source, tags=tags,
-                            confidence=confidence, db_path=db_path)
+                            confidence=confidence, db_path=db_path, project_id=project_id,
+                            scope=scope, revision=revision, conditions=conditions,
+                            evidence_key=evidence_key)
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
@@ -255,9 +267,12 @@ def search_findings_tool(
 def check_finding_freshness_tool() -> str:
     """[deprecated → doc_admin(action=freshness)] 检测经验结论的时效性：锚定符号在 cppsg 代码图谱中是否还存在。
 
-    代码重构/删除后，结论可能已失效。本工具将 finding 锚定的符号与 cppsg
-    当前节点比对（宽松匹配），自动做幂等状态迁移：
-    - 全部锚定符号消失 → active → stale（查询时会带 ⚠️ 提示）
+    代码重构/删除后，结论可能已失效。三层判定（2026-10-22 起）：
+    0. 域外豁免：MCU 日志/芯片标识类锚定不适用代码存在性判据，跳过；
+    1. 锚定符号与 cppsg 当前节点比对（宽松匹配），全部消失才进入下一层；
+    2. 仓库级兜底 grep（BSW/SDK/工具链检索根），符号在仓库源码中仍存在则不判 stale。
+    自动做幂等状态迁移：
+    - 全部锚定符号在仓库中消失 → active → stale（查询时会带 ⚠️ 提示）
     - stale 结论的符号回归 → stale → active（自动恢复）
 
     建议在 cppsg 重建后调用一次。
@@ -374,19 +389,6 @@ def get_doc_stats() -> str:
 
 # ─── 主函数 ───────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    # 传输模式：默认 stdio（向后兼容）；DOC_GRAPH_TRANSPORT=http 跑单例 HTTP 服务
-    # http 模式配合 systemd user unit（~/.config/systemd/user/doc-graph-mcp.service），
-    # 多客户端共享单进程，避免 stdio 模式每连接一个进程的资源浪费与孤儿堆积。
-    # 端点：http://127.0.0.1:8930/mcp
-    if os.environ.get("DOC_GRAPH_TRANSPORT", "").lower() == "http":
-        mcp.settings.host = "127.0.0.1"
-        mcp.settings.port = int(os.environ.get("DOC_GRAPH_PORT", "8930"))
-        mcp.run(transport="streamable-http")
-    else:
-        mcp.run()
-
-
 # ============ 场景化打包工具（2026-09-03，与 cppsg tool_consolidation_design 同型）============
 # 6→3：doc_search（检索合并）/ record_finding_tool（写，保留）/ doc_admin（管理合并）。
 # 旧工具 docstring 标 deprecated 保留兜底，usage 归零后删除。
@@ -400,10 +402,10 @@ def doc_search(
     ftype: str = "",
     depth: int = 2,
     bridge_to_code: bool = True,
+    include_detail: bool = False,
     limit: int = 10,
 ) -> str:
-    """场景化检索文档知识图谱。scope="all"（默认）= 全图检索（文档+知识点+符号+findings，BFS 关联）；
-    scope="findings" = 直查经验结论表（"之前关于 X 的结论/教训/约束"）。
+    """场景化检索文档知识图谱（渐进披露）。scope="all"（默认）= 全图检索（文档+知识点+符号+findings，BFS 关联，默认目录级返回，include_detail=true 取全文详情）；scope="findings" = 直查经验结论表（"之前关于 X 的结论/教训/约束"）。
 
     Args:
         keyword: 关键词（中英文均可，建议附带同义词提升召回，如"崩溃 crash 挂"）
@@ -411,7 +413,8 @@ def doc_search(
         symbol: scope="findings" 时可按代码符号过滤（返回锚定该符号的所有结论）
         ftype: scope="findings" 时类型过滤: fact | constraint | decision | lesson | risk
         depth: scope="all" 时 BFS 遍历深度（默认 2）
-        bridge_to_code: scope="all" 时是否桥接 cppsg 代码节点（默认 true）
+        bridge_to_code: scope="all" 时是否桥接 cppsg 代码节点（默认 true，仅 detail 模式生效）
+        include_detail: scope="all" 时是否返回全量详情（默认 false 目录级：文档一句话摘要/知识点标题索引/符号名列表）
         limit: scope="findings" 时最大返回条数（默认 10）
     """
     db_path = os.environ.get("DOC_GRAPH_DB", DEFAULT_DB)
@@ -422,20 +425,23 @@ def doc_search(
                           ensure_ascii=False, indent=2, default=str)
     result = doc_graph_search(
         keyword=keyword, depth=depth, edge_filter=None,
-        bridge_to_code=bridge_to_code, db_path=db_path,
+        bridge_to_code=bridge_to_code, include_detail=include_detail, db_path=db_path,
     )
     return json.dumps(result, ensure_ascii=False, indent=2, default=str)
 
 
 @mcp.tool()
 @_telemetry("doc_admin")
-def doc_admin(action: str = "stats", doc_type: str = "", status: str = "") -> str:
-    """场景化管理查询：action="stats"（图谱统计：节点/边/类型分布/覆盖率）、"list"（文档清单，可按类型/状态过滤）、"freshness"（finding 时效检查：锚定符号在 cppsg 是否仍存在，重建后调用）。
+def doc_admin(action: str = "stats", doc_type: str = "", status: str = "",
+              finding_id: str = "", reason: str = "") -> str:
+    """场景化管理查询：action="stats"（图谱统计：节点/边/类型分布/覆盖率）、"list"（文档清单，可按类型/状态过滤）、"freshness"（finding 时效检查：三层判定——域外豁免/cppsg 比对/仓库兜底 grep，重建后调用）、"revoke"（撤销经验结论：finding_id+reason，status→revoked 不再进默认召回，2026-10-23 新增）。
 
     Args:
-        action: "stats"（默认）/ "list" / "freshness"
+        action: "stats"（默认）/ "list" / "freshness" / "revoke"
         doc_type: action="list" 时类型过滤: task, diary, review, design, link, requirement, report
         status: action="list" 时状态过滤（如: 已完成, 待评审）
+        finding_id: action="revoke" 时必填（如 "finding:20261022-150438-1526"）
+        reason: action="revoke" 时撤销原因（追加进 detail 审计）
     """
     import sqlite3
     db_path = os.environ.get("DOC_GRAPH_DB", DEFAULT_DB)
@@ -445,6 +451,10 @@ def doc_admin(action: str = "stats", doc_type: str = "", status: str = "") -> st
         if action == "freshness":
             return json.dumps(check_freshness(db_path=db_path),
                               ensure_ascii=False, indent=2, default=str)
+        if action == "revoke":
+            result = revoke_finding(finding_id=finding_id, reason=reason,
+                                    db_path=db_path)
+            return json.dumps(result, ensure_ascii=False, indent=2, default=str)
         if action == "list":
             query = ("SELECT id, title, summary, doc_type, status, date, path "
                      "FROM node WHERE type = 'document'")
@@ -482,3 +492,84 @@ def doc_admin(action: str = "stats", doc_type: str = "", status: str = "") -> st
         }, ensure_ascii=False, indent=2, default=str)
     finally:
         conn.close()
+
+
+# Durable cross-session/project memory, sharing the original database/findings.
+import knowledge_memory as memory
+
+
+@mcp.tool()
+@_telemetry("memory_store")
+def memory_store(action: str, project_id: str, root: str = "", path: str = "",
+                 revision: str = "", title: str = "", detail: str = "",
+                 document_id: str = "", conditions: str = "", scope: str = "project",
+                 ftype: str = "lesson", confidence: str = "suspected", evidence_key: str = "",
+                 symbols: list[str] | None = None, old_id: str = "", replacement_id: str = "",
+                 reason: str = "") -> str:
+    """保存可复用文档/结论，避免以后重复推导；按项目隔离，保留全文、来源哈希和版本。
+
+    action=register: 首次登记稳定 project_id + 绝对 root；同 root 不登记第二个 ID。
+    action=capture: 保存该项目内 UTF-8 文档 path 的完整快照和章节索引，revision 写实际基线。
+    action=remember: 从已 capture 的 document_id 提炼 title/detail/conditions，保留证据边。
+      缺省 suspected；confirmed 要有实际验证的 evidence_key（工具不代替验证）。
+      scope=portable 明确标为可跨项目的经验，必须写条件，不直接升级为其他项目事实。
+    action=supersede: 新结论替代同项目旧结论，传 old_id/replacement_id/reason，旧结论退出默认召回。
+    action=status: 查看已登记项目、来源目录、文档/结论规模。
+    先回忆后分析；形成有复用价值的文档后 capture+remember。不要保存临时聊天/未经区分的推测。
+    """
+    db_path = os.environ.get("DOC_GRAPH_DB", DEFAULT_DB)
+    if action == "register":
+        out = memory.register_project(project_id, root, db_path)
+    elif action == "capture":
+        out = memory.capture_document(project_id, path, revision, db_path)
+    elif action == "remember":
+        out = memory.remember(project_id, title, detail, document_id, conditions, db_path,
+                              revision, scope, ftype, confidence, evidence_key, symbols)
+    elif action == "supersede":
+        out = memory.supersede(project_id, old_id, replacement_id, reason, db_path)
+    elif action == "status":
+        out = memory.status(db_path)
+    else:
+        raise ValueError("unknown memory_store action")
+    return json.dumps(out, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+@_telemetry("memory_recall")
+def memory_recall(project_id: str, keyword: str, revision: str = "",
+                  include_portable: bool = True, include_history: bool = False,
+                  limit: int = 10) -> str:
+    """遇到相似问题先查历史结论和文档全文，按项目+通用经验召回，返回证据/适用条件/替代关系。
+
+    project_id 从 memory_store(action=status) 找与当前工作目录对应的注册项目，不能猜用 adc4。
+    keyword 用主题/症状/符号，可附同义词；revision 写当前真实基线（不知道则留空）。
+    默认不返回其他项目的专用事实和已撤销/被替代结论；include_history 用于追溯。
+    返回 source_state/reuse_state，变更或版本不符时须重新验证，不可直接沿用。
+    无命中不证明从未发生；可改写查询或检查文档是否已 capture。
+    """
+    return json.dumps(memory.recall(project_id, keyword, os.environ.get("DOC_GRAPH_DB", DEFAULT_DB),
+                                    revision, include_portable, include_history, limit),
+                      ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+@_telemetry("memory_get")
+def memory_get(project_id: str, memory_id: str, offset: int = 0, max_chars: int = 12000, snapshot_hash: str = "") -> str:
+    """按 memory_recall 返回的 document/finding ID 分页读取保存的完整原文与证据边。
+    返回 total_chars/next_offset 和结论 history；传 snapshot_hash 可读改写前结论，不冒充当前事实。
+    """
+    return json.dumps(memory.get_memory(memory_id, project_id, os.environ.get("DOC_GRAPH_DB", DEFAULT_DB),
+                                        offset, max_chars, snapshot_hash), ensure_ascii=False, indent=2)
+
+
+if __name__ == "__main__":
+    # 传输模式：默认 stdio（向后兼容）；DOC_GRAPH_TRANSPORT=http 跑单例 HTTP 服务
+    # http 模式配合 systemd user unit（~/.config/systemd/user/doc-graph-mcp.service），
+    # 多客户端共享单进程，避免 stdio 模式每连接一个进程的资源浪费与孤儿堆积。
+    # 端点：http://127.0.0.1:8930/mcp
+    if os.environ.get("DOC_GRAPH_TRANSPORT", "").lower() == "http":
+        mcp.settings.host = "127.0.0.1"
+        mcp.settings.port = int(os.environ.get("DOC_GRAPH_PORT", "8930"))
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()
