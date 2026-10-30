@@ -2055,10 +2055,11 @@ mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose"
 </script>
 </head>
 <body>
-<h1 id="harness-hld">Harness 记忆与工作流优化方案概要设计（HLD）</h1>
+<h1 id="harness">Harness 优化专项——市场对标·现状评估·优化路线·落地记录</h1>
 <blockquote>
-<p>版本：V1.1 ｜ 日期：2026-10-23 ｜ 状态：P0 已实施
-工程仓库：FS-Yuao/cpp-semantic-graph（本文档所属基础设施工程）</p>
+<p>版本：V2.0 ｜ 日期：2026-10-23 ｜ 状态：P0 已实施
+工程仓库：FS-Yuao/cpp-semantic-graph（本文档所属基础设施工程）
+定位：<strong>优化专项文档</strong>——回答"我们对 harness 做了什么优化、为什么这么做、落地到什么程度"。harness 现状全景讲解见 <a href="QBuddy_HARNESS_GUIDE.md">QBuddy_HARNESS_GUIDE.md</a>；记忆图谱架构设计见 <a href="MEMORY_GRAPH_ARCHITECTURE.md">MEMORY_GRAPH_ARCHITECTURE.md</a>。</p>
 </blockquote>
 <h2 id="_1">变更履历</h2>
 <table>
@@ -2080,14 +2081,20 @@ mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose"
 <tr>
 <td>V1.1</td>
 <td>2026-10-23</td>
-<td>P0 三项落地：O-1 渐进披露（返回体积 13%）、O-2 parser summary 穿透修复（重复对 782→27）+ 空章节准入过滤（节点 1807→1520）、O-3 evidence 回填（零值 58%→0）；§3/§4.2/§5.4/§6 同步</td>
+<td>P0 三项落地：O-1 渐进披露（返回体积 13%）、O-2 parser summary 穿透修复（重复对 782→27）+ 空章节准入过滤（节点 1807→1520）、O-3 evidence 回填（零值 58%→0）；§3/§4.2/§5.4/§6 同步。§2.2 架构图 ASCII→mermaid ELK（按画图标准选型表，三条细关系边改文字承载避穿字，headless 渲染检测 29 框零重叠/零穿字）</td>
+<td>主 agent</td>
+</tr>
+<tr>
+<td>V2.0</td>
+<td>2026-10-23</td>
+<td>文档拆分重定位：harness 现状讲解拆出至 QBuddy_HARNESS_GUIDE.md，记忆子系统结构详设拆出至 MEMORY_GRAPH_ARCHITECTURE.md；本文聚焦优化专项（对标/评估/路线/落地记录），§3 机制映射表即"已做优化"的追踪表</td>
 <td>主 agent</td>
 </tr>
 </tbody>
 </table>
 <h2 id="1">1 引言</h2>
 <h3 id="11">1.1 目的</h3>
-<p>描述当前 AI 工作环境（harness）的优化方案现状：总体架构、记忆子系统三路机制（注入/检索/沉淀）的设计实现、与 2026 年市场主流记忆技术的对标结论、客观现状评估与分级优化路线。作为后续 harness 迭代决策的基准文档。</p>
+<p>记录 harness 的<strong>优化专项</strong>：与 2026 年市场主流记忆技术的对标结论、客观现状评估、分级优化路线与落地验证记录。机制映射表（§3）即"已做优化"的追踪表。harness 由什么组成见 <a href="QBuddy_HARNESS_GUIDE.md">QBuddy_HARNESS_GUIDE.md</a>。</p>
 <h3 id="12">1.2 范围</h3>
 <p>覆盖单用户（单人开发）单领域（ADC4.0 OTA 项目 + 配套基础设施工程）场景下的完整 harness：宿主客户端、模型、规则人格层、记忆知识层、角色外脑层、流程协议层、自动化层、观测治理层。不覆盖多用户/多租户场景（见 §7 约束）。</p>
 <h3 id="13">1.3 术语定义</h3>
@@ -2136,36 +2143,7 @@ mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose"
 <h3 id="21">2.1 系统定位</h3>
 <p>harness 的设计目标：让 AI 在长期、连续的工程任务中保持正确的决策质量——记住历史结论、遵守已定约束、不重蹈覆辙、不重复推导。核心思路是<strong>分层记忆 + 机制化回忆 + 证据化沉淀</strong>，替代默认的"每会话从零开始"。</p>
 <h3 id="22">2.2 总体架构（六层）</h3>
-<pre><code>┌────────────────────────────────────────────────────────┐
-│ 宿主：CodeBuddy(QBuddy) IDE —— agent 循环/工具协议/     │
-│       hooks 生命周期(27+ 事件)/Task 子代理/团队模式      │
-│ 模型：GLM（主 agent 与子代理共用）                      │
-├────────────────────────────────────────────────────────┤
-│ L1 规则人格层（每次会话注入的行为基准）                  │
-│    通用规则(四要素人格) → 项目规则(事实红线) → 21 skills │
-├────────────────────────────────────────────────────────┤
-│ L2 记忆知识层（三路）                                    │
-│    注入路：SessionStart hook → MAP(12KB)+RECENT(8KB)    │
-│            +常驻答案页(3KB)，三级硬预算                  │
-│    检索路：doc-graph(findings 118+文档 267 节点)         │
-│            cppsg(代码图谱)+clangd(SDK/BSW 兜底)          │
-│    沉淀路：record_finding 幂等写入/回写五步协议/         │
-│            每日记忆/constraint_index/bugs 总账           │
-├────────────────────────────────────────────────────────┤
-│ L3 角色外脑层：architect-anchor(锚定)/reviewer(审查)/    │
-│    bug-analyst(日志包分析)/code-explorer + 并行只读消化  │
-├────────────────────────────────────────────────────────┤
-│ L4 流程协议层：入口锚定→文档先行→测试先行→编码→验证审查  │
-│    session-handoff(会话交接)/daily-summary/dev-loop      │
-├────────────────────────────────────────────────────────┤
-│ L5 自动化层：cron×4(记忆入库/图谱增量/RECENT 再生/       │
-│    纪律审计)；hooks×3(SessionStart/PreToolUse 守卫/      │
-│    PostToolUse dirty 标记)                              │
-├────────────────────────────────────────────────────────┤
-│ L6 观测治理层：search-stats 体检/每日纪律审计/           │
-│    双遥测 jsonl/finding 生命周期/迁移资产四层模型        │
-└────────────────────────────────────────────────────────┘
-</code></pre>
+<p>六层全景架构图与逐层讲解见 <a href="QBuddy_HARNESS_GUIDE.md">QBuddy_HARNESS_GUIDE.md</a> §1/§3，此处不重复。与优化直接相关的结论：<strong>优化动作集中在 L2 记忆知识层与 L6 观测治理层</strong>（注入/检索/沉淀三路 + 生命周期治理），L1/L3/L4/L5 为稳定的既有设施。</p>
 <h3 id="23">2.3 运行环境</h3>
 <ul>
 <li>宿主：CodeBuddy IDE（QBuddy），兼容 Claude Code hooks 规范</li>
@@ -2236,7 +2214,7 @@ mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose"
 <td>记忆不被误标/污染</td>
 <td>evidence_count 证据计数 + 衰减排序 + DB 副本预演纪律</td>
 <td>L2/L6</td>
-<td>已上线（2026-10-23 存量回填，零值 58%→0）</td>
+<td>已上线（2026-10-23 存量回填零值清零 + 评审修复：衰减排序覆盖主入口、revoke 可达、空参不覆盖更新语义，见 MEMORY_GRAPH_ARCHITECTURE 附录 B）</td>
 </tr>
 <tr>
 <td>检索信噪比（渐进披露）</td>
@@ -2253,29 +2231,11 @@ mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose"
 </tbody>
 </table>
 <h2 id="4">4 记忆子系统结构</h2>
-<h3 id="41">4.1 写入（沉淀路）</h3>
-<pre><code>会话/分析产出结论
-      │
-      ▼
-record_finding_tool（MCP，写入 doc_graph.db）
-      ├─ 同 title 幂等合并（v2 增量追加模式）
-      ├─ 符号锚定（finding_symbol 表，118/118 全锚定）
-      ├─ 证据计数 evidence_count + last_confirmed
-      └─ FTS5 索引 + 向量 embedding（fastembed bge-small-zh，可选降级）
-      │
-      ▼
-配套沉淀：每日记忆(YYYY-MM-DD.md，锚点追加式) / constraint_index
-         四元组 / PROJECT_MAP 目录行 / bugs 总账 / 任务三件套
-</code></pre>
-<p>写入触发靠<strong>流程协议纪律</strong>（回写五步、reviewer 第四阶段核验），非自动抽取。写入内容带行号级证据坐标（日志文件名+行号 / 代码文件名+行号），推测强制标注 suspected。</p>
-<h3 id="42">4.2 召回（注入路 + 检索路）</h3>
-<p>注入路（高频，零检索成本）：会话开始 hook 注入三级内容——PROJECT_MAP（长期目录）、RECENT（14 天窗口）、STANDING_ANSWERS（高频架构事实预计算答案，只收带行号证据条目）。</p>
-<p>检索路（低频深查，渐进披露两步式）：<code>doc_graph_search</code> 默认返回目录级（文档 title/path/一句话摘要 100 字符截断、知识点标题索引带行号、符号名列表截 30、findings 精简为 id/title/状态/置信度，cppsg 桥接不展开）；调用方判断相关后带 <code>include_detail=true</code> 重查同关键词取全量。实测同关键词（"串口让渡"）单次返回 79153B → 10215B（13%）。代码类查询走 cppsg 三场景工具，降级链 cppsg → clangd → 文本检索。</p>
-<h3 id="43">4.3 生命周期治理</h3>
+<p>记忆子系统（写入管线/召回管线/生命周期治理/数据模型/接口表）的完整架构设计独立成册：见 <a href="MEMORY_GRAPH_ARCHITECTURE.md">MEMORY_GRAPH_ARCHITECTURE.md</a>。本节仅保留与优化决策直接相关的三个事实：</p>
 <ul>
-<li>freshness 三层判定（2026-10-22）：域外注册表豁免（MCU 日志/芯片标识）→ cppsg 存在性精查 → 仓库级 grep 兜底（BSW/SDK/工具链检索根），原则"宁漏标不误标"</li>
-<li>衰减排序：evidence_count 加成 + last_confirmed 180 天线性衰减，刹车"库自我污染"</li>
-<li>幂等恢复：stale → active 自动迁移，恢复计一次证据</li>
+<li>写入触发靠<strong>流程协议纪律</strong>（回写五步、reviewer 第四阶段核验），非自动抽取——这是"保证据质量、放弃覆盖率"的有意取舍（§5.4 对标依据）；</li>
+<li>检索路已实施渐进披露两步式：同关键词实测返回 79153B → 10215B（13%，2026-10-23 冒烟）；</li>
+<li>生命周期治理三层判定（域外豁免→cppsg 精查→仓库级 grep 兜底）+ evidence_count 衰减排序，原则"宁漏标不误标"。</li>
 </ul>
 <h2 id="5">5 市场主流技术对标</h2>
 <h3 id="51-2026">5.1 主流记忆写入技术（2026 年格局）</h3>
